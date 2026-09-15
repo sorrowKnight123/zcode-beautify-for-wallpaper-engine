@@ -12,6 +12,8 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   CdpConnection,
   buildBootstrapScript,
@@ -23,6 +25,10 @@ import { buildPayload, DEFAULT_CONFIG, type BeautifyConfig } from "./inject.js";
 import { loadWallpaper, type WallpaperAssets } from "./monet.js";
 import { buildPanelScript } from "../panel/panelScript.js";
 import { dataDir, loadConfig, saveConfig } from "./launch.js";
+import { sendMediaFile } from "./media.js";
+import { importScene, MissingDependencyError, type SceneImportResult } from "./scenePipeline.js";
+import { getInstallGuide } from "./dependencyCheck.js";
+import { scenesCacheRoot } from "./cacheManager.js";
 
 const MAX_WALLPAPER_BYTES = 20 * 1024 * 1024;
 const MAX_BODY_BYTES = MAX_WALLPAPER_BYTES + 1024 * 1024;
@@ -42,15 +48,27 @@ interface HeldSession {
 // panel feels instant. Invalidated whenever the wallpaper file changes.
 let cachedAssets: { file: string; mtimeMs: number; assets: WallpaperAssets } | undefined;
 
-async function getAssets(wallpaperPath?: string): Promise<WallpaperAssets | undefined> {
+async function getAssets(config: BeautifyConfig): Promise<WallpaperAssets | undefined> {
+  const wallpaperPath = config.wallpaperPath;
   if (!wallpaperPath || !fs.existsSync(wallpaperPath)) return undefined;
-  const mtimeMs = fs.statSync(wallpaperPath).mtimeMs;
-  if (cachedAssets?.file === wallpaperPath && cachedAssets.mtimeMs === mtimeMs) {
+  // Scene wallpaper: wallpaperPath is the loop VIDEO — jimp can't decode it.
+  // The poster frame next to the loop carries the Monet source colors.
+  const sourcePath =
+    config.mediaType === "video"
+      ? path.join(path.dirname(wallpaperPath), "poster.jpg")
+      : wallpaperPath;
+  if (!fs.existsSync(sourcePath)) return undefined;
+  const mtimeMs = fs.statSync(sourcePath).mtimeMs;
+  if (cachedAssets?.file === sourcePath && cachedAssets.mtimeMs === mtimeMs) {
     return cachedAssets.assets;
   }
-  const assets = await loadWallpaper(wallpaperPath);
-  cachedAssets = { file: wallpaperPath, mtimeMs, assets };
-  return assets;
+  try {
+    const assets = await loadWallpaper(sourcePath);
+    cachedAssets = { file: sourcePath, mtimeMs, assets };
+    return assets;
+  } catch {
+    return undefined; // undecodable wallpaper: inject without Monet rather than not at all
+  }
 }
 
 function currentConfig(): BeautifyConfig {
@@ -75,6 +93,8 @@ function publicConfig(config: BeautifyConfig) {
     wallpaperSet: Boolean(config.wallpaperPath && fs.existsSync(config.wallpaperPath)),
     hasBackup: hasBackup(),
     cdpPort: config.port,
+    mediaType: config.mediaType ?? "image",
+    sceneHash: config.sceneHash,
   };
 }
 
@@ -87,6 +107,19 @@ function sanitize(body: any): Partial<BeautifyConfig> {
   if (body?.fit === "cover" || body?.fit === "contain" || body?.fit === "smart") out.fit = body.fit;
   return out;
 }
+
+// --- scene import job (one at a time; the panel polls for progress) ----------
+
+interface ImportJob {
+  running: boolean;
+  stage: string;
+  detail?: string;
+  error?: string;
+  guide?: string;
+  result?: { loopPath: string; posterPath: string; hash: string; fromCache: boolean };
+}
+
+let importJob: ImportJob = { running: false, stage: "idle" };
 
 // --- injection session management -------------------------------------------
 
@@ -110,11 +143,12 @@ async function holdSession(
   await conn.send("Page.enable");
   const session: HeldSession = { conn };
 
-  const assets = await getAssets(config.wallpaperPath);
+  const assets = await getAssets(config);
   const payload = buildPayload(config, assets);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
+    videoSrc: payload.videoSrc,
     fit: payload.fit,
   });
   const { identifier } = await conn.send("Page.addScriptToEvaluateOnNewDocument", {
@@ -132,11 +166,12 @@ async function holdSession(
 
 /** Re-evaluates the theme bootstrap in every live session after a config change. */
 async function pushConfigToSessions(config: BeautifyConfig): Promise<number> {
-  const assets = await getAssets(config.wallpaperPath);
+  const assets = await getAssets(config);
   const payload = buildPayload(config, assets);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
+    videoSrc: payload.videoSrc,
     fit: payload.fit,
   });
   let ok = 0;
@@ -337,7 +372,7 @@ export async function startServe(opts: ServeOptions): Promise<void> {
             held.delete(id);
           }
         }
-        saveConfig({ ...stored, wallpaperPath: undefined });
+        saveConfig({ ...stored, wallpaperPath: undefined, mediaType: undefined, sceneHash: undefined, sceneVideoUrl: undefined });
         cachedAssets = undefined;
         sendJson(res, 200, { ok: true, hasBackup: true });
         return;
@@ -359,6 +394,144 @@ export async function startServe(opts: ServeOptions): Promise<void> {
 
       if (req.method === "GET" && url.pathname === "/api/health") {
         sendJson(res, 200, { ok: true, service: "zcode-beautify", pid: process.pid });
+        return;
+      }
+
+      // --- scene wallpaper import -------------------------------------------
+
+      // Opens a native file dialog and returns the picked path. The panel is
+      // a web page and cannot see absolute paths (browser security), but this
+      // local serve process can — so the dialog lives here.
+      if (req.method === "POST" && url.pathname === "/api/pick-scene") {
+        const picked = await pickFileViaDialog();
+        sendJson(res, 200, { ok: Boolean(picked), path: picked });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/import-scene") {
+        const body = JSON.parse(await readBody(req));
+        const scenePath = typeof body?.path === "string" ? body.path.trim() : "";
+        if (!scenePath) throw new Error("path is required");
+        if (importJob.running) {
+          sendJson(res, 409, { error: "another import is already running", stage: importJob.stage });
+          return;
+        }
+        importJob = { running: true, stage: "starting" };
+        // Fire-and-forget: the panel polls /api/import-status for progress.
+        void importScene(scenePath, (stage, detail) => {
+          importJob.stage = stage;
+          importJob.detail = detail;
+        })
+          .then(async (result: SceneImportResult) => {
+            importJob = {
+              running: false,
+              stage: "done",
+              result: { loopPath: result.loopPath, posterPath: result.posterPath, hash: result.hash, fromCache: result.fromCache },
+            };
+            // Adopt the imported scene as the current wallpaper right away.
+            const config = runtimeConfig();
+            const next: BeautifyConfig = {
+              ...config,
+              mediaType: "video",
+              sceneHash: result.hash,
+              wallpaperPath: result.loopPath,
+              apiPort,
+              sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${result.hash}.mp4`,
+            };
+            saveConfig(persisted(next));
+            await pushConfigToSessions(next).catch(() => 0);
+          })
+          .catch((err: Error) => {
+            importJob = {
+              running: false,
+              stage: "error",
+              error: err.message,
+              guide: err instanceof MissingDependencyError ? getInstallGuide(err.missing) : undefined,
+            };
+          });
+        sendJson(res, 200, { ok: true, started: true });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/import-status") {
+        sendJson(res, 200, importJob);
+        return;
+      }
+
+      // Apply an item from the library: image by path, scene by cache hash.
+      if (req.method === "POST" && url.pathname === "/api/apply-wallpaper") {
+        const body = JSON.parse(await readBody(req));
+        const config = runtimeConfig();
+        if (typeof body?.hash === "string") {
+          const loopPath = path.join(scenesCacheRoot(), body.hash, "loop.mp4");
+          if (!fs.existsSync(loopPath)) throw new Error("unknown scene hash");
+          const next: BeautifyConfig = {
+            ...config,
+            mediaType: "video",
+            sceneHash: body.hash,
+            wallpaperPath: loopPath,
+            apiPort,
+            sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${body.hash}.mp4`,
+          };
+          saveConfig(persisted(next));
+          const windows = await pushConfigToSessions(next).catch(() => 0);
+          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
+          return;
+        }
+        if (typeof body?.path === "string" && fs.existsSync(body.path)) {
+          const next: BeautifyConfig = {
+            ...config,
+            wallpaperPath: body.path,
+            mediaType: "image",
+            sceneHash: undefined,
+            sceneVideoUrl: undefined,
+          };
+          saveConfig(persisted(next));
+          const windows = await pushConfigToSessions(next).catch(() => 0);
+          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
+          return;
+        }
+        throw new Error("provide hash or existing path");
+      }
+
+      // Library listing for the panel: static images + cached scene loops.
+      if (req.method === "GET" && url.pathname === "/api/library") {
+        const images: Array<{ name: string; path: string }> = [];
+        for (const f of fs.readdirSync(dataDir())) {
+          if (/\.(jpe?g|png|webp|bmp)$/i.test(f) && f.startsWith("wallpaper")) {
+            images.push({ name: f, path: path.join(dataDir(), f) });
+          }
+        }
+        const scenes: Array<{ hash: string; sizeBytes: number; mtimeMs: number }> = [];
+        try {
+          for (const d of fs.readdirSync(scenesCacheRoot())) {
+            const loop = path.join(scenesCacheRoot(), d, "loop.mp4");
+            try {
+              const st = fs.statSync(loop);
+              scenes.push({ hash: d, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+            } catch {
+              /* incomplete entry */
+            }
+          }
+        } catch {
+          /* no scenes dir yet */
+        }
+        scenes.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        sendJson(res, 200, { images, scenes });
+        return;
+      }
+
+      // Loop video streaming for the injected <video> layer (Range-capable).
+      if (req.method === "GET" && url.pathname.startsWith("/media/scene/")) {
+        const hash = /^\/media\/scene\/([a-f0-9]{8,64})\.mp4$/.exec(url.pathname)?.[1];
+        if (!hash) {
+          sendJson(res, 400, { error: "bad scene media path" });
+          return;
+        }
+        const file = path.join(scenesCacheRoot(), hash, "loop.mp4");
+        if (!sendMediaFile(req, res, file)) {
+          sendJson(res, 404, { error: "scene media not found" });
+        }
         return;
       }
 
@@ -387,5 +560,28 @@ export async function startServe(opts: ServeOptions): Promise<void> {
   for (;;) {
     await new Promise((r) => setTimeout(r, POLL_MS));
     await poll(runtimeConfig(), apiPort);
+  }
+}
+
+/**
+ * Native wallpaper file picker, shown from the serve process via PowerShell
+ * WinForms (STA + a topmost owner form so it surfaces above ZCode). The
+ * panel is a web page and cannot read absolute paths from <input type=file>,
+ * so the dialog has to live in this local process. Resolves "" on cancel.
+ */
+async function pickFileViaDialog(): Promise<string> {
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = '选择 Wallpaper Engine 场景壁纸 (.pkg 或壁纸目录内任意文件)'
+$d.Filter = 'Wallpaper Engine 壁纸 (*.pkg;*.json;*.gif;*.jpg;*.png)|*.pkg;*.json;*.gif;*.jpg;*.png|所有文件 (*.*)|*.*'
+if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`;
+  try {
+    const { stdout } = await promisify(execFile)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 300_000 });
+    return stdout.trim();
+  } catch {
+    return "";
   }
 }
