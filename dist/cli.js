@@ -159,7 +159,11 @@ function buildBootstrapScript(payload) {
     bp.dataset.on = '0';
   }
 
-  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  // Keep the loop alive. Chromium's media suspension can freeze a nominally
+  // playing wallpaper video (paused:false but the clock stops \u2014 occlusion
+  // misdetection is common with transparent Electron windows), so a watchdog
+  // samples currentTime and kicks the element whenever the page is visible
+  // but the clock is frozen, paused, or ended.
   if (!window.__zcodeBeautify.visBound) {
     window.__zcodeBeautify.visBound = true;
     document.addEventListener('visibilitychange', function() {
@@ -167,6 +171,36 @@ function buildBootstrapScript(payload) {
       if (!v) return;
       if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
     });
+    window.addEventListener('focus', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+    window.addEventListener('pageshow', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+  }
+  if (!window.__zcodeBeautify.watchdog) {
+    window.__zcodeBeautify.stallCount = 0;
+    window.__zcodeBeautify.lastClock = -1;
+    window.__zcodeBeautify.watchdog = setInterval(function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      var S = window.__zcodeBeautify;
+      if (document.hidden) { S.lastClock = -1; return; }
+      if (v.ended || (v.paused && v.autoplay)) {
+        S.stallCount = 0;
+        v.play().catch(function() {});
+      } else if (!v.paused && v.readyState >= 2 && S.lastClock === v.currentTime) {
+        // nominally playing but the media clock is frozen
+        S.stallCount++;
+        if (S.stallCount >= 2) { v.load(); }
+        v.play().catch(function() {});
+      } else {
+        S.stallCount = 0;
+      }
+      S.lastClock = v.currentTime;
+    }, 2000);
   }
 
   // Persist for the panel's self-heal path (best effort; large wallpapers may
@@ -110567,16 +110601,22 @@ import { execFile as execFile5 } from "node:child_process";
 import { mkdirSync as mkdirSync2 } from "node:fs";
 import path5 from "node:path";
 import { promisify as promisify5 } from "node:util";
-async function makeSeamless(input, output, fadeSec, ffmpegPath) {
+async function makeSeamless(input, output, fadeSec, ffmpegPath, options = {}) {
   const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
     throw new LoopError("ffmpeg not found \u2014 cannot process loop");
-  const duration = await probeDuration(input, ffmpeg);
-  if (!Number.isFinite(duration) || duration <= fadeSec + 1) {
-    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${duration}s)`);
+  const fullDuration = await probeDuration(input, ffmpeg);
+  if (!Number.isFinite(fullDuration) || fullDuration <= fadeSec + 1) {
+    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${fullDuration}s)`);
+  }
+  const duration = Math.min(fullDuration, options.seconds ?? fullDuration);
+  const startAt = Math.min(options.startAt ?? 0, fullDuration - duration);
+  if (duration <= fadeSec + 1) {
+    throw new LoopError(`Truncated input too short for a ${fadeSec}s crossfade (duration ${duration}s)`);
   }
   const tailStart = duration - fadeSec;
   const mainEnd = duration - fadeSec;
+  const scale = options.maxWidth && options.maxWidth > 0 ? `scale=w='min(${options.maxWidth}\\,iw)':h=-2,` : "";
   const filter = [
     `[0:v]split[base][src]`,
     // crossfade base: the source tail, head image fades in over it
@@ -110585,7 +110625,8 @@ async function makeSeamless(input, output, fadeSec, ffmpegPath) {
     `[tail][head]overlay=format=auto[xfade]`,
     // main body: the source between the crossfade end and the tail start
     `[base]trim=start=${fadeSec.toFixed(4)}:end=${mainEnd.toFixed(4)},setpts=PTS-STARTPTS[main]`,
-    `[xfade][main]concat=n=2:v=1:a=0[out]`
+    `[xfade][main]concat=n=2:v=1:a=0[joined]`,
+    `[joined]${scale}format=yuv420p[out]`
   ].join(";");
   mkdirSync2(path5.dirname(path5.resolve(output)), { recursive: true });
   await exec4(ffmpeg, [
@@ -110593,6 +110634,10 @@ async function makeSeamless(input, output, fadeSec, ffmpegPath) {
     "-hide_banner",
     "-loglevel",
     "warning",
+    // -ss/-t BEFORE -i: they must limit what the FILTERS see (an output-side
+    // -t would cap the result while the trims ran on the whole stream).
+    ...options.startAt ? ["-ss", startAt.toFixed(3)] : [],
+    ...options.seconds ? ["-t", duration.toFixed(3)] : [],
     "-i",
     input,
     "-filter_complex",
@@ -110611,7 +110656,7 @@ async function makeSeamless(input, output, fadeSec, ffmpegPath) {
     "+faststart",
     "-an",
     output
-  ], { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 });
+  ], { timeout: 6e5, maxBuffer: 16 * 1024 * 1024 });
   const outputDuration = await probeDuration(output, ffmpeg);
   return { inputDuration: duration, outputDuration };
 }
@@ -110835,6 +110880,21 @@ import { execFile as execFile6 } from "node:child_process";
 import fs7 from "node:fs";
 import path7 from "node:path";
 import { promisify as promisify6 } from "node:util";
+function findVideoInDir(dir) {
+  for (const subdir of ["", "files"]) {
+    const base = path7.join(dir, subdir);
+    let entries;
+    try {
+      entries = fs7.readdirSync(base);
+    } catch {
+      continue;
+    }
+    const hit = entries.find((e2) => /\.(mp4|webm)$/i.test(e2));
+    if (hit)
+      return path7.join(base, hit);
+  }
+  return void 0;
+}
 function resolveSceneInput(input) {
   let stat;
   try {
@@ -110859,21 +110919,35 @@ function resolveSceneInput(input) {
 }
 async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath) {
   const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
-  pkgPath = resolveSceneInput(pkgPath);
   onProgress("detect", pkgPath);
-  const type = detectWallpaperType(pkgPath);
-  if (type !== "scene") {
-    throw new SceneImportError(`Not a scene wallpaper (${type}): ${pkgPath}`);
+  let type = detectWallpaperType(pkgPath);
+  try {
+    if (type === "video" && fs7.statSync(pkgPath).isDirectory()) {
+      const videoFile = findVideoInDir(pkgPath);
+      if (!videoFile)
+        throw new SceneImportError(`No .mp4/.webm inside video wallpaper directory: ${pkgPath}`);
+      pkgPath = videoFile;
+    } else if (type !== "video") {
+      pkgPath = resolveSceneInput(pkgPath);
+      type = detectWallpaperType(pkgPath);
+    }
+  } catch (err) {
+    if (err instanceof SceneImportError)
+      throw err;
   }
+  if (type !== "scene" && type !== "video") {
+    throw new SceneImportError(`Not a scene or video wallpaper (${type}): ${pkgPath}`);
+  }
+  const isVideo = type === "video";
   onProgress("deps");
   const missing = [];
-  if (!(await checkWallpaperEngine()).ok)
+  if (!isVideo && !(await checkWallpaperEngine()).ok)
     missing.push("we");
   if (!(await checkFfmpeg()).ok)
     missing.push("ffmpeg");
   if (missing.length > 0)
     throw new MissingDependencyError(missing);
-  const hash = computeHash(pkgPath, {
+  const hash = isVideo ? computeHash(pkgPath, { kind: "video", maxWidth: 1920, maxSeconds: opts.maxSeconds, fadeSec: opts.fadeSec }) : computeHash(pkgPath, {
     width: opts.width,
     height: opts.height,
     fps: opts.fps,
@@ -110887,6 +110961,29 @@ async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffm
     touchCache(hash);
     enforceLimit(opts.maxCacheBytes);
     return { loopPath, posterPath, hash, blackness: { blackFraction: -1, meanLuma: -1, durationSec: -1 }, fromCache: true };
+  }
+  if (isVideo) {
+    onProgress("analyzing", pkgPath);
+    const sourceDuration = await probeDuration(pkgPath, ffmpegPath ?? (await checkFfmpeg()).path);
+    const trim = sourceDuration > opts.maxSeconds ? { startAt: (sourceDuration - opts.maxSeconds) / 2, seconds: opts.maxSeconds } : void 0;
+    if (trim)
+      onProgress("truncating", `${sourceDuration.toFixed(1)}s -> ${opts.maxSeconds}s`);
+    onProgress("processing", `crossfade ${opts.fadeSec}s`);
+    const tmpLoop = `${loopPath}.tmp.mp4`;
+    await makeSeamless(pkgPath, tmpLoop, opts.fadeSec, ffmpegPath, {
+      startAt: trim?.startAt,
+      seconds: trim?.seconds,
+      maxWidth: 1920
+    });
+    onProgress("poster");
+    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    onProgress("saving", hash);
+    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.renameSync(tmpLoop, loopPath);
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    enforceLimit(opts.maxCacheBytes);
+    onProgress("done", loopPath);
+    return { loopPath, posterPath, hash, blackness, fromCache: false };
   }
   onProgress("opening", `window "${opts.title}"`);
   const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
@@ -110971,7 +111068,8 @@ var init_scenePipeline = __esm({
       duration: 15,
       fadeSec: 1,
       title: "WE_Render",
-      maxCacheBytes: 10 * 1024 ** 3
+      maxCacheBytes: 10 * 1024 ** 3,
+      maxSeconds: 60
     };
   }
 });
@@ -110998,7 +111096,8 @@ async function applyWallpaper(imagePath, opts) {
   const abs = path8.resolve(imagePath);
   if (!fs8.existsSync(abs))
     throw new Error(`Image not found: ${abs}`);
-  if (detectWallpaperType(abs) === "scene") {
+  const kind = detectWallpaperType(abs);
+  if (kind === "scene" || kind === "video") {
     const result = await applySceneWallpaper(abs, opts);
     return { windows: result.windows, config: result.config };
   }
@@ -111206,11 +111305,11 @@ function buildPanelScript(apiPort) {
     '      <label class="zb-btn" for="zb-file" title="\u9009\u62E9\u4E00\u5F20\u56FE\u7247\u4F5C\u4E3A\u80CC\u666F\u58C1\u7EB8,UI \u914D\u8272\u968F\u4E4B\u66F4\u65B0">\u66F4\u6362\u56FE\u7247\u2026</label>' +
     '      <input type="file" id="zb-file" accept="image/*" hidden>' +
     '    </div>' +
-    '    <div class="zb-row"><label style="opacity:.85"><span>\u573A\u666F\u58C1\u7EB8 (Wallpaper Engine)</span></label>' +
+    '    <div class="zb-row"><label style="opacity:.85"><span>\u52A8\u6001\u58C1\u7EB8 (\u573A\u666F / \u89C6\u9891)</span></label>' +
     '      <div class="zb-actions" style="margin:2px 0 6px">' +
-    '        <button class="zb-btn" id="zb-pick" title="\u6253\u5F00\u6587\u4EF6\u9009\u62E9\u5668,\u9009 .pkg \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6(\u4F1A\u81EA\u52A8\u5B9A\u4F4D\u58C1\u7EB8\u76EE\u5F55)\u5E76\u5F00\u59CB\u5BFC\u5165">\u9009\u62E9\u5E76\u5BFC\u5165\u2026</button>' +
+    '        <button class="zb-btn" id="zb-pick" title="\u6253\u5F00\u6587\u4EF6\u9009\u62E9\u5668:\u9009 .pkg(\u573A\u666F)\u6216 .mp4(\u89C6\u9891),\u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6(\u4F1A\u81EA\u52A8\u5B9A\u4F4D),\u9009\u5B8C\u81EA\u52A8\u5F00\u59CB\u5BFC\u5165">\u9009\u62E9\u5E76\u5BFC\u5165\u2026</button>' +
     '      </div>' +
-    '      <input type="text" id="zb-scene-path" placeholder="\u6216\u7C98\u8D34 .pkg / \u58C1\u7EB8\u76EE\u5F55\u5B8C\u6574\u8DEF\u5F84\u2026" spellcheck="false">' +
+    '      <input type="text" id="zb-scene-path" placeholder="\u6216\u7C98\u8D34 .pkg / .mp4 / \u58C1\u7EB8\u76EE\u5F55\u5B8C\u6574\u8DEF\u5F84\u2026" spellcheck="false">' +
     '      <div class="zb-actions" style="margin-top:6px">' +
     '        <button class="zb-btn" id="zb-import" title="\u6E32\u67D3\u5E76\u5F55\u5236\u573A\u666F\u58C1\u7EB8,\u751F\u6210\u65E0\u7F1D\u5FAA\u73AF\u52A8\u6001\u80CC\u666F">\u5BFC\u5165\u7C98\u8D34\u7684\u8DEF\u5F84</button>' +
     '      </div>' +
@@ -111438,7 +111537,7 @@ function buildPanelScript(apiPort) {
         var el = $('zb-lib');
         el.innerHTML = '';
         var head1 = document.createElement('div');
-        head1.className = 'zb-lib-head'; head1.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u573A\u666F';
+        head1.className = 'zb-lib-head'; head1.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u52A8\u6001';
         el.appendChild(head1);
         (lib.scenes || []).forEach(function (s) {
           el.appendChild(libItem('\u573A\u666F ' + s.hash.slice(0, 8), { hash: s.hash }, s.hash));
@@ -112048,8 +112147,8 @@ Add-Type -AssemblyName System.Windows.Forms
 $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $d = New-Object System.Windows.Forms.OpenFileDialog
-$d.Title = '\u9009\u62E9 Wallpaper Engine \u573A\u666F\u58C1\u7EB8 (.pkg \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6)'
-$d.Filter = 'Wallpaper Engine \u58C1\u7EB8 (*.pkg;*.json;*.gif;*.jpg;*.png)|*.pkg;*.json;*.gif;*.jpg;*.png|\u6240\u6709\u6587\u4EF6 (*.*)|*.*'
+$d.Title = '\u9009\u62E9\u52A8\u6001\u58C1\u7EB8 (\u573A\u666F .pkg / \u89C6\u9891 .mp4, \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6)'
+$d.Filter = '\u52A8\u6001\u58C1\u7EB8 (*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm)|*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm|\u6240\u6709\u6587\u4EF6 (*.*)|*.*'
 if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`;
   try {
     const { stdout } = await promisify7(execFile7)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 3e5 });

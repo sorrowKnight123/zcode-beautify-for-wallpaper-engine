@@ -7313,7 +7313,11 @@ function buildBootstrapScript(payload) {
     bp.dataset.on = '0';
   }
 
-  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  // Keep the loop alive. Chromium's media suspension can freeze a nominally
+  // playing wallpaper video (paused:false but the clock stops \u2014 occlusion
+  // misdetection is common with transparent Electron windows), so a watchdog
+  // samples currentTime and kicks the element whenever the page is visible
+  // but the clock is frozen, paused, or ended.
   if (!window.__zcodeBeautify.visBound) {
     window.__zcodeBeautify.visBound = true;
     document.addEventListener('visibilitychange', function() {
@@ -7321,6 +7325,36 @@ function buildBootstrapScript(payload) {
       if (!v) return;
       if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
     });
+    window.addEventListener('focus', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+    window.addEventListener('pageshow', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+  }
+  if (!window.__zcodeBeautify.watchdog) {
+    window.__zcodeBeautify.stallCount = 0;
+    window.__zcodeBeautify.lastClock = -1;
+    window.__zcodeBeautify.watchdog = setInterval(function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      var S = window.__zcodeBeautify;
+      if (document.hidden) { S.lastClock = -1; return; }
+      if (v.ended || (v.paused && v.autoplay)) {
+        S.stallCount = 0;
+        v.play().catch(function() {});
+      } else if (!v.paused && v.readyState >= 2 && S.lastClock === v.currentTime) {
+        // nominally playing but the media clock is frozen
+        S.stallCount++;
+        if (S.stallCount >= 2) { v.load(); }
+        v.play().catch(function() {});
+      } else {
+        S.stallCount = 0;
+      }
+      S.lastClock = v.currentTime;
+    }, 2000);
   }
 
   // Persist for the panel's self-heal path (best effort; large wallpapers may
@@ -37469,16 +37503,22 @@ import { execFile as execFile5 } from "node:child_process";
 import { mkdirSync as mkdirSync2 } from "node:fs";
 import path5 from "node:path";
 import { promisify as promisify5 } from "node:util";
-async function makeSeamless(input2, output2, fadeSec, ffmpegPath) {
+async function makeSeamless(input2, output2, fadeSec, ffmpegPath, options = {}) {
   const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
     throw new LoopError("ffmpeg not found \u2014 cannot process loop");
-  const duration3 = await probeDuration(input2, ffmpeg);
-  if (!Number.isFinite(duration3) || duration3 <= fadeSec + 1) {
-    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${duration3}s)`);
+  const fullDuration = await probeDuration(input2, ffmpeg);
+  if (!Number.isFinite(fullDuration) || fullDuration <= fadeSec + 1) {
+    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${fullDuration}s)`);
+  }
+  const duration3 = Math.min(fullDuration, options.seconds ?? fullDuration);
+  const startAt = Math.min(options.startAt ?? 0, fullDuration - duration3);
+  if (duration3 <= fadeSec + 1) {
+    throw new LoopError(`Truncated input too short for a ${fadeSec}s crossfade (duration ${duration3}s)`);
   }
   const tailStart = duration3 - fadeSec;
   const mainEnd = duration3 - fadeSec;
+  const scale = options.maxWidth && options.maxWidth > 0 ? `scale=w='min(${options.maxWidth}\\,iw)':h=-2,` : "";
   const filter = [
     `[0:v]split[base][src]`,
     // crossfade base: the source tail, head image fades in over it
@@ -37487,7 +37527,8 @@ async function makeSeamless(input2, output2, fadeSec, ffmpegPath) {
     `[tail][head]overlay=format=auto[xfade]`,
     // main body: the source between the crossfade end and the tail start
     `[base]trim=start=${fadeSec.toFixed(4)}:end=${mainEnd.toFixed(4)},setpts=PTS-STARTPTS[main]`,
-    `[xfade][main]concat=n=2:v=1:a=0[out]`
+    `[xfade][main]concat=n=2:v=1:a=0[joined]`,
+    `[joined]${scale}format=yuv420p[out]`
   ].join(";");
   mkdirSync2(path5.dirname(path5.resolve(output2)), { recursive: true });
   await exec4(ffmpeg, [
@@ -37495,6 +37536,10 @@ async function makeSeamless(input2, output2, fadeSec, ffmpegPath) {
     "-hide_banner",
     "-loglevel",
     "warning",
+    // -ss/-t BEFORE -i: they must limit what the FILTERS see (an output-side
+    // -t would cap the result while the trims ran on the whole stream).
+    ...options.startAt ? ["-ss", startAt.toFixed(3)] : [],
+    ...options.seconds ? ["-t", duration3.toFixed(3)] : [],
     "-i",
     input2,
     "-filter_complex",
@@ -37513,7 +37558,7 @@ async function makeSeamless(input2, output2, fadeSec, ffmpegPath) {
     "+faststart",
     "-an",
     output2
-  ], { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 });
+  ], { timeout: 6e5, maxBuffer: 16 * 1024 * 1024 });
   const outputDuration = await probeDuration(output2, ffmpeg);
   return { inputDuration: duration3, outputDuration };
 }
@@ -37737,6 +37782,21 @@ import { execFile as execFile6 } from "node:child_process";
 import fs7 from "node:fs";
 import path7 from "node:path";
 import { promisify as promisify6 } from "node:util";
+function findVideoInDir(dir) {
+  for (const subdir of ["", "files"]) {
+    const base = path7.join(dir, subdir);
+    let entries;
+    try {
+      entries = fs7.readdirSync(base);
+    } catch {
+      continue;
+    }
+    const hit = entries.find((e2) => /\.(mp4|webm)$/i.test(e2));
+    if (hit)
+      return path7.join(base, hit);
+  }
+  return void 0;
+}
 function resolveSceneInput(input2) {
   let stat;
   try {
@@ -37761,21 +37821,35 @@ function resolveSceneInput(input2) {
 }
 async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath) {
   const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
-  pkgPath = resolveSceneInput(pkgPath);
   onProgress("detect", pkgPath);
-  const type = detectWallpaperType(pkgPath);
-  if (type !== "scene") {
-    throw new SceneImportError(`Not a scene wallpaper (${type}): ${pkgPath}`);
+  let type = detectWallpaperType(pkgPath);
+  try {
+    if (type === "video" && fs7.statSync(pkgPath).isDirectory()) {
+      const videoFile = findVideoInDir(pkgPath);
+      if (!videoFile)
+        throw new SceneImportError(`No .mp4/.webm inside video wallpaper directory: ${pkgPath}`);
+      pkgPath = videoFile;
+    } else if (type !== "video") {
+      pkgPath = resolveSceneInput(pkgPath);
+      type = detectWallpaperType(pkgPath);
+    }
+  } catch (err) {
+    if (err instanceof SceneImportError)
+      throw err;
   }
+  if (type !== "scene" && type !== "video") {
+    throw new SceneImportError(`Not a scene or video wallpaper (${type}): ${pkgPath}`);
+  }
+  const isVideo = type === "video";
   onProgress("deps");
   const missing = [];
-  if (!(await checkWallpaperEngine()).ok)
+  if (!isVideo && !(await checkWallpaperEngine()).ok)
     missing.push("we");
   if (!(await checkFfmpeg()).ok)
     missing.push("ffmpeg");
   if (missing.length > 0)
     throw new MissingDependencyError(missing);
-  const hash2 = computeHash(pkgPath, {
+  const hash2 = isVideo ? computeHash(pkgPath, { kind: "video", maxWidth: 1920, maxSeconds: opts.maxSeconds, fadeSec: opts.fadeSec }) : computeHash(pkgPath, {
     width: opts.width,
     height: opts.height,
     fps: opts.fps,
@@ -37789,6 +37863,29 @@ async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffm
     touchCache(hash2);
     enforceLimit(opts.maxCacheBytes);
     return { loopPath, posterPath, hash: hash2, blackness: { blackFraction: -1, meanLuma: -1, durationSec: -1 }, fromCache: true };
+  }
+  if (isVideo) {
+    onProgress("analyzing", pkgPath);
+    const sourceDuration = await probeDuration(pkgPath, ffmpegPath ?? (await checkFfmpeg()).path);
+    const trim = sourceDuration > opts.maxSeconds ? { startAt: (sourceDuration - opts.maxSeconds) / 2, seconds: opts.maxSeconds } : void 0;
+    if (trim)
+      onProgress("truncating", `${sourceDuration.toFixed(1)}s -> ${opts.maxSeconds}s`);
+    onProgress("processing", `crossfade ${opts.fadeSec}s`);
+    const tmpLoop = `${loopPath}.tmp.mp4`;
+    await makeSeamless(pkgPath, tmpLoop, opts.fadeSec, ffmpegPath, {
+      startAt: trim?.startAt,
+      seconds: trim?.seconds,
+      maxWidth: 1920
+    });
+    onProgress("poster");
+    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    onProgress("saving", hash2);
+    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.renameSync(tmpLoop, loopPath);
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    enforceLimit(opts.maxCacheBytes);
+    onProgress("done", loopPath);
+    return { loopPath, posterPath, hash: hash2, blackness, fromCache: false };
   }
   onProgress("opening", `window "${opts.title}"`);
   const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
@@ -37873,7 +37970,8 @@ var init_scenePipeline = __esm({
       duration: 15,
       fadeSec: 1,
       title: "WE_Render",
-      maxCacheBytes: 10 * 1024 ** 3
+      maxCacheBytes: 10 * 1024 ** 3,
+      maxSeconds: 60
     };
   }
 });
@@ -145620,7 +145718,8 @@ async function applyWallpaper(imagePath, opts) {
   const abs = path8.resolve(imagePath);
   if (!fs8.existsSync(abs))
     throw new Error(`Image not found: ${abs}`);
-  if (detectWallpaperType(abs) === "scene") {
+  const kind = detectWallpaperType(abs);
+  if (kind === "scene" || kind === "video") {
     const result = await applySceneWallpaper(abs, opts);
     return { windows: result.windows, config: result.config };
   }
@@ -145766,12 +145865,12 @@ server.registerTool("set_background", {
   }
 }, async ({ image_path, blur, dim }) => {
   try {
-    const isScene = detectWallpaperType(image_path) === "scene";
-    const { windows } = isScene ? await applySceneWallpaper(image_path, { blur, dim }) : await applyWallpaper(image_path, { blur, dim });
+    const kind = detectWallpaperType(image_path);
+    const { windows } = kind === "scene" || kind === "video" ? await applySceneWallpaper(image_path, { blur, dim }) : await applyWallpaper(image_path, { blur, dim });
     return {
       content: [{
         type: "text",
-        text: isScene ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.` : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`
+        text: kind === "scene" ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.` : kind === "video" ? `Video wallpaper imported (trimmed and looped) and applied to ${windows} window(s).` : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`
       }]
     };
   } catch (err) {

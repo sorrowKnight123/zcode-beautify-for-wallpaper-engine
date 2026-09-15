@@ -1,6 +1,7 @@
-# CHANGES.md — 动态壁纸（Wallpaper Engine 场景）支持
+# CHANGES.md — 动态壁纸（Wallpaper Engine 场景 / 视频壁纸）支持
 
 > 基于 fork 上游 0.2.1（27d8699）。所有改动均为增量，静态壁纸原有链路保持不变。
+> 0.3.0：场景壁纸 + 视频壁纸（.mp4/.webm 直接导入）+ 循环冻结看门狗 + ZCode 启动自动拉起 serve。
 
 ## 功能概述
 

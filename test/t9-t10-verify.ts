@@ -74,7 +74,7 @@ for (const ui of ["zb-import", "zb-progress", "zb-guide", "zb-guide-retry", "zb-
   check(`panel element ${ui}`, panelSrc.includes(ui));
 }
 check("panel polls import status", panelSrc.includes("/api/import-status"));
-check("panel groups library image/scene", panelSrc.includes("壁纸库 — 场景") && panelSrc.includes("壁纸库 — 图片"));
+check("panel groups library image/scene", panelSrc.includes("壁纸库 — 动态") && panelSrc.includes("壁纸库 — 图片"));
 
 const cliSrc = fs.readFileSync(path.resolve("./src/cli.ts"), "utf8");
 check("cli apply-scene command", cliSrc.includes('"apply-scene"') && cliSrc.includes("applySceneWallpaper"));
