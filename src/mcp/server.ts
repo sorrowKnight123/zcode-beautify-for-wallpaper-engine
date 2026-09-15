@@ -78,16 +78,20 @@ server.registerTool(
   },
   async ({ image_path, blur, dim }) => {
     try {
-      const isScene = detectWallpaperType(image_path) === "scene";
-      const { windows } = isScene
-        ? await applySceneWallpaper(image_path, { blur, dim })
-        : await applyWallpaper(image_path, { blur, dim });
+      const kind = detectWallpaperType(image_path);
+      const { windows } =
+        kind === "scene" || kind === "video"
+          ? await applySceneWallpaper(image_path, { blur, dim })
+          : await applyWallpaper(image_path, { blur, dim });
       return {
         content: [{
           type: "text",
-          text: isScene
-            ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.`
-            : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`,
+          text:
+            kind === "scene"
+              ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.`
+              : kind === "video"
+                ? `Video wallpaper imported (trimmed and looped) and applied to ${windows} window(s).`
+                : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`,
         }],
       };
     } catch (err) {

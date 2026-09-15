@@ -29,9 +29,10 @@ export async function applyWallpaper(imagePath: string, opts: ApplyOptions): Pro
   const abs = path.resolve(imagePath);
   if (!fs.existsSync(abs)) throw new Error(`Image not found: ${abs}`);
 
-  // Scene wallpapers route through the render pipeline and end up as a loop
-  // video + Monet theme from the poster frame.
-  if (detectWallpaperType(abs) === "scene") {
+  // Scene and video wallpapers route through the render pipeline and end up
+  // as a loop video + Monet theme from the poster frame.
+  const kind = detectWallpaperType(abs);
+  if (kind === "scene" || kind === "video") {
     const result = await applySceneWallpaper(abs, opts);
     return { windows: result.windows, config: result.config };
   }

@@ -17,7 +17,7 @@ import { detectWallpaperType } from "./wallpaperType.js";
 import { checkWallpaperEngine, checkFfmpeg } from "./dependencyCheck.js";
 import { openSceneWindow, closeSceneWindow } from "./weLauncher.js";
 import { recordSceneWindow, analyzeBlackness } from "./recorder.js";
-import { makeSeamless } from "./loopProcessor.js";
+import { makeSeamless, probeDuration } from "./loopProcessor.js";
 import { computeHash, getCachePath, hasCache, touchCache, enforceLimit } from "./cacheManager.js";
 
 export interface SceneImportOptions {
@@ -27,6 +27,8 @@ export interface SceneImportOptions {
   /** Raw capture length in seconds; the loop ends up duration - fade. */
   duration?: number;
   fadeSec?: number;
+  /** Video imports longer than this are truncated to a middle segment. */
+  maxSeconds?: number;
   /** Window title for the temporary WE render window. */
   title?: string;
   maxCacheBytes?: number;
@@ -51,6 +53,22 @@ export class MissingDependencyError extends Error {
 }
 
 export class SceneImportError extends Error {}
+
+/** First .mp4/.webm in the directory root, then its files/ subfolder. */
+function findVideoInDir(dir: string): string | undefined {
+  for (const subdir of ["", "files"]) {
+    const base = path.join(dir, subdir);
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      continue;
+    }
+    const hit = entries.find((e) => /\.(mp4|webm)$/i.test(e));
+    if (hit) return path.join(base, hit);
+  }
+  return undefined;
+}
 
 /**
  * Accepts the many ways a user can point at a scene wallpaper: a `.pkg`
@@ -77,7 +95,7 @@ export function resolveSceneInput(input: string): string {
   return input;
 }
 
-export const DEFAULT_SCENE_OPTIONS: Required<Pick<SceneImportOptions, "width" | "height" | "fps" | "duration" | "fadeSec" | "title" | "maxCacheBytes">> = {
+export const DEFAULT_SCENE_OPTIONS: Required<Pick<SceneImportOptions, "width" | "height" | "fps" | "duration" | "fadeSec" | "title" | "maxCacheBytes" | "maxSeconds">> = {
   width: 1920,
   height: 1080,
   fps: 30,
@@ -85,6 +103,7 @@ export const DEFAULT_SCENE_OPTIONS: Required<Pick<SceneImportOptions, "width" | 
   fadeSec: 1,
   title: "WE_Render",
   maxCacheBytes: 10 * 1024 ** 3,
+  maxSeconds: 60,
 };
 
 export async function importScene(
@@ -95,26 +114,46 @@ export async function importScene(
 ): Promise<SceneImportResult> {
   const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
 
-  pkgPath = resolveSceneInput(pkgPath);
   onProgress("detect", pkgPath);
-  const type = detectWallpaperType(pkgPath);
-  if (type !== "scene") {
-    throw new SceneImportError(`Not a scene wallpaper (${type}): ${pkgPath}`);
+  let type = detectWallpaperType(pkgPath);
+
+  // A video input stays a file (the footage itself); a video-type DIRECTORY
+  // (WE video wallpapers have project.json too) resolves to the video inside.
+  // Everything else may point at any file inside the wallpaper directory.
+  try {
+    if (type === "video" && fs.statSync(pkgPath).isDirectory()) {
+      const videoFile = findVideoInDir(pkgPath);
+      if (!videoFile) throw new SceneImportError(`No .mp4/.webm inside video wallpaper directory: ${pkgPath}`);
+      pkgPath = videoFile;
+    } else if (type !== "video") {
+      pkgPath = resolveSceneInput(pkgPath);
+      type = detectWallpaperType(pkgPath);
+    }
+  } catch (err) {
+    if (err instanceof SceneImportError) throw err;
+    /* stat failed on a nonexistent path — detect below reports it */
   }
+  if (type !== "scene" && type !== "video") {
+    throw new SceneImportError(`Not a scene or video wallpaper (${type}): ${pkgPath}`);
+  }
+  const isVideo = type === "video";
 
   onProgress("deps");
+  // Video imports need no Wallpaper Engine — ffmpeg alone suffices.
   const missing: Array<"we" | "ffmpeg"> = [];
-  if (!(await checkWallpaperEngine()).ok) missing.push("we");
+  if (!isVideo && !(await checkWallpaperEngine()).ok) missing.push("we");
   if (!(await checkFfmpeg()).ok) missing.push("ffmpeg");
   if (missing.length > 0) throw new MissingDependencyError(missing);
 
-  const hash = computeHash(pkgPath, {
-    width: opts.width,
-    height: opts.height,
-    fps: opts.fps,
-    duration: opts.duration,
-    fadeSec: opts.fadeSec,
-  });
+  const hash = isVideo
+    ? computeHash(pkgPath, { kind: "video", maxWidth: 1920, maxSeconds: opts.maxSeconds, fadeSec: opts.fadeSec })
+    : computeHash(pkgPath, {
+        width: opts.width,
+        height: opts.height,
+        fps: opts.fps,
+        duration: opts.duration,
+        fadeSec: opts.fadeSec,
+      });
   const loopPath = getCachePath(hash);
   const posterPath = path.join(path.dirname(loopPath), "poster.jpg");
 
@@ -123,6 +162,39 @@ export async function importScene(
     touchCache(hash);
     enforceLimit(opts.maxCacheBytes);
     return { loopPath, posterPath, hash, blackness: { blackFraction: -1, meanLuma: -1, durationSec: -1 }, fromCache: true };
+  }
+
+  if (isVideo) {
+    // Direct video wallpaper: no WE window, no recording — the source IS the
+    // footage. Normalize (truncate long clips, cap width), loop, poster, cache.
+    onProgress("analyzing", pkgPath);
+    const sourceDuration = await probeDuration(pkgPath, ffmpegPath ?? (await checkFfmpeg()).path!);
+    const trim =
+      sourceDuration > opts.maxSeconds
+        ? { startAt: (sourceDuration - opts.maxSeconds) / 2, seconds: opts.maxSeconds }
+        : undefined;
+    if (trim) onProgress("truncating", `${sourceDuration.toFixed(1)}s -> ${opts.maxSeconds}s`);
+
+    onProgress("processing", `crossfade ${opts.fadeSec}s`);
+    const tmpLoop = `${loopPath}.tmp.mp4`;
+    await makeSeamless(pkgPath, tmpLoop, opts.fadeSec, ffmpegPath, {
+      startAt: trim?.startAt,
+      seconds: trim?.seconds,
+      maxWidth: 1920,
+    });
+
+    onProgress("poster");
+    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+
+    onProgress("saving", hash);
+    fs.mkdirSync(path.dirname(loopPath), { recursive: true });
+    fs.renameSync(tmpLoop, loopPath);
+
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    enforceLimit(opts.maxCacheBytes);
+
+    onProgress("done", loopPath);
+    return { loopPath, posterPath, hash, blackness, fromCache: false };
   }
 
   onProgress("opening", `window "${opts.title}"`);

@@ -32,22 +32,42 @@ const exec = promisify(execFile);
 
 export class LoopError extends Error {}
 
+export interface SeamlessOptions {
+  /** Cut the source from startAt for `seconds` before looping (long inputs). */
+  startAt?: number;
+  seconds?: number;
+  /** Downscale so width <= maxWidth (keeps aspect, even heights). Default no scaling. */
+  maxWidth?: number;
+}
+
 export async function makeSeamless(
   input: string,
   output: string,
   fadeSec: number,
   ffmpegPath?: string,
+  options: SeamlessOptions = {},
 ): Promise<{ inputDuration: number; outputDuration: number }> {
   const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
   if (!ffmpeg) throw new LoopError("ffmpeg not found — cannot process loop");
 
-  const duration = await probeDuration(input, ffmpeg);
-  if (!Number.isFinite(duration) || duration <= fadeSec + 1) {
-    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${duration}s)`);
+  const fullDuration = await probeDuration(input, ffmpeg);
+  if (!Number.isFinite(fullDuration) || fullDuration <= fadeSec + 1) {
+    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${fullDuration}s)`);
+  }
+  // Long inputs are truncated to a middle segment before the crossfade; the
+  // whole file would balloon the cache for minutes-long sources.
+  const duration = Math.min(fullDuration, options.seconds ?? fullDuration);
+  const startAt = Math.min(options.startAt ?? 0, fullDuration - duration);
+  if (duration <= fadeSec + 1) {
+    throw new LoopError(`Truncated input too short for a ${fadeSec}s crossfade (duration ${duration}s)`);
   }
 
   const tailStart = duration - fadeSec;
   const mainEnd = duration - fadeSec;
+  const scale =
+    options.maxWidth && options.maxWidth > 0
+      ? `scale=w='min(${options.maxWidth}\\,iw)':h=-2,`
+      : "";
   const filter = [
     `[0:v]split[base][src]`,
     // crossfade base: the source tail, head image fades in over it
@@ -56,12 +76,17 @@ export async function makeSeamless(
     `[tail][head]overlay=format=auto[xfade]`,
     // main body: the source between the crossfade end and the tail start
     `[base]trim=start=${fadeSec.toFixed(4)}:end=${mainEnd.toFixed(4)},setpts=PTS-STARTPTS[main]`,
-    `[xfade][main]concat=n=2:v=1:a=0[out]`,
+    `[xfade][main]concat=n=2:v=1:a=0[joined]`,
+    `[joined]${scale}format=yuv420p[out]`,
   ].join(";");
 
   mkdirSync(path.dirname(path.resolve(output)), { recursive: true });
   await exec(ffmpeg, [
     "-y", "-hide_banner", "-loglevel", "warning",
+    // -ss/-t BEFORE -i: they must limit what the FILTERS see (an output-side
+    // -t would cap the result while the trims ran on the whole stream).
+    ...(options.startAt ? ["-ss", startAt.toFixed(3)] : []),
+    ...(options.seconds ? ["-t", duration.toFixed(3)] : []),
     "-i", input,
     "-filter_complex", filter,
     "-map", "[out]",
@@ -72,7 +97,7 @@ export async function makeSeamless(
     "-movflags", "+faststart",
     "-an",
     output,
-  ], { timeout: 300_000, maxBuffer: 16 * 1024 * 1024 });
+  ], { timeout: 600_000, maxBuffer: 16 * 1024 * 1024 });
 
   const outputDuration = await probeDuration(output, ffmpeg);
   return { inputDuration: duration, outputDuration };
@@ -103,7 +128,8 @@ export async function loopSeamSsim(file: string, ffmpegPath?: string): Promise<n
   }
 }
 
-async function probeDuration(file: string, ffmpegPath: string): Promise<number> {
+/** Container duration in seconds (ffprobe with an ffmpeg -i fallback). */
+export async function probeDuration(file: string, ffmpegPath: string): Promise<number> {
   // ffprobe ships next to ffmpeg in standard distributions; fall back to ffmpeg -i.
   const ffprobe = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
   try {

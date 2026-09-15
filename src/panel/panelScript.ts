@@ -110,11 +110,11 @@ export function buildPanelScript(apiPort: number): string {
     '      <label class="zb-btn" for="zb-file" title="选择一张图片作为背景壁纸,UI 配色随之更新">更换图片…</label>' +
     '      <input type="file" id="zb-file" accept="image/*" hidden>' +
     '    </div>' +
-    '    <div class="zb-row"><label style="opacity:.85"><span>场景壁纸 (Wallpaper Engine)</span></label>' +
+    '    <div class="zb-row"><label style="opacity:.85"><span>动态壁纸 (场景 / 视频)</span></label>' +
     '      <div class="zb-actions" style="margin:2px 0 6px">' +
-    '        <button class="zb-btn" id="zb-pick" title="打开文件选择器,选 .pkg 或壁纸目录内任意文件(会自动定位壁纸目录)并开始导入">选择并导入…</button>' +
+    '        <button class="zb-btn" id="zb-pick" title="打开文件选择器:选 .pkg(场景)或 .mp4(视频),或壁纸目录内任意文件(会自动定位),选完自动开始导入">选择并导入…</button>' +
     '      </div>' +
-    '      <input type="text" id="zb-scene-path" placeholder="或粘贴 .pkg / 壁纸目录完整路径…" spellcheck="false">' +
+    '      <input type="text" id="zb-scene-path" placeholder="或粘贴 .pkg / .mp4 / 壁纸目录完整路径…" spellcheck="false">' +
     '      <div class="zb-actions" style="margin-top:6px">' +
     '        <button class="zb-btn" id="zb-import" title="渲染并录制场景壁纸,生成无缝循环动态背景">导入粘贴的路径</button>' +
     '      </div>' +
@@ -342,7 +342,7 @@ export function buildPanelScript(apiPort: number): string {
         var el = $('zb-lib');
         el.innerHTML = '';
         var head1 = document.createElement('div');
-        head1.className = 'zb-lib-head'; head1.textContent = '壁纸库 — 场景';
+        head1.className = 'zb-lib-head'; head1.textContent = '壁纸库 — 动态';
         el.appendChild(head1);
         (lib.scenes || []).forEach(function (s) {
           el.appendChild(libItem('场景 ' + s.hash.slice(0, 8), { hash: s.hash }, s.hash));
