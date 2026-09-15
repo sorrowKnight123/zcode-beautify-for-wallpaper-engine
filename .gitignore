@@ -28,3 +28,6 @@ Thumbs.db
 coverage/
 screenshots/
 packages/
+
+# test run artifacts (screenshots, recorded clips) — verify scripts & fixtures stay
+test/out/

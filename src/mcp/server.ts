@@ -3,38 +3,143 @@
  * the model can set a wallpaper / re-theme / reset on the user's behalf.
  */
 
+import { spawn } from "node:child_process";
+import { existsSync, statSync } from "node:fs";
+import path from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { applyColorsOnly, applyWallpaper, reapplyStored, resetAppearance } from "../core/session.js";
+import { applyColorsOnly, applyWallpaper, applySceneWallpaper, reapplyStored, resetAppearance } from "../core/session.js";
+import { detectWallpaperType } from "../core/wallpaperType.js";
 import { loadConfig } from "../core/launch.js";
+
+/**
+ * ZCode launches this MCP server on every app start — the ideal hook to make
+ * the settings panel "just exist": piggyback a detached `serve` process so it
+ * injects the panel as soon as the renderer is up. Idempotent (a healthy
+ * serve on the API port is left alone) and strictly fire-and-forget: a slow
+ * or failed bootstrap must never delay or break MCP startup.
+ */
+function bootstrapServe(): void {
+  try {
+    const serverFile = path.resolve(process.argv[1] ?? "");
+    // Only from the bundled layout (dist/mcp/server.js → dist/cli.js); under
+    // tsx from src/ there is nothing to point at, so skip quietly.
+    const cliJs = path.join(path.dirname(serverFile), "..", "cli.js");
+    if (path.basename(serverFile) !== "server.js" || !existsSync(cliJs)) return;
+    fetch("http://127.0.0.1:9223/api/health", { signal: AbortSignal.timeout(1500) })
+      .then((r) => r.json())
+      .then((body) => {
+        if ((body as { service?: string })?.service !== "zcode-beautify") throw new Error("foreign service");
+      })
+      .catch(() => {
+        try {
+          spawn(process.execPath, [cliJs, "serve", "--detach"], {
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+          }).unref();
+        } catch {
+          /* best effort */
+        }
+      });
+  } catch {
+    /* best effort */
+  }
+}
+bootstrapServe();
 
 const server = new McpServer({
   name: "zcode-beautify",
-  version: "0.2.1",
+  version: "0.3.0",
 });
+
+/** Registry of the tools this server exposes (used by tests / docs). */
+export const TOOL_NAMES = [
+  "set_background",
+  "import_scene_wallpaper",
+  "apply_options",
+  "refresh_theme",
+  "reset_appearance",
+  "beautify_status",
+] as const;
 
 server.registerTool(
   "set_background",
   {
     title: "Set ZCode wallpaper",
     description:
-      "Set the ZCode desktop client's background wallpaper image and adapt the UI colors with Material Design 3 (Monet) dynamic color. ZCode must be running with the CDP debug port (see zcode-beautify launch).",
+      "Set the ZCode desktop client's background wallpaper image and adapt the UI colors with Material Design 3 (Monet) dynamic color. Accepts a static image OR a Wallpaper Engine scene wallpaper (.pkg / workshop directory) — scene inputs are rendered, recorded and looped automatically. ZCode must be running with the CDP debug port (see zcode-beautify launch).",
     inputSchema: {
-      image_path: z.string().describe("Absolute path of the image to use as wallpaper"),
+      image_path: z.string().describe("Absolute path of the image, .pkg file, or scene directory to use as wallpaper"),
       blur: z.number().min(0).max(100).optional().describe("Wallpaper blur radius in px (default 0)"),
       dim: z.number().min(0).max(100).optional().describe("Wallpaper darkening 0-100 (default 25)"),
     },
   },
   async ({ image_path, blur, dim }) => {
     try {
-      const { windows } = await applyWallpaper(image_path, { blur, dim });
-      return { content: [{ type: "text", text: `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.` }] };
+      const isScene = detectWallpaperType(image_path) === "scene";
+      const { windows } = isScene
+        ? await applySceneWallpaper(image_path, { blur, dim })
+        : await applyWallpaper(image_path, { blur, dim });
+      return {
+        content: [{
+          type: "text",
+          text: isScene
+            ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.`
+            : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`,
+        }],
+      };
     } catch (err) {
       return { content: [{ type: "text", text: `Failed: ${(err as Error).message}` }], isError: true };
     }
   }
 );
+
+server.registerTool(
+  "import_scene_wallpaper",
+  {
+    title: "Import scene wallpaper",
+    description:
+      "Import a Wallpaper Engine scene wallpaper (.pkg file or extracted workshop directory) as an animated ZCode wallpaper: opens it in a Wallpaper Engine window, records ~15s with ffmpeg, processes it into a perfectly seamless loop, caches it, and applies it with Monet colors from a poster frame. Requires Wallpaper Engine and ffmpeg 5+ locally.",
+    inputSchema: {
+      path: z.string().describe("Absolute path of the .pkg file or the scene directory (project.json folder)"),
+      blur: z.number().min(0).max(100).optional().describe("Wallpaper blur radius in px"),
+      dim: z.number().min(0).max(100).optional().describe("Wallpaper darkening 0-100"),
+    },
+  },
+  async ({ path: scenePath, blur, dim }) => {
+    try {
+      const stages: string[] = [];
+      const { windows, served, scene } = await applySceneWallpaper(scenePath, {
+        blur,
+        dim,
+        onProgress: (stage) => {
+          if (stages[stages.length - 1] !== stage) stages.push(stage);
+        },
+      });
+      const notes = served
+        ? "Loop is streaming from the serve media endpoint."
+        : "serve is not running: the poster frame is applied as a static wallpaper. Run `zcode-beautify serve --detach`, then `refresh_theme`, to get motion.";
+      return {
+        content: [{
+          type: "text",
+          text: `Scene imported (${scene.fromCache ? "cache hit" : "freshly rendered"}, ${Math.round(statSizeMb(scene.loopPath))} MB) and applied to ${windows} window(s). Stages: ${stages.join(" → ")}. ${notes}`,
+        }],
+      };
+    } catch (err) {
+      return { content: [{ type: "text", text: `Failed: ${(err as Error).message}` }], isError: true };
+    }
+  }
+);
+
+function statSizeMb(file: string): number {
+  try {
+    return statSync(file).size / 1024 / 1024;
+  } catch {
+    return 0;
+  }
+}
 
 server.registerTool(
   "apply_options",

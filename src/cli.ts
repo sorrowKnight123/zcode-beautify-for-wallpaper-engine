@@ -27,6 +27,13 @@ Commands:
     --fit <mode>                 cover | contain | smart (default cover)
     --no-monet                   Keep ZCode's original colors
     --port <N>                   CDP port (default 9222)
+  apply-scene <pkg-or-dir> [options]
+                                 Import a Wallpaper Engine scene wallpaper,
+                                 render it to a seamless loop and apply it.
+                                 Accepts the same flags as 'apply'. Requires
+                                 Wallpaper Engine + ffmpeg 5+; a running
+                                 'serve' is needed for motion (otherwise the
+                                 poster frame is applied).
   colors [--port N]              Re-apply stored theme without wallpaper change
   reset [--port N]               Remove wallpaper and color overrides
   status [--port N]              Show CDP reachability and renderer targets
@@ -78,6 +85,28 @@ async function main(): Promise<void> {
           fit: flag("--fit") as ApplyOptions["fit"],
         });
         console.log(`Applied wallpaper + theme to ${windows} window(s).`);
+        break;
+      }
+      case "apply-scene": {
+        const scenePath = rest.find((a) => !a.startsWith("--"));
+        if (!scenePath) {
+          console.error(USAGE);
+          process.exitCode = 1;
+          return;
+        }
+        const { applySceneWallpaper } = await import("./core/session.js");
+        const { windows, served, scene } = await applySceneWallpaper(scenePath, {
+          port,
+          blur: Number(flag("--blur") ?? 0),
+          dim: Number(flag("--dim") ?? 25),
+          monet: !has("--no-monet"),
+          fit: flag("--fit") as ApplyOptions["fit"],
+          onProgress: (stage, detail) => console.log(`  [${stage}]${detail ? ` ${detail}` : ""}`),
+        });
+        console.log(`Scene ${scene.fromCache ? "loaded from cache" : "imported"} (${scene.hash.slice(0, 8)}) and applied to ${windows} window(s).`);
+        if (!served) {
+          console.log("Motion requires the serve media endpoint: run `zcode-beautify serve --detach`, then `zcode-beautify colors`.");
+        }
         break;
       }
       case "colors": {

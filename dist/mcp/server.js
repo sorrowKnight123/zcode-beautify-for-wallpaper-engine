@@ -3276,8 +3276,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path3) {
-      let input2 = path3;
+    function removeDotSegments(path10) {
+      let input2 = path10;
       const output2 = [];
       let nextSlash = -1;
       let len = 0;
@@ -3686,8 +3686,8 @@ var require_schemes = __commonJS({
       }
       if (wsComponent.resourceName) {
         const queryIndex = wsComponent.resourceName.indexOf("?");
-        const path3 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
-        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
+        const path10 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
+        wsComponent.path = path10 && path10 !== "/" ? path10 : void 0;
         wsComponent.query = queryIndex === -1 ? void 0 : wsComponent.resourceName.slice(queryIndex + 1);
         wsComponent.resourceName = void 0;
       }
@@ -7199,16 +7199,221 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f2;
     };
-    function addFormats(ajv, list, fs5, exportName) {
+    function addFormats(ajv, list, fs9, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f2 of list)
-        ajv.addFormat(f2, fs5[f2]);
+        ajv.addFormat(f2, fs9[f2]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
     exports.default = formatsPlugin;
+  }
+});
+
+// dist/core/cdp.js
+async function listTargets(port, host = "127.0.0.1") {
+  let res;
+  try {
+    res = await fetch(`http://${host}:${port}/json/list`, { signal: AbortSignal.timeout(3e3) });
+  } catch {
+    throw new CdpError(`Cannot reach CDP at ${host}:${port} \u2014 is ZCode running with --remote-debugging-port=${port}?`);
+  }
+  if (!res.ok)
+    throw new CdpError(`CDP /json/list returned HTTP ${res.status}`);
+  return await res.json();
+}
+function pickRendererTargets(targets) {
+  const pages = targets.filter((t2) => t2.type === "page" && t2.webSocketDebuggerUrl);
+  const main = pages.filter((t2) => t2.url.includes("out/renderer/index.html") || t2.title === "ZCode");
+  return main.length > 0 ? main : pages.filter((t2) => !t2.url.includes("devtools://"));
+}
+async function injectIntoTarget(target, payload) {
+  const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
+  try {
+    await conn.send("Page.enable");
+    await conn.send("Runtime.enable");
+    const bootstrap = buildBootstrapScript(payload);
+    await conn.send("Page.addScriptToEvaluateOnNewDocument", { source: bootstrap });
+    await conn.send("Runtime.evaluate", {
+      expression: bootstrap,
+      returnByValue: true
+    });
+  } finally {
+    conn.close();
+  }
+}
+function buildBootstrapScript(payload) {
+  const marker = payload.marker ?? "zcode-beautify";
+  const videoSrc = payload.videoSrc ?? "";
+  return `(function(){
+  var MARKER = ${JSON.stringify(marker)};
+  if (!window.__zcodeBeautify) window.__zcodeBeautify = {};
+  var VIDEO_SRC = ${JSON.stringify(videoSrc)};
+  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)} && window.__zcodeBeautify.videoSrc === VIDEO_SRC) return;
+  window.__zcodeBeautify.cssText = ${JSON.stringify(payload.css)};
+  window.__zcodeBeautify.videoSrc = VIDEO_SRC;
+
+  var style = document.getElementById(MARKER + '-style');
+  if (!style) {
+    style = document.createElement('style');
+    style.id = MARKER + '-style';
+    (document.head || document.documentElement).appendChild(style);
+  }
+  style.textContent = ${JSON.stringify(payload.css)};
+
+  var wp = document.getElementById(MARKER + '-wallpaper');
+  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))} || VIDEO_SRC) {
+    if (!wp) {
+      wp = document.createElement('div');
+      wp.id = MARKER + '-wallpaper';
+      document.documentElement.appendChild(wp);
+    }
+  }
+  var vid = document.getElementById(MARKER + '-video');
+  if (VIDEO_SRC) {
+    wp.style.backgroundImage = 'none';
+    if (!vid) {
+      vid = document.createElement('video');
+      vid.id = MARKER + '-video';
+      vid.setAttribute('autoplay', '');
+      vid.setAttribute('loop', '');
+      vid.setAttribute('muted', '');
+      vid.setAttribute('playsinline', '');
+      vid.muted = true;
+      vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';
+      wp.appendChild(vid);
+    }
+    if (vid.getAttribute('src') !== VIDEO_SRC) {
+      vid.setAttribute('src', VIDEO_SRC);
+      vid.load();
+    }
+    vid.play().catch(function() {});
+  } else {
+    if (vid) vid.remove();
+    if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+      wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
+    } else if (wp) {
+      wp.remove();
+    }
+  }
+
+  var FIT = ${JSON.stringify(payload.fit ?? "cover")};
+  var bp = document.getElementById(MARKER + '-backdrop');
+  if (FIT === 'contain' && ${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+    if (!bp) {
+      bp = document.createElement('div');
+      bp.id = MARKER + '-backdrop';
+      document.documentElement.appendChild(bp);
+    }
+    bp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
+    bp.dataset.on = '1';
+  } else if (bp) {
+    bp.dataset.on = '0';
+  }
+
+  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  if (!window.__zcodeBeautify.visBound) {
+    window.__zcodeBeautify.visBound = true;
+    document.addEventListener('visibilitychange', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
+    });
+  }
+
+  // Persist for the panel's self-heal path (best effort; large wallpapers may
+  // exceed the localStorage quota, in which case only the CSS is saved).
+  // Scene videos are never persisted: the src is a serve URL and the loop
+  // file itself would blow the quota.
+  try {
+    localStorage.setItem(MARKER + ':css', ${JSON.stringify(payload.css)});
+    localStorage.setItem(MARKER + ':wallpaper', ${JSON.stringify(payload.wallpaperDataUri ?? "")});
+  } catch (e) {}
+})();`;
+}
+function buildResetScript(marker = "zcode-beautify") {
+  return `(function(){
+  document.getElementById(${JSON.stringify(marker)} + '-style')?.remove();
+  document.getElementById(${JSON.stringify(marker)} + '-wallpaper')?.remove();
+  document.getElementById(${JSON.stringify(marker)} + '-backdrop')?.remove();
+  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; window.__zcodeBeautify.videoSrc = null; }
+})();`;
+}
+var CdpError, CdpConnection;
+var init_cdp = __esm({
+  "dist/core/cdp.js"() {
+    "use strict";
+    CdpError = class extends Error {
+    };
+    CdpConnection = class _CdpConnection {
+      ws;
+      nextId = 1;
+      pending = /* @__PURE__ */ new Map();
+      eventHandlers = /* @__PURE__ */ new Map();
+      targetUrl;
+      constructor(wsUrl) {
+        this.targetUrl = wsUrl;
+        this.ws = new WebSocket(wsUrl);
+        this.ws.addEventListener("message", (ev) => {
+          const msg = JSON.parse(String(ev.data));
+          if (msg.id !== void 0) {
+            const p2 = this.pending.get(msg.id);
+            if (p2) {
+              this.pending.delete(msg.id);
+              if (msg.error)
+                p2.reject(new CdpError(`${msg.error.message} (code ${msg.error.code})`));
+              else
+                p2.resolve(msg.result);
+            }
+          } else if (msg.method) {
+            this.eventHandlers.get(msg.method)?.forEach((h) => h(msg.params));
+          }
+        });
+        this.ws.addEventListener("close", () => {
+          for (const p2 of this.pending.values())
+            p2.reject(new CdpError("CDP connection closed"));
+          this.pending.clear();
+        });
+      }
+      static connect(wsUrl) {
+        return new Promise((resolve, reject) => {
+          const conn = new _CdpConnection(wsUrl);
+          const timer = setTimeout(() => reject(new CdpError("CDP websocket connect timeout")), 5e3);
+          conn.ws.addEventListener("open", () => {
+            clearTimeout(timer);
+            resolve(conn);
+          });
+          conn.ws.addEventListener("error", () => {
+            clearTimeout(timer);
+            reject(new CdpError(`CDP websocket error for ${wsUrl}`));
+          });
+        });
+      }
+      get isOpen() {
+        return this.ws.readyState === WebSocket.OPEN;
+      }
+      send(method, params = {}) {
+        const id = this.nextId++;
+        return new Promise((resolve, reject) => {
+          this.pending.set(id, { resolve, reject });
+          this.ws.send(JSON.stringify({ id, method, params }));
+        });
+      }
+      on(event, handler) {
+        let set2 = this.eventHandlers.get(event);
+        if (!set2)
+          this.eventHandlers.set(event, set2 = /* @__PURE__ */ new Set());
+        set2.add(handler);
+      }
+      close() {
+        try {
+          this.ws.close();
+        } catch {
+        }
+      }
+    };
   }
 });
 
@@ -11196,7 +11401,7 @@ var require_gifframe = __commonJS({
 var require_gifutil = __commonJS({
   "node_modules/gifwrap/src/gifutil.js"(exports) {
     "use strict";
-    var fs5 = __require("fs");
+    var fs9 = __require("fs");
     var ImageQ = require_image_q();
     var BitmapImage2 = require_bitmapimage();
     var { GifFrame: GifFrame2 } = require_gifframe();
@@ -11311,14 +11516,14 @@ var require_gifutil = __commonJS({
       jimpImage.bitmap.data = bitmapImageToShare.bitmap.data;
       return jimpImage;
     };
-    exports.write = function(path3, frames, spec, encoder) {
+    exports.write = function(path10, frames, spec, encoder) {
       encoder = encoder || defaultCodec;
-      const matches = path3.match(/\.[a-zA-Z]+$/);
+      const matches = path10.match(/\.[a-zA-Z]+$/);
       if (matches !== null && INVALID_SUFFIXES.includes(matches[0].toLowerCase())) {
-        throw new Error(`GIF '${path3}' has an unexpected suffix`);
+        throw new Error(`GIF '${path10}' has an unexpected suffix`);
       }
       return encoder.encodeGif(frames, spec).then((gif2) => {
-        return _writeBinary(path3, gif2.buffer).then(() => {
+        return _writeBinary(path10, gif2.buffer).then(() => {
           return gif2;
         });
       });
@@ -11390,9 +11595,9 @@ var require_gifutil = __commonJS({
         }
       }
     }
-    function _readBinary(path3) {
+    function _readBinary(path10) {
       return new Promise((resolve, reject) => {
-        fs5.readFile(path3, (err, buffer) => {
+        fs9.readFile(path10, (err, buffer) => {
           if (err) {
             return reject(err);
           }
@@ -11400,9 +11605,9 @@ var require_gifutil = __commonJS({
         });
       });
     }
-    function _writeBinary(path3, buffer) {
+    function _writeBinary(path10, buffer) {
       return new Promise((resolve, reject) => {
-        fs5.writeFile(path3, buffer, (err) => {
+        fs9.writeFile(path10, buffer, (err) => {
           if (err) {
             return reject(err);
           }
@@ -13381,9 +13586,9 @@ var require_decoder = __commonJS({
         return a2 < 0 ? 0 : a2 > 255 ? 255 : a2;
       }
       constructor.prototype = {
-        load: function load(path3) {
+        load: function load(path10) {
           var xhr = new XMLHttpRequest();
-          xhr.open("GET", path3, true);
+          xhr.open("GET", path10, true);
           xhr.responseType = "arraybuffer";
           xhr.onload = (function() {
             var data = new Uint8Array(xhr.response || xhr.mozResponseArrayBuffer);
@@ -23810,11 +24015,11 @@ var require_Mime = __commonJS({
         }
       }
     };
-    Mime.prototype.getType = function(path3) {
-      path3 = String(path3);
-      let last = path3.replace(/^.*[/\\]/, "").toLowerCase();
+    Mime.prototype.getType = function(path10) {
+      path10 = String(path10);
+      let last = path10.replace(/^.*[/\\]/, "").toLowerCase();
       let ext = last.replace(/^.*\./, "").toLowerCase();
-      let hasPath = last.length < path3.length;
+      let hasPath = last.length < path10.length;
       let hasDot = ext.length < last.length - 1;
       return (hasDot || !hasPath) && this._types[ext] || null;
     };
@@ -30001,8 +30206,8 @@ function isTokenizerStreamBoundsError(error62) {
   }
   return /strtok3[/\\]lib[/\\]stream[/\\]/.test(error62.stack);
 }
-async function fileTypeFromFile(path3, options) {
-  return new FileTypeParser2(options).fromFile(path3, options);
+async function fileTypeFromFile(path10, options) {
+  return new FileTypeParser2(options).fromFile(path10, options);
 }
 async function fileTypeFromStream(stream, options) {
   return new FileTypeParser2(options).fromStream(stream);
@@ -30033,9 +30238,9 @@ var init_file_type = __esm({
           }
         }
       }
-      async fromFile(path3) {
+      async fromFile(path10) {
         this.options.signal?.throwIfAborted();
-        const fileHandle = await fs2.open(path3, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
+        const fileHandle = await fs2.open(path10, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
         const fileStat = await fileHandle.stat();
         if (!fileStat.isFile()) {
           await fileHandle.close();
@@ -30044,7 +30249,7 @@ var init_file_type = __esm({
         const tokenizer = new FileTokenizer(fileHandle, {
           ...this.getTokenizerOptions(),
           fileInfo: {
-            path: path3,
+            path: path10,
             size: fileStat.size
           }
         });
@@ -36702,6 +36907,982 @@ var require_pixelmatch = __commonJS({
   }
 });
 
+// dist/core/launch.js
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import fs3 from "node:fs";
+import os from "node:os";
+import path from "node:path";
+function dataDir() {
+  return process.env.ZCODE_BEAUTIFY_DATA_DIR ?? path.join(os.homedir(), ".zcode", "cli", "plugins", "data", "zcode-beautify");
+}
+function configFile() {
+  return path.join(dataDir(), "config.json");
+}
+function loadConfig() {
+  try {
+    return JSON.parse(fs3.readFileSync(configFile(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+function saveConfig(config2) {
+  fs3.mkdirSync(dataDir(), { recursive: true });
+  fs3.writeFileSync(configFile(), JSON.stringify(config2, null, 2));
+}
+var ZCODE_EXE_CANDIDATES, execFileAsync;
+var init_launch = __esm({
+  "dist/core/launch.js"() {
+    "use strict";
+    init_cdp();
+    ZCODE_EXE_CANDIDATES = process.platform === "win32" ? [
+      process.env.ZCODE_WINDOWS_APP_INSTALL_DIR ? path.join(process.env.ZCODE_WINDOWS_APP_INSTALL_DIR, "ZCode.exe") : void 0,
+      "C:\\Program Files\\ZCode\\ZCode.exe",
+      path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode", "ZCode.exe")
+    ].filter(Boolean) : process.platform === "darwin" ? ["/Applications/ZCode.app/Contents/MacOS/ZCode"] : ["/usr/bin/zcode", "/opt/ZCode/zcode"];
+    execFileAsync = promisify(execFile);
+  }
+});
+
+// dist/core/wallpaperType.js
+import fs4 from "node:fs";
+import path2 from "node:path";
+function detectWallpaperType(input2) {
+  const ext = path2.extname(input2).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext))
+    return "image";
+  if (VIDEO_EXTENSIONS.has(ext))
+    return "video";
+  if (ext === ".pkg")
+    return "scene";
+  let stat;
+  try {
+    stat = fs4.statSync(input2);
+  } catch {
+    return "unknown";
+  }
+  if (!stat.isDirectory())
+    return "unknown";
+  return detectDirectoryType(input2);
+}
+function detectDirectoryType(dir) {
+  const project = readProjectJson(path2.join(dir, "project.json"));
+  const declared = typeof project?.type === "string" ? project.type.toLowerCase() : "";
+  if (declared === "scene" || declared === "video" || declared === "web") {
+    return declared;
+  }
+  const entryExt = path2.extname(typeof project?.file === "string" ? project.file : "").toLowerCase();
+  if (SCENE_ENTRY_EXTENSIONS.has(entryExt))
+    return "scene";
+  if (VIDEO_EXTENSIONS.has(entryExt))
+    return "video";
+  if (entryExt === ".html" || entryExt === ".htm")
+    return "web";
+  return detectFromDirectoryContents(dir);
+}
+function readProjectJson(file2) {
+  try {
+    return JSON.parse(fs4.readFileSync(file2, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function detectFromDirectoryContents(dir) {
+  let entries;
+  try {
+    entries = fs4.readdirSync(dir);
+  } catch {
+    return "unknown";
+  }
+  let nested = [];
+  if (entries.some((e2) => e2.toLowerCase() === "files")) {
+    try {
+      nested = fs4.readdirSync(path2.join(dir, "files")).map((e2) => path2.join("files", e2));
+    } catch {
+    }
+  }
+  for (const name of [...entries, ...nested]) {
+    const lower = name.toLowerCase();
+    const ext = path2.extname(lower);
+    if (lower === "scene.pkg" || lower === "scene.json")
+      return "scene";
+    if (ext === ".html" || ext === ".htm")
+      return "web";
+    if (VIDEO_EXTENSIONS.has(ext))
+      return "video";
+  }
+  return "unknown";
+}
+var IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, SCENE_ENTRY_EXTENSIONS;
+var init_wallpaperType = __esm({
+  "dist/core/wallpaperType.js"() {
+    "use strict";
+    IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp"]);
+    VIDEO_EXTENSIONS = /* @__PURE__ */ new Set([".mp4", ".webm"]);
+    SCENE_ENTRY_EXTENSIONS = /* @__PURE__ */ new Set([".pkg", ".json"]);
+  }
+});
+
+// dist/core/dependencyCheck.js
+import { execFile as execFile2 } from "node:child_process";
+import fs5 from "node:fs";
+import path3 from "node:path";
+import { promisify as promisify2 } from "node:util";
+async function checkWallpaperEngine() {
+  if (process.platform !== "win32") {
+    return { ok: false, detail: "Wallpaper Engine is Windows-only" };
+  }
+  const running = await findRunningWallpaperProcess();
+  if (running)
+    return { ok: true, path: running, detail: "detected via running wallpaper64.exe process" };
+  const registry2 = await findWallpaperInRegistry();
+  if (registry2)
+    return { ok: true, path: registry2, detail: "detected via HKLM\\SOFTWARE\\Wallpaper Engine" };
+  for (const candidate of steamLibraryCandidates()) {
+    const exe = path3.join(candidate, WE_EXE_RELATIVE);
+    if (isFile(exe))
+      return { ok: true, path: exe, detail: `detected via Steam library ${candidate}` };
+  }
+  const onPath = await whereExecutable("wallpaper64.exe");
+  if (onPath[0])
+    return { ok: true, path: onPath[0], detail: "detected on PATH" };
+  return { ok: false, detail: "wallpaper64.exe not found in registry, Steam libraries or PATH" };
+}
+async function checkFfmpeg() {
+  const override = process.env.ZCODE_BEAUTIFY_FFMPEG;
+  const candidates = override ? [override, ...await whereExecutable("ffmpeg")] : await whereExecutable("ffmpeg");
+  for (const candidate of candidates) {
+    const exe = isFile(candidate) ? candidate : void 0;
+    if (!exe)
+      continue;
+    const version2 = await ffmpegVersion(exe);
+    if (version2 === void 0)
+      continue;
+    if (version2.major < MIN_FFMPEG_MAJOR) {
+      return {
+        ok: false,
+        path: exe,
+        detail: `ffmpeg ${version2.raw} found but ddagrab needs >= ${MIN_FFMPEG_MAJOR}.0`
+      };
+    }
+    return { ok: true, path: exe, detail: `ffmpeg ${version2.raw}` };
+  }
+  return { ok: false, detail: "ffmpeg not found on PATH" + (override ? ` (env override ${override} not usable)` : "") };
+}
+async function findRunningWallpaperProcess() {
+  try {
+    const { stdout } = await exec("powershell", [
+      "-NoProfile",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "Name='wallpaper64.exe'" | Select-Object -First 1).ExecutablePath`
+    ], { timeout: 8e3 });
+    const p2 = stdout.trim();
+    return p2 && isFile(p2) ? p2 : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function findWallpaperInRegistry() {
+  for (const key of ["HKLM\\SOFTWARE\\Wallpaper Engine", "HKCU\\SOFTWARE\\Wallpaper Engine"]) {
+    try {
+      const { stdout } = await exec("reg", ["query", key, "/v", "InstallPath"], { timeout: 5e3 });
+      const match = /\sInstallPath\s+REG_SZ\s+(.+)/.exec(stdout);
+      const dir = match?.[1]?.trim();
+      if (dir) {
+        const exe = path3.join(dir, "wallpaper64.exe");
+        if (isFile(exe))
+          return exe;
+      }
+    } catch {
+    }
+  }
+  return void 0;
+}
+function steamLibraryCandidates() {
+  const candidates = /* @__PURE__ */ new Set();
+  const vdfRoots = [
+    "C:\\Program Files (x86)\\Steam",
+    "C:\\Program Files\\Steam",
+    ...driveRoots().flatMap((d) => [path3.join(d, "Steam"), path3.join(d, "SteamLibrary")])
+  ];
+  for (const root of vdfRoots) {
+    const vdf = path3.join(root, "steamapps", "libraryfolders.vdf");
+    for (const lib of parseVdfPaths(readFileSafe(vdf)))
+      candidates.add(lib);
+  }
+  for (const drive of driveRoots()) {
+    for (const name of ["SteamLibrary", "Steam", "Games\\Steam", "Program Files (x86)\\Steam"]) {
+      candidates.add(path3.join(drive, name));
+    }
+  }
+  return [...candidates];
+}
+function parseVdfPaths(vdf) {
+  const paths = [];
+  for (const match of vdf.matchAll(/"path"\s*"([^"]+)"/gi)) {
+    paths.push(match[1].replace(/\\\\/g, "\\"));
+  }
+  return paths;
+}
+function driveRoots() {
+  const roots = [];
+  for (let i2 = 67; i2 <= 90; i2++) {
+    const drive = `${String.fromCharCode(i2)}:\\`;
+    try {
+      fs5.accessSync(drive);
+      roots.push(drive);
+    } catch {
+    }
+  }
+  return roots;
+}
+async function whereExecutable(name) {
+  try {
+    const { stdout } = await exec("where", [name], { timeout: 5e3 });
+    return stdout.split(/\r?\n/).map((l2) => l2.trim()).filter((l2) => l2.length > 0);
+  } catch {
+    return [];
+  }
+}
+async function ffmpegVersion(exe) {
+  try {
+    const { stdout } = await exec(exe, ["-version"], { timeout: 8e3 });
+    const match = /ffmpeg version (\S+)/.exec(stdout);
+    if (!match)
+      return void 0;
+    const raw = match[1];
+    const numeric = raw.replace(/^n/i, "").match(/^(\d+)/);
+    if (!numeric)
+      return { raw, major: Number.MAX_SAFE_INTEGER };
+    return { raw, major: Number(numeric[1]) };
+  } catch {
+    return void 0;
+  }
+}
+function isFile(p2) {
+  try {
+    return fs5.statSync(p2).isFile();
+  } catch {
+    return false;
+  }
+}
+function readFileSafe(p2) {
+  try {
+    return fs5.readFileSync(p2, "utf8");
+  } catch {
+    return "";
+  }
+}
+var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
+var init_dependencyCheck = __esm({
+  "dist/core/dependencyCheck.js"() {
+    "use strict";
+    exec = promisify2(execFile2);
+    WE_EXE_RELATIVE = path3.join("wallpaper_engine", "wallpaper64.exe");
+    MIN_FFMPEG_MAJOR = 5;
+  }
+});
+
+// dist/core/weLauncher.js
+import { spawn as spawn2 } from "node:child_process";
+import { execFile as execFile3 } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
+async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
+  const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
+  if (!exe)
+    throw new SceneWindowError("Wallpaper Engine not found \u2014 cannot open scene window");
+  const proc = spawn2(exe, [
+    "-control",
+    "openWallpaper",
+    "-file",
+    pkgPath,
+    "-playInWindow",
+    opts.title,
+    "-width",
+    String(opts.width),
+    "-height",
+    String(opts.height)
+  ], { stdio: "ignore", detached: false });
+  proc.unref();
+  const hwnd = await waitForWindow(opts.title, 15e3);
+  if (hwnd === null) {
+    throw new SceneWindowError(`Window "${opts.title}" did not appear within 15s`);
+  }
+  const client = await positionWindow(hwnd, opts);
+  return { title: opts.title, hwnd, client, proc };
+}
+async function closeSceneWindow(handle, wallpaperExePath) {
+  const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
+  if (!exe)
+    throw new SceneWindowError("Wallpaper Engine not found \u2014 cannot close scene window");
+  await exec2(exe, ["-control", "closeWallpaper", "-playInWindow", handle.title], { timeout: 1e4 });
+  const deadline = Date.now() + 1e4;
+  while (Date.now() < deadline) {
+    const still = await findWindowOnce(handle.title);
+    if (still === null)
+      return;
+    await sleep(300);
+  }
+  throw new SceneWindowError(`Window "${handle.title}" still present 10s after closeWallpaper`);
+}
+async function waitForWindow(title, timeoutMs) {
+  const script = `${PS_WINDOW_HELPERS}
+$deadline = (Get-Date).AddMilliseconds(${timeoutMs})
+while ((Get-Date) -lt $deadline) {
+  $h = Find-WindowByTitle '${title}'
+  if ($null -ne $h) { Write-Output $h; exit 0 }
+  Start-Sleep -Milliseconds 300
+}
+exit 3`;
+  try {
+    const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: timeoutMs + 1e4 });
+    const hwnd = Number(stdout.trim());
+    return Number.isFinite(hwnd) && hwnd > 0 ? hwnd : null;
+  } catch {
+    return null;
+  }
+}
+async function findWindowOnce(title) {
+  const script = `${PS_WINDOW_HELPERS}
+$h = Find-WindowByTitle '${title}'
+if ($null -ne $h) { Write-Output $h }`;
+  try {
+    const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+    const hwnd = Number(stdout.trim());
+    return Number.isFinite(hwnd) && hwnd > 0 ? hwnd : null;
+  } catch {
+    return null;
+  }
+}
+async function positionWindow(hwnd, opts) {
+  const script = `${PS_WINDOW_HELPERS}
+$h = [IntPtr]${hwnd}
+$x = ${opts.x ?? -1}; $y = ${opts.y ?? -1}
+$w = ${opts.width}; $hh = ${opts.height}
+if ($x -eq -1 -or $y -eq -1) {
+  Add-Type -AssemblyName System.Windows.Forms
+  $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $x = [int](($b.Width - $w) / 2); $y = [int](($b.Height - $hh) / 2)
+}
+[Native.Win]::SetWindowPos($h, [IntPtr]::Zero, $x, $y, $w, $hh, 0x0004) | Out-Null  # SWP_NOZORDER
+Start-Sleep -Milliseconds 200
+$c = Measure-Client $h
+Write-Output ("{0},{1},{2},{3}" -f $c[0], $c[1], $c[2], $c[3])`;
+  const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+  return parseClientRect(stdout, opts.title);
+}
+async function measureClientRect(hwnd, title) {
+  const script = `${PS_WINDOW_HELPERS}
+$c = Measure-Client ([IntPtr]${hwnd})
+Write-Output ("{0},{1},{2},{3}" -f $c[0], $c[1], $c[2], $c[3])`;
+  const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+  return parseClientRect(stdout, title);
+}
+function parseClientRect(stdout, title) {
+  const [x2, y2, width, height] = stdout.trim().split(",").map(Number);
+  if (![x2, y2, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    throw new SceneWindowError(`Failed to measure client rect for "${title}" (got "${stdout.trim()}")`);
+  }
+  return { x: x2, y: y2, width, height };
+}
+function sleep(ms) {
+  return new Promise((r2) => setTimeout(r2, ms));
+}
+var exec2, SceneWindowError, PS_WINDOW_HELPERS;
+var init_weLauncher = __esm({
+  "dist/core/weLauncher.js"() {
+    "use strict";
+    init_dependencyCheck();
+    exec2 = promisify3(execFile3);
+    SceneWindowError = class extends Error {
+    };
+    PS_WINDOW_HELPERS = `
+# ddagrab captures PHYSICAL pixels; without DPI awareness PowerShell returns
+# logical (virtualized) coordinates and the crop lands on the wrong region.
+Add-Type -Namespace N -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[N.Dpi]::SetProcessDPIAware() | Out-Null
+Add-Type -Namespace Native -Name Win -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool SetWindowPos(IntPtr h, IntPtr after, int X, int Y, int cx, int cy, uint flags);
+[DllImport("user32.dll")]
+public static extern bool GetClientRect(IntPtr h, out RECT r);
+[DllImport("user32.dll")]
+public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+public struct RECT { public int Left, Top, Right, Bottom; }
+public struct POINT { public int X, Y; }
+'@
+Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class WinEnum {
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int m);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  public static string FindExact(string title) {
+    string hit = null;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      var sb = new StringBuilder(256);
+      GetWindowText(h, sb, 256);
+      if (sb.ToString() == title) { hit = h.ToString(); return false; }
+      return true;
+    }, IntPtr.Zero);
+    return hit;
+  }
+}
+'@
+function Find-WindowByTitle([string]$Title) {
+  # FindWindowW misbehaves under PowerShell string marshaling for these
+  # windows (verified: EnumWindows sees WE_Render, FindWindowW returns 0).
+  $r = [WinEnum]::FindExact($Title)
+  if ($r) { [long]$r } else { $null }
+}
+function Measure-Client([IntPtr]$h) {
+  $cr = New-Object Native.Win+RECT
+  [Native.Win]::GetClientRect($h, [ref]$cr) | Out-Null
+  $pt = New-Object Native.Win+POINT
+  [Native.Win]::ClientToScreen($h, [ref]$pt) | Out-Null
+  ,@($pt.X, $pt.Y, ($cr.Right - $cr.Left), ($cr.Bottom - $cr.Top))
+}
+`;
+  }
+});
+
+// dist/core/recorder.js
+import { execFile as execFile4 } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import path4 from "node:path";
+import { promisify as promisify4 } from "node:util";
+async function recordSceneWindow(handle, out, opts, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new RecordError("ffmpeg not found \u2014 cannot record scene window");
+  mkdirSync(path4.dirname(path4.resolve(out)), { recursive: true });
+  const client = await measureClientRect(handle.hwnd, handle.title);
+  const { x: x2, y: y2, width, height } = client;
+  const outW = opts.outWidth ?? 1920;
+  const outH = opts.outHeight ?? 1080;
+  const args = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-f",
+    "lavfi",
+    "-i",
+    `ddagrab=output_idx=0:framerate=${opts.fps}:draw_mouse=0`,
+    "-t",
+    String(opts.duration),
+    "-vf",
+    `hwdownload,format=bgra,crop=${width}:${height}:${x2}:${y2},scale=${outW}:${outH}`,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-an",
+    out
+  ];
+  await setTopmost(handle.hwnd, true);
+  try {
+    await exec3(ffmpeg, args, { timeout: (opts.duration + 30) * 1e3, maxBuffer: 16 * 1024 * 1024 });
+  } catch (err) {
+    throw new RecordError(`ffmpeg ddagrab capture failed: ${err.message}`);
+  } finally {
+    await setTopmost(handle.hwnd, false).catch(() => void 0);
+  }
+}
+async function analyzeBlackness(file2, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new RecordError("ffmpeg not found \u2014 cannot analyze footage");
+  let stderr = "";
+  try {
+    await exec3(ffmpeg, [
+      "-hide_banner",
+      "-i",
+      file2,
+      "-vf",
+      "blackdetect=d=0.5:pix_th=0.05",
+      "-an",
+      "-f",
+      "null",
+      "-"
+    ], { timeout: 12e4, maxBuffer: 16 * 1024 * 1024 }).then((r2) => stderr = r2.stderr);
+  } catch (err) {
+    stderr = err.stderr ?? String(err);
+  }
+  const durationSec = Number(/Duration: (\d+):(\d+):([\d.]+)/.exec(stderr)?.slice(1).reduce((acc, v) => acc * 60 + Number(v), 0) ?? 0);
+  const blackRanges = [...stderr.matchAll(/black_start:[\d.]+ black_end:([\d.]+) black_duration:([\d.]+)/g)];
+  const blackSec = blackRanges.reduce((sum, m) => sum + Number(m[2]), 0);
+  const blackFraction = durationSec > 0 ? blackSec / durationSec : 1;
+  const meanLuma = await meanLumaOf(file2, ffmpeg);
+  return { blackFraction, meanLuma, durationSec };
+}
+async function meanLumaOf(file2, ffmpeg) {
+  try {
+    const { stdout } = await exec3(ffmpeg, [
+      "-hide_banner",
+      "-i",
+      file2,
+      "-vf",
+      "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+      "-an",
+      "-f",
+      "null",
+      "-"
+    ], { timeout: 12e4, maxBuffer: 16 * 1024 * 1024 });
+    const values = [...stdout.matchAll(/YAVG=([\d.]+)/g)].map((m) => Number(m[1]));
+    if (values.length === 0)
+      return -1;
+    return values.reduce((a2, b) => a2 + b, 0) / values.length;
+  } catch {
+    return -1;
+  }
+}
+async function setTopmost(hwnd, topmost) {
+  const after = topmost ? -1 : -2;
+  await exec3("powershell", [
+    "-NoProfile",
+    "-Command",
+    `Add-Type -Namespace N -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
+[N.W]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]${after}, 0, 0, 0, 0, 0x0003)`
+  ], { timeout: 1e4 });
+}
+var exec3, RecordError;
+var init_recorder = __esm({
+  "dist/core/recorder.js"() {
+    "use strict";
+    init_dependencyCheck();
+    init_weLauncher();
+    exec3 = promisify4(execFile4);
+    RecordError = class extends Error {
+    };
+  }
+});
+
+// dist/core/loopProcessor.js
+import { execFile as execFile5 } from "node:child_process";
+import { mkdirSync as mkdirSync2 } from "node:fs";
+import path5 from "node:path";
+import { promisify as promisify5 } from "node:util";
+async function makeSeamless(input2, output2, fadeSec, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new LoopError("ffmpeg not found \u2014 cannot process loop");
+  const duration3 = await probeDuration(input2, ffmpeg);
+  if (!Number.isFinite(duration3) || duration3 <= fadeSec + 1) {
+    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${duration3}s)`);
+  }
+  const tailStart = duration3 - fadeSec;
+  const mainEnd = duration3 - fadeSec;
+  const filter = [
+    `[0:v]split[base][src]`,
+    // crossfade base: the source tail, head image fades in over it
+    `[src]trim=start=${tailStart.toFixed(4)},setpts=PTS-STARTPTS[tail]`,
+    `[base]trim=end=${fadeSec.toFixed(4)},setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:d=${fadeSec.toFixed(4)}:alpha=1[head]`,
+    `[tail][head]overlay=format=auto[xfade]`,
+    // main body: the source between the crossfade end and the tail start
+    `[base]trim=start=${fadeSec.toFixed(4)}:end=${mainEnd.toFixed(4)},setpts=PTS-STARTPTS[main]`,
+    `[xfade][main]concat=n=2:v=1:a=0[out]`
+  ].join(";");
+  mkdirSync2(path5.dirname(path5.resolve(output2)), { recursive: true });
+  await exec4(ffmpeg, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-i",
+    input2,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[out]",
+    "-c:v",
+    "libx264",
+    "-crf",
+    "18",
+    "-preset",
+    "veryfast",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-an",
+    output2
+  ], { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 });
+  const outputDuration = await probeDuration(output2, ffmpeg);
+  return { inputDuration: duration3, outputDuration };
+}
+async function probeDuration(file2, ffmpegPath) {
+  const ffprobe = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
+  try {
+    const { stdout } = await exec4(ffprobe, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file2], { timeout: 3e4 });
+    return Number(stdout.trim());
+  } catch {
+    const { stderr } = await exec4(ffmpegPath, ["-hide_banner", "-i", file2, "-f", "null", "-"], { timeout: 3e4, maxBuffer: 4 * 1024 * 1024 });
+    const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
+    return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number.NaN;
+  }
+}
+var exec4, LoopError;
+var init_loopProcessor = __esm({
+  "dist/core/loopProcessor.js"() {
+    "use strict";
+    init_dependencyCheck();
+    exec4 = promisify5(execFile5);
+    LoopError = class extends Error {
+    };
+  }
+});
+
+// dist/core/cacheManager.js
+import crypto from "node:crypto";
+import fs6 from "node:fs";
+import path6 from "node:path";
+function scenesCacheRoot() {
+  return path6.join(dataDir(), "scenes");
+}
+function getCachePath(hash2) {
+  return path6.join(scenesCacheRoot(), hash2, "loop.mp4");
+}
+function hasCache(hash2) {
+  try {
+    return fs6.statSync(getCachePath(hash2)).isFile() && fs6.statSync(getCachePath(hash2)).size > 0;
+  } catch {
+    return false;
+  }
+}
+function computeHash(pkgPath, opts) {
+  const md5 = crypto.createHash("md5");
+  md5.update(fingerprint(pkgPath));
+  md5.update(JSON.stringify(normalizeOpts(opts)));
+  return md5.digest("hex");
+}
+function touchCache(hash2) {
+  const file2 = getCachePath(hash2);
+  const now = /* @__PURE__ */ new Date();
+  try {
+    fs6.utimesSync(file2, now, now);
+  } catch {
+  }
+}
+function enforceLimit(maxBytes) {
+  const root = scenesCacheRoot();
+  let entries;
+  try {
+    entries = fs6.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  const sized = entries.filter((e2) => e2.isDirectory()).map((e2) => {
+    const dir = path6.join(root, e2.name);
+    try {
+      return { dir, size: dirSize(dir), lru: lastUseMs(dir) };
+    } catch {
+      return { dir, size: 0, lru: 0 };
+    }
+  });
+  let total = sized.reduce((sum, e2) => sum + e2.size, 0);
+  if (total <= maxBytes)
+    return total;
+  sized.sort((a2, b) => a2.lru - b.lru);
+  for (const entry of sized) {
+    if (total <= maxBytes)
+      break;
+    try {
+      fs6.rmSync(entry.dir, { recursive: true, force: true });
+    } catch {
+      continue;
+    }
+    total -= entry.size;
+  }
+  return total;
+}
+function normalizeOpts(opts) {
+  const sorted = {};
+  for (const key of Object.keys(opts).sort()) {
+    sorted[key] = opts[key];
+  }
+  return sorted;
+}
+function fingerprint(p2) {
+  let stat;
+  try {
+    stat = fs6.statSync(p2);
+  } catch {
+    return `missing:${p2}`;
+  }
+  if (stat.isFile()) {
+    const buf = crypto.createHash("md5");
+    buf.update(fs6.readFileSync(p2));
+    return `file:${stat.size}:${buf.digest("hex")}`;
+  }
+  if (stat.isDirectory()) {
+    const manifest = [];
+    const walk = (abs, rel) => {
+      let items;
+      try {
+        items = fs6.readdirSync(abs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const item of items) {
+        const childAbs = path6.join(abs, item.name);
+        const childRel = rel ? `${rel}/${item.name}` : item.name;
+        if (item.isDirectory()) {
+          walk(childAbs, childRel);
+        } else if (item.isFile()) {
+          let size = 0;
+          try {
+            size = fs6.statSync(childAbs).size;
+          } catch {
+          }
+          if (size <= 16 * 1024 * 1024) {
+            let content = "";
+            try {
+              content = crypto.createHash("md5").update(fs6.readFileSync(childAbs)).digest("hex");
+            } catch {
+              content = "unreadable";
+            }
+            manifest.push(`${childRel}:${size}:${content}`);
+          } else {
+            manifest.push(`${childRel}:${size}`);
+          }
+        }
+      }
+    };
+    walk(p2, "");
+    manifest.sort();
+    const buf = crypto.createHash("md5");
+    buf.update(manifest.join("\n"));
+    return `dir:${manifest.length}:${buf.digest("hex")}`;
+  }
+  return `other:${p2}`;
+}
+function dirSize(dir) {
+  let total = 0;
+  walkSize(dir);
+  return total;
+  function walkSize(dir2) {
+    let items;
+    try {
+      items = fs6.readdirSync(dir2, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const item of items) {
+      const child = path6.join(dir2, item.name);
+      if (item.isDirectory())
+        walkSize(child);
+      else if (item.isFile()) {
+        try {
+          total += fs6.statSync(child).size;
+        } catch {
+        }
+      }
+    }
+  }
+}
+function lastUseMs(dir) {
+  let newest = 0;
+  const consider = (st) => {
+    if (st?.isFile())
+      newest = Math.max(newest, st.mtimeMs);
+  };
+  let items;
+  try {
+    items = fs6.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const item of items) {
+    try {
+      const st = fs6.statSync(path6.join(dir, item.name));
+      consider(st);
+      if (item.isDirectory()) {
+        for (const inner of fs6.readdirSync(path6.join(dir, item.name), { withFileTypes: true })) {
+          try {
+            consider(fs6.statSync(path6.join(dir, item.name, inner.name)));
+          } catch {
+          }
+        }
+      }
+    } catch {
+    }
+  }
+  return newest;
+}
+var init_cacheManager = __esm({
+  "dist/core/cacheManager.js"() {
+    "use strict";
+    init_launch();
+  }
+});
+
+// dist/core/scenePipeline.js
+var scenePipeline_exports = {};
+__export(scenePipeline_exports, {
+  DEFAULT_SCENE_OPTIONS: () => DEFAULT_SCENE_OPTIONS,
+  MissingDependencyError: () => MissingDependencyError,
+  SceneImportError: () => SceneImportError,
+  extractPoster: () => extractPoster,
+  importScene: () => importScene,
+  resolveSceneInput: () => resolveSceneInput
+});
+import { execFile as execFile6 } from "node:child_process";
+import fs7 from "node:fs";
+import path7 from "node:path";
+import { promisify as promisify6 } from "node:util";
+function resolveSceneInput(input2) {
+  let stat;
+  try {
+    stat = fs7.statSync(input2);
+  } catch {
+    return input2;
+  }
+  if (stat.isDirectory())
+    return input2;
+  if (input2.toLowerCase().endsWith(".pkg"))
+    return input2;
+  let dir = path7.dirname(path7.resolve(input2));
+  for (let hop = 0; hop < 4; hop++) {
+    if (fs7.existsSync(path7.join(dir, "project.json")))
+      return dir;
+    const parent = path7.dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return input2;
+}
+async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath) {
+  const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
+  pkgPath = resolveSceneInput(pkgPath);
+  onProgress("detect", pkgPath);
+  const type = detectWallpaperType(pkgPath);
+  if (type !== "scene") {
+    throw new SceneImportError(`Not a scene wallpaper (${type}): ${pkgPath}`);
+  }
+  onProgress("deps");
+  const missing = [];
+  if (!(await checkWallpaperEngine()).ok)
+    missing.push("we");
+  if (!(await checkFfmpeg()).ok)
+    missing.push("ffmpeg");
+  if (missing.length > 0)
+    throw new MissingDependencyError(missing);
+  const hash2 = computeHash(pkgPath, {
+    width: opts.width,
+    height: opts.height,
+    fps: opts.fps,
+    duration: opts.duration,
+    fadeSec: opts.fadeSec
+  });
+  const loopPath = getCachePath(hash2);
+  const posterPath = path7.join(path7.dirname(loopPath), "poster.jpg");
+  if (hasCache(hash2)) {
+    onProgress("cache-hit", hash2);
+    touchCache(hash2);
+    enforceLimit(opts.maxCacheBytes);
+    return { loopPath, posterPath, hash: hash2, blackness: { blackFraction: -1, meanLuma: -1, durationSec: -1 }, fromCache: true };
+  }
+  onProgress("opening", `window "${opts.title}"`);
+  const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
+  try {
+    onProgress("render-ready", JSON.stringify(handle.client));
+    await new Promise((r2) => setTimeout(r2, 3e3));
+    onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
+    const rawPath = path7.join(path7.dirname(loopPath), `raw-${Date.now()}.mp4`);
+    fs7.mkdirSync(path7.dirname(rawPath), { recursive: true });
+    try {
+      await recordSceneWindow(handle, rawPath, { duration: opts.duration, fps: opts.fps, outWidth: opts.width, outHeight: opts.height }, ffmpegPath);
+    } finally {
+      onProgress("closing");
+      await closeSceneWindow(handle).catch(() => void 0);
+    }
+    onProgress("processing", `crossfade ${opts.fadeSec}s`);
+    const tmpLoop = `${loopPath}.tmp.mp4`;
+    await makeSeamless(rawPath, tmpLoop, opts.fadeSec, ffmpegPath);
+    onProgress("poster");
+    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    onProgress("saving", hash2);
+    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.renameSync(tmpLoop, loopPath);
+    fs7.rmSync(rawPath, { force: true });
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    enforceLimit(opts.maxCacheBytes);
+    onProgress("done", loopPath);
+    return { loopPath, posterPath, hash: hash2, blackness, fromCache: false };
+  } finally {
+    await closeSceneWindow(handle).catch(() => void 0);
+  }
+}
+async function extractPoster(loopFile, posterPath, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new SceneImportError("ffmpeg not found");
+  fs7.mkdirSync(path7.dirname(path7.resolve(posterPath)), { recursive: true });
+  await execFileP(ffmpeg, [
+    "-y",
+    "-loglevel",
+    "error",
+    "-ss",
+    "1",
+    // skip the crossfade's darkest opening moment
+    "-i",
+    loopFile,
+    "-frames:v",
+    "1",
+    "-update",
+    "1",
+    "-q:v",
+    "2",
+    posterPath
+  ], { timeout: 6e4 });
+}
+function execFileP(cmd, args, opts) {
+  return promisify6(execFile6)(cmd, args, opts);
+}
+var MissingDependencyError, SceneImportError, DEFAULT_SCENE_OPTIONS;
+var init_scenePipeline = __esm({
+  "dist/core/scenePipeline.js"() {
+    "use strict";
+    init_wallpaperType();
+    init_dependencyCheck();
+    init_weLauncher();
+    init_recorder();
+    init_loopProcessor();
+    init_cacheManager();
+    MissingDependencyError = class extends Error {
+      missing;
+      constructor(missing) {
+        super(`Missing dependencies: ${missing.join(", ")}`);
+        this.missing = missing;
+      }
+    };
+    SceneImportError = class extends Error {
+    };
+    DEFAULT_SCENE_OPTIONS = {
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      duration: 15,
+      fadeSec: 1,
+      title: "WE_Render",
+      maxCacheBytes: 10 * 1024 ** 3
+    };
+  }
+});
+
+// dist/mcp/server.js
+import { spawn as spawn3 } from "node:child_process";
+import { existsSync as existsSync2, statSync } from "node:fs";
+import path9 from "node:path";
+
 // node_modules/zod/v3/helpers/util.js
 var util;
 (function(util18) {
@@ -37076,8 +38257,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -37192,11 +38373,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -41150,10 +42331,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path3) {
-  if (!path3)
+function getElementAtPath(obj, path10) {
+  if (!path10)
     return obj;
-  return path3.reduce((acc, key) => acc?.[key], obj);
+  return path10.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -41493,11 +42674,11 @@ function explicitlyAborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path3, issues) {
+function prefixIssues(path10, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path3);
+    iss.path.unshift(path10);
     return iss;
   });
 }
@@ -41947,16 +43128,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path3 = []) => {
+  const processError = (error63, path10 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path10, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path10, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -41995,17 +43176,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path3 = []) => {
+  const processError = (error63, path10 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path10, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path10, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -42044,8 +43225,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path3 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path3) {
+  const path10 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path10) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -57560,11 +58741,11 @@ function normalizeObjectSchema(schema) {
   }
   return void 0;
 }
-function getDotPath(path3) {
-  if (path3.length === 0) {
+function getDotPath(path10) {
+  if (path10.length === 0) {
     return "object root";
   }
-  return path3.reduce((acc, seg, index) => {
+  return path10.reduce((acc, seg, index) => {
     if (index === 0) {
       return String(seg);
     }
@@ -59791,13 +60972,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path3 = ref.slice(1).split("/").filter(Boolean);
-  if (path3.length === 0) {
+  const path10 = ref.slice(1).split("/").filter(Boolean);
+  if (path10.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path3[0] === defsKey) {
-    const key = path3[1] === void 0 ? void 0 : decodeJSONPointerSegment(path3[1]);
+  if (path10[0] === defsKey) {
+    const key = path10[1] === void 0 ? void 0 : decodeJSONPointerSegment(path10[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -65981,168 +67162,11 @@ var StdioServerTransport = class {
 };
 
 // dist/core/session.js
-import fs4 from "node:fs";
-import path2 from "node:path";
+import fs8 from "node:fs";
+import path8 from "node:path";
 
-// dist/core/cdp.js
-var CdpError = class extends Error {
-};
-async function listTargets(port, host = "127.0.0.1") {
-  let res;
-  try {
-    res = await fetch(`http://${host}:${port}/json/list`, { signal: AbortSignal.timeout(3e3) });
-  } catch {
-    throw new CdpError(`Cannot reach CDP at ${host}:${port} \u2014 is ZCode running with --remote-debugging-port=${port}?`);
-  }
-  if (!res.ok)
-    throw new CdpError(`CDP /json/list returned HTTP ${res.status}`);
-  return await res.json();
-}
-function pickRendererTargets(targets) {
-  const pages = targets.filter((t2) => t2.type === "page" && t2.webSocketDebuggerUrl);
-  const main = pages.filter((t2) => t2.url.includes("out/renderer/index.html") || t2.title === "ZCode");
-  return main.length > 0 ? main : pages.filter((t2) => !t2.url.includes("devtools://"));
-}
-var CdpConnection = class _CdpConnection {
-  ws;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  eventHandlers = /* @__PURE__ */ new Map();
-  targetUrl;
-  constructor(wsUrl) {
-    this.targetUrl = wsUrl;
-    this.ws = new WebSocket(wsUrl);
-    this.ws.addEventListener("message", (ev) => {
-      const msg = JSON.parse(String(ev.data));
-      if (msg.id !== void 0) {
-        const p2 = this.pending.get(msg.id);
-        if (p2) {
-          this.pending.delete(msg.id);
-          if (msg.error)
-            p2.reject(new CdpError(`${msg.error.message} (code ${msg.error.code})`));
-          else
-            p2.resolve(msg.result);
-        }
-      } else if (msg.method) {
-        this.eventHandlers.get(msg.method)?.forEach((h) => h(msg.params));
-      }
-    });
-    this.ws.addEventListener("close", () => {
-      for (const p2 of this.pending.values())
-        p2.reject(new CdpError("CDP connection closed"));
-      this.pending.clear();
-    });
-  }
-  static connect(wsUrl) {
-    return new Promise((resolve, reject) => {
-      const conn = new _CdpConnection(wsUrl);
-      const timer = setTimeout(() => reject(new CdpError("CDP websocket connect timeout")), 5e3);
-      conn.ws.addEventListener("open", () => {
-        clearTimeout(timer);
-        resolve(conn);
-      });
-      conn.ws.addEventListener("error", () => {
-        clearTimeout(timer);
-        reject(new CdpError(`CDP websocket error for ${wsUrl}`));
-      });
-    });
-  }
-  get isOpen() {
-    return this.ws.readyState === WebSocket.OPEN;
-  }
-  send(method, params = {}) {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.ws.send(JSON.stringify({ id, method, params }));
-    });
-  }
-  on(event, handler) {
-    let set2 = this.eventHandlers.get(event);
-    if (!set2)
-      this.eventHandlers.set(event, set2 = /* @__PURE__ */ new Set());
-    set2.add(handler);
-  }
-  close() {
-    try {
-      this.ws.close();
-    } catch {
-    }
-  }
-};
-async function injectIntoTarget(target, payload) {
-  const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
-  try {
-    await conn.send("Page.enable");
-    await conn.send("Runtime.enable");
-    const bootstrap = buildBootstrapScript(payload);
-    await conn.send("Page.addScriptToEvaluateOnNewDocument", { source: bootstrap });
-    await conn.send("Runtime.evaluate", {
-      expression: bootstrap,
-      returnByValue: true
-    });
-  } finally {
-    conn.close();
-  }
-}
-function buildBootstrapScript(payload) {
-  const marker = payload.marker ?? "zcode-beautify";
-  return `(function(){
-  var MARKER = ${JSON.stringify(marker)};
-  if (!window.__zcodeBeautify) window.__zcodeBeautify = {};
-  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)}) return;
-  window.__zcodeBeautify.cssText = ${JSON.stringify(payload.css)};
-
-  var style = document.getElementById(MARKER + '-style');
-  if (!style) {
-    style = document.createElement('style');
-    style.id = MARKER + '-style';
-    (document.head || document.documentElement).appendChild(style);
-  }
-  style.textContent = ${JSON.stringify(payload.css)};
-
-  var wp = document.getElementById(MARKER + '-wallpaper');
-  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
-    if (!wp) {
-      wp = document.createElement('div');
-      wp.id = MARKER + '-wallpaper';
-      document.documentElement.appendChild(wp);
-    }
-    wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
-  } else if (wp) {
-    wp.remove();
-  }
-
-  var FIT = ${JSON.stringify(payload.fit ?? "cover")};
-  var bp = document.getElementById(MARKER + '-backdrop');
-  if (FIT === 'contain' && ${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
-    if (!bp) {
-      bp = document.createElement('div');
-      bp.id = MARKER + '-backdrop';
-      document.documentElement.appendChild(bp);
-    }
-    bp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
-    bp.dataset.on = '1';
-  } else if (bp) {
-    bp.dataset.on = '0';
-  }
-
-  // Persist for the panel's self-heal path (best effort; large wallpapers may
-  // exceed the localStorage quota, in which case only the CSS is saved).
-  try {
-    localStorage.setItem(MARKER + ':css', ${JSON.stringify(payload.css)});
-    localStorage.setItem(MARKER + ':wallpaper', ${JSON.stringify(payload.wallpaperDataUri ?? "")});
-  } catch (e) {}
-})();`;
-}
-function buildResetScript(marker = "zcode-beautify") {
-  return `(function(){
-  document.getElementById(${JSON.stringify(marker)} + '-style')?.remove();
-  document.getElementById(${JSON.stringify(marker)} + '-wallpaper')?.remove();
-  document.getElementById(${JSON.stringify(marker)} + '-backdrop')?.remove();
-  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; }
-})();`;
-}
+// dist/core/inject.js
+init_cdp();
 
 // node_modules/bmp-ts/dist/esm/header-types.js
 var HeaderTypes;
@@ -68526,8 +69550,8 @@ function getErrorMap3() {
 
 // node_modules/@jimp/types/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue2 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -68643,11 +69667,11 @@ var errorUtil2;
 
 // node_modules/@jimp/types/node_modules/zod/v3/types.js
 var ParseInputLazyPath2 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -72582,8 +73606,8 @@ function getErrorMap4() {
 
 // node_modules/@jimp/plugin-blit/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue3 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -72699,11 +73723,11 @@ var errorUtil3;
 
 // node_modules/@jimp/plugin-blit/node_modules/zod/v3/types.js
 var ParseInputLazyPath3 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -77408,8 +78432,8 @@ function getErrorMap5() {
 
 // node_modules/@jimp/plugin-circle/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue4 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -77525,11 +78549,11 @@ var errorUtil4;
 
 // node_modules/@jimp/plugin-circle/node_modules/zod/v3/types.js
 var ParseInputLazyPath4 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -81491,8 +82515,8 @@ function getErrorMap6() {
 
 // node_modules/@jimp/plugin-color/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue5 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -81608,11 +82632,11 @@ var errorUtil5;
 
 // node_modules/@jimp/plugin-color/node_modules/zod/v3/types.js
 var ParseInputLazyPath5 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -86328,9 +87352,9 @@ function createJimp({ plugins: pluginsArg, formats: formatsArg } = {}) {
      * await image.write("test/output.png");
      * ```
      */
-    async write(path3, options) {
-      const mimeType = import_lite.default.getType(path3);
-      await writeFile(path3, await this.getBuffer(mimeType, options));
+    async write(path10, options) {
+      const mimeType = import_lite.default.getType(path10);
+      await writeFile(path10, await this.getBuffer(mimeType, options));
     }
     /**
      * Clone the image into a new Jimp instance.
@@ -87021,8 +88045,8 @@ function getErrorMap7() {
 
 // node_modules/@jimp/plugin-resize/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue6 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -87138,11 +88162,11 @@ var errorUtil6;
 
 // node_modules/@jimp/plugin-resize/node_modules/zod/v3/types.js
 var ParseInputLazyPath6 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -91694,8 +92718,8 @@ function getErrorMap8() {
 
 // node_modules/@jimp/plugin-contain/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue7 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -91811,11 +92835,11 @@ var errorUtil7;
 
 // node_modules/@jimp/plugin-contain/node_modules/zod/v3/types.js
 var ParseInputLazyPath7 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -95786,8 +96810,8 @@ function getErrorMap9() {
 
 // node_modules/@jimp/plugin-crop/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue8 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -95903,11 +96927,11 @@ var errorUtil8;
 
 // node_modules/@jimp/plugin-crop/node_modules/zod/v3/types.js
 var ParseInputLazyPath8 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -100008,8 +101032,8 @@ function getErrorMap10() {
 
 // node_modules/@jimp/plugin-cover/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue9 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -100125,11 +101149,11 @@ var errorUtil9;
 
 // node_modules/@jimp/plugin-cover/node_modules/zod/v3/types.js
 var ParseInputLazyPath9 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -104096,8 +105120,8 @@ function getErrorMap11() {
 
 // node_modules/@jimp/plugin-displace/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue10 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -104213,11 +105237,11 @@ var errorUtil10;
 
 // node_modules/@jimp/plugin-displace/node_modules/zod/v3/types.js
 var ParseInputLazyPath10 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -108217,8 +109241,8 @@ function getErrorMap12() {
 
 // node_modules/@jimp/plugin-fisheye/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue11 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -108334,11 +109358,11 @@ var errorUtil11;
 
 // node_modules/@jimp/plugin-fisheye/node_modules/zod/v3/types.js
 var ParseInputLazyPath11 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -112296,8 +113320,8 @@ function getErrorMap13() {
 
 // node_modules/@jimp/plugin-flip/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue12 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -112413,11 +113437,11 @@ var errorUtil12;
 
 // node_modules/@jimp/plugin-flip/node_modules/zod/v3/types.js
 var ParseInputLazyPath12 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -116529,8 +117553,8 @@ function getErrorMap14() {
 
 // node_modules/@jimp/plugin-mask/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue13 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -116646,11 +117670,11 @@ var errorUtil13;
 
 // node_modules/@jimp/plugin-mask/node_modules/zod/v3/types.js
 var ParseInputLazyPath13 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -120627,8 +121651,8 @@ function getErrorMap15() {
 
 // node_modules/@jimp/plugin-print/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue14 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -120744,11 +121768,11 @@ var errorUtil14;
 
 // node_modules/@jimp/plugin-print/node_modules/zod/v3/types.js
 var ParseInputLazyPath14 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -124868,8 +125892,8 @@ function getErrorMap16() {
 
 // node_modules/@jimp/plugin-rotate/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue15 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -124985,11 +126009,11 @@ var errorUtil15;
 
 // node_modules/@jimp/plugin-rotate/node_modules/zod/v3/types.js
 var ParseInputLazyPath15 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -129070,8 +130094,8 @@ function getErrorMap17() {
 
 // node_modules/@jimp/plugin-threshold/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue16 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -129187,11 +130211,11 @@ var errorUtil16;
 
 // node_modules/@jimp/plugin-threshold/node_modules/zod/v3/types.js
 var ParseInputLazyPath16 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -136042,8 +137066,8 @@ function getErrorMap18() {
 
 // node_modules/@jimp/plugin-quantize/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue17 = (params) => {
-  const { data, path: path3, errorMaps, issueData } = params;
-  const fullPath = [...path3, ...issueData.path || []];
+  const { data, path: path10, errorMaps, issueData } = params;
+  const fullPath = [...path10, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -136159,11 +137183,11 @@ var errorUtil17;
 
 // node_modules/@jimp/plugin-quantize/node_modules/zod/v3/types.js
 var ParseInputLazyPath17 = class {
-  constructor(parent, value, path3, key) {
+  constructor(parent, value, path10, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path3;
+    this._path = path10;
     this._key = key;
   }
   get path() {
@@ -144540,10 +145564,12 @@ html, body { background: transparent !important; }
       parts.push(buildTransparencyOverrides({ dim: config2.dim }));
     }
   }
-  const wallpaperDataUri = config2.wallpaperVisible ? assets?.dataUri : void 0;
+  const wallpaperDataUri = config2.sceneVideoUrl || !config2.wallpaperVisible ? void 0 : assets?.dataUri;
+  const videoSrc = config2.wallpaperVisible ? config2.sceneVideoUrl : void 0;
   return {
     css: parts.join("\n"),
     wallpaperDataUri,
+    videoSrc,
     fit: config2.wallpaperVisible ? resolved : "cover",
     focusX,
     focusY
@@ -144581,60 +145607,29 @@ async function resetZCode(port) {
   return count;
 }
 
-// dist/core/launch.js
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import fs3 from "node:fs";
-import os from "node:os";
-import path from "node:path";
-function dataDir() {
-  return process.env.ZCODE_BEAUTIFY_DATA_DIR ?? path.join(os.homedir(), ".zcode", "cli", "plugins", "data", "zcode-beautify");
-}
-function configFile() {
-  return path.join(dataDir(), "config.json");
-}
-function loadConfig() {
-  try {
-    return JSON.parse(fs3.readFileSync(configFile(), "utf8"));
-  } catch {
-    return {};
-  }
-}
-function saveConfig(config2) {
-  fs3.mkdirSync(dataDir(), { recursive: true });
-  fs3.writeFileSync(configFile(), JSON.stringify(config2, null, 2));
-}
-var ZCODE_EXE_CANDIDATES = process.platform === "win32" ? [
-  process.env.ZCODE_WINDOWS_APP_INSTALL_DIR ? path.join(process.env.ZCODE_WINDOWS_APP_INSTALL_DIR, "ZCode.exe") : void 0,
-  "C:\\Program Files\\ZCode\\ZCode.exe",
-  path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode", "ZCode.exe")
-].filter(Boolean) : process.platform === "darwin" ? ["/Applications/ZCode.app/Contents/MacOS/ZCode"] : ["/usr/bin/zcode", "/opt/ZCode/zcode"];
-var execFileAsync = promisify(execFile);
-
 // dist/core/session.js
+init_launch();
+init_wallpaperType();
+init_scenePipeline();
+init_dependencyCheck();
 async function reapplyStored() {
   const config2 = mergedConfig();
   return applyToZCode(config2, await buildPayloadFromConfig(config2));
 }
 async function applyWallpaper(imagePath, opts) {
-  const abs = path2.resolve(imagePath);
-  if (!fs4.existsSync(abs))
+  const abs = path8.resolve(imagePath);
+  if (!fs8.existsSync(abs))
     throw new Error(`Image not found: ${abs}`);
+  if (detectWallpaperType(abs) === "scene") {
+    const result = await applySceneWallpaper(abs, opts);
+    return { windows: result.windows, config: result.config };
+  }
   const stored = loadConfig();
-  const config2 = {
-    ...DEFAULT_CONFIG,
-    ...stored,
-    port: opts.port ?? stored.port ?? DEFAULT_CONFIG.port,
-    blur: opts.blur ?? stored.blur ?? DEFAULT_CONFIG.blur,
-    dim: opts.dim ?? stored.dim ?? DEFAULT_CONFIG.dim,
-    monet: opts.monet ?? stored.monet ?? DEFAULT_CONFIG.monet,
-    wallpaperVisible: opts.wallpaperVisible ?? stored.wallpaperVisible ?? DEFAULT_CONFIG.wallpaperVisible,
-    fit: opts.fit ?? stored.fit ?? DEFAULT_CONFIG.fit
-  };
-  fs4.mkdirSync(dataDir(), { recursive: true });
-  const dest = path2.join(dataDir(), "wallpaper" + path2.extname(abs).toLowerCase());
+  const config2 = { ...baseConfig(opts, stored), mediaType: "image", sceneHash: void 0 };
+  fs8.mkdirSync(dataDir(), { recursive: true });
+  const dest = path8.join(dataDir(), "wallpaper" + path8.extname(abs).toLowerCase());
   if (dest !== abs)
-    fs4.copyFileSync(abs, dest);
+    fs8.copyFileSync(abs, dest);
   const assets = await loadWallpaper(dest);
   const payload = buildPayload(config2, assets);
   saveConfig({ ...config2, wallpaperPath: dest });
@@ -144643,7 +145638,12 @@ async function applyWallpaper(imagePath, opts) {
 }
 async function applyColorsOnly(opts) {
   const stored = loadConfig();
-  const config2 = {
+  const config2 = baseConfig(opts, stored);
+  saveConfig(config2);
+  return applyToZCode(config2, await buildPayloadFromConfig(config2));
+}
+function baseConfig(opts, stored) {
+  return {
     ...DEFAULT_CONFIG,
     ...stored,
     port: opts.port ?? stored.port ?? DEFAULT_CONFIG.port,
@@ -144653,18 +145653,63 @@ async function applyColorsOnly(opts) {
     wallpaperVisible: opts.wallpaperVisible ?? stored.wallpaperVisible ?? DEFAULT_CONFIG.wallpaperVisible,
     fit: opts.fit ?? stored.fit ?? DEFAULT_CONFIG.fit
   };
-  saveConfig(config2);
-  return applyToZCode(config2, await buildPayloadFromConfig(config2));
+}
+async function applySceneWallpaper(scenePath, opts = {}) {
+  const abs = path8.resolve(scenePath);
+  const { importScene: importScene2 } = await Promise.resolve().then(() => (init_scenePipeline(), scenePipeline_exports));
+  const scene = await importScene2(abs, opts.onProgress ?? (() => void 0));
+  const stored = loadConfig();
+  const config2 = baseConfig(opts, stored);
+  const apiPort = stored.apiPort ?? 9223;
+  const sceneVideoUrl = `http://127.0.0.1:${apiPort}/media/scene/${scene.hash}.mp4`;
+  const served = await isServeAlive(apiPort);
+  const next = {
+    ...config2,
+    mediaType: "video",
+    sceneHash: scene.hash,
+    wallpaperPath: scene.loopPath,
+    apiPort,
+    ...served ? { sceneVideoUrl } : {}
+  };
+  saveConfig(next);
+  if (!served) {
+    console.warn("scene loop stored, but serve is not running \u2014 applying the poster frame as a static wallpaper.\nRun `zcode-beautify serve --detach` and `refresh_theme` to enable motion.");
+    const assets = await loadWallpaper(scene.posterPath);
+    const payload = buildPayload({ ...next, sceneVideoUrl: void 0 }, assets);
+    const windows2 = await applyToZCode({ ...next, sceneVideoUrl: void 0 }, payload);
+    return { windows: windows2, config: next, scene, served: false };
+  }
+  const windows = await applyToZCode(next, await buildPayloadFromConfig(next));
+  return { windows, config: next, scene, served: true };
+}
+async function isServeAlive(apiPort) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1200) });
+    return (await res.json())?.service === "zcode-beautify";
+  } catch {
+    return false;
+  }
 }
 async function resetAppearance(port) {
   const stored = loadConfig();
   await resetZCode(port ?? stored.port ?? DEFAULT_CONFIG.port);
-  saveConfig({ ...stored, wallpaperPath: void 0 });
+  saveConfig({ ...stored, wallpaperPath: void 0, mediaType: void 0, sceneHash: void 0, sceneVideoUrl: void 0 });
   return 0;
 }
 async function buildPayloadFromConfig(config2) {
   let assets;
-  if (config2.wallpaperPath && fs4.existsSync(config2.wallpaperPath)) {
+  if (config2.mediaType === "video" && config2.wallpaperPath && fs8.existsSync(config2.wallpaperPath)) {
+    const posterPath = path8.join(path8.dirname(config2.wallpaperPath), "poster.jpg");
+    if (fs8.existsSync(posterPath)) {
+      assets = await loadWallpaper(posterPath);
+    }
+    const apiPort = config2.apiPort ?? 9223;
+    if (!config2.sceneVideoUrl && config2.sceneHash) {
+      config2 = { ...config2, sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${config2.sceneHash}.mp4` };
+    }
+    return buildPayload(config2, assets);
+  }
+  if (config2.wallpaperPath && fs8.existsSync(config2.wallpaperPath)) {
     assets = await loadWallpaper(config2.wallpaperPath);
   }
   return buildPayload(config2, assets);
@@ -144674,26 +145719,102 @@ function mergedConfig() {
 }
 
 // dist/mcp/server.js
+init_wallpaperType();
+init_launch();
+function bootstrapServe() {
+  try {
+    const serverFile = path9.resolve(process.argv[1] ?? "");
+    const cliJs = path9.join(path9.dirname(serverFile), "..", "cli.js");
+    if (path9.basename(serverFile) !== "server.js" || !existsSync2(cliJs))
+      return;
+    fetch("http://127.0.0.1:9223/api/health", { signal: AbortSignal.timeout(1500) }).then((r2) => r2.json()).then((body) => {
+      if (body?.service !== "zcode-beautify")
+        throw new Error("foreign service");
+    }).catch(() => {
+      try {
+        spawn3(process.execPath, [cliJs, "serve", "--detach"], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true
+        }).unref();
+      } catch {
+      }
+    });
+  } catch {
+  }
+}
+bootstrapServe();
 var server = new McpServer({
   name: "zcode-beautify",
-  version: "0.2.1"
+  version: "0.3.0"
 });
+var TOOL_NAMES = [
+  "set_background",
+  "import_scene_wallpaper",
+  "apply_options",
+  "refresh_theme",
+  "reset_appearance",
+  "beautify_status"
+];
 server.registerTool("set_background", {
   title: "Set ZCode wallpaper",
-  description: "Set the ZCode desktop client's background wallpaper image and adapt the UI colors with Material Design 3 (Monet) dynamic color. ZCode must be running with the CDP debug port (see zcode-beautify launch).",
+  description: "Set the ZCode desktop client's background wallpaper image and adapt the UI colors with Material Design 3 (Monet) dynamic color. Accepts a static image OR a Wallpaper Engine scene wallpaper (.pkg / workshop directory) \u2014 scene inputs are rendered, recorded and looped automatically. ZCode must be running with the CDP debug port (see zcode-beautify launch).",
   inputSchema: {
-    image_path: external_exports.string().describe("Absolute path of the image to use as wallpaper"),
+    image_path: external_exports.string().describe("Absolute path of the image, .pkg file, or scene directory to use as wallpaper"),
     blur: external_exports.number().min(0).max(100).optional().describe("Wallpaper blur radius in px (default 0)"),
     dim: external_exports.number().min(0).max(100).optional().describe("Wallpaper darkening 0-100 (default 25)")
   }
 }, async ({ image_path, blur, dim }) => {
   try {
-    const { windows } = await applyWallpaper(image_path, { blur, dim });
-    return { content: [{ type: "text", text: `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.` }] };
+    const isScene = detectWallpaperType(image_path) === "scene";
+    const { windows } = isScene ? await applySceneWallpaper(image_path, { blur, dim }) : await applyWallpaper(image_path, { blur, dim });
+    return {
+      content: [{
+        type: "text",
+        text: isScene ? `Scene wallpaper imported and applied to ${windows} window(s). First import renders in real time; later imports are served from cache.` : `Wallpaper applied to ${windows} window(s) with Monet-adapted colors.`
+      }]
+    };
   } catch (err) {
     return { content: [{ type: "text", text: `Failed: ${err.message}` }], isError: true };
   }
 });
+server.registerTool("import_scene_wallpaper", {
+  title: "Import scene wallpaper",
+  description: "Import a Wallpaper Engine scene wallpaper (.pkg file or extracted workshop directory) as an animated ZCode wallpaper: opens it in a Wallpaper Engine window, records ~15s with ffmpeg, processes it into a perfectly seamless loop, caches it, and applies it with Monet colors from a poster frame. Requires Wallpaper Engine and ffmpeg 5+ locally.",
+  inputSchema: {
+    path: external_exports.string().describe("Absolute path of the .pkg file or the scene directory (project.json folder)"),
+    blur: external_exports.number().min(0).max(100).optional().describe("Wallpaper blur radius in px"),
+    dim: external_exports.number().min(0).max(100).optional().describe("Wallpaper darkening 0-100")
+  }
+}, async ({ path: scenePath, blur, dim }) => {
+  try {
+    const stages = [];
+    const { windows, served, scene } = await applySceneWallpaper(scenePath, {
+      blur,
+      dim,
+      onProgress: (stage) => {
+        if (stages[stages.length - 1] !== stage)
+          stages.push(stage);
+      }
+    });
+    const notes = served ? "Loop is streaming from the serve media endpoint." : "serve is not running: the poster frame is applied as a static wallpaper. Run `zcode-beautify serve --detach`, then `refresh_theme`, to get motion.";
+    return {
+      content: [{
+        type: "text",
+        text: `Scene imported (${scene.fromCache ? "cache hit" : "freshly rendered"}, ${Math.round(statSizeMb(scene.loopPath))} MB) and applied to ${windows} window(s). Stages: ${stages.join(" \u2192 ")}. ${notes}`
+      }]
+    };
+  } catch (err) {
+    return { content: [{ type: "text", text: `Failed: ${err.message}` }], isError: true };
+  }
+});
+function statSizeMb(file2) {
+  try {
+    return statSync(file2).size / 1024 / 1024;
+  } catch {
+    return 0;
+  }
+}
 server.registerTool("apply_options", {
   title: "Tune ZCode appearance",
   description: "Adjust the live ZCode appearance without changing the wallpaper: blur radius, dim level, Monet dynamic colors on/off, and wallpaper visibility (translucent vs opaque surfaces). Only the provided values change; the rest keep their current setting.",
@@ -144745,3 +145866,6 @@ server.registerTool("beautify_status", {
   return { content: [{ type: "text", text: JSON.stringify(cfg, null, 2) }] };
 });
 await server.connect(new StdioServerTransport());
+export {
+  TOOL_NAMES
+};

@@ -92,11 +92,14 @@ async function injectIntoTarget(target, payload) {
 }
 function buildBootstrapScript(payload) {
   const marker = payload.marker ?? "zcode-beautify";
+  const videoSrc = payload.videoSrc ?? "";
   return `(function(){
   var MARKER = ${JSON.stringify(marker)};
   if (!window.__zcodeBeautify) window.__zcodeBeautify = {};
-  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)}) return;
+  var VIDEO_SRC = ${JSON.stringify(videoSrc)};
+  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)} && window.__zcodeBeautify.videoSrc === VIDEO_SRC) return;
   window.__zcodeBeautify.cssText = ${JSON.stringify(payload.css)};
+  window.__zcodeBeautify.videoSrc = VIDEO_SRC;
 
   var style = document.getElementById(MARKER + '-style');
   if (!style) {
@@ -107,15 +110,39 @@ function buildBootstrapScript(payload) {
   style.textContent = ${JSON.stringify(payload.css)};
 
   var wp = document.getElementById(MARKER + '-wallpaper');
-  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))} || VIDEO_SRC) {
     if (!wp) {
       wp = document.createElement('div');
       wp.id = MARKER + '-wallpaper';
       document.documentElement.appendChild(wp);
     }
-    wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
-  } else if (wp) {
-    wp.remove();
+  }
+  var vid = document.getElementById(MARKER + '-video');
+  if (VIDEO_SRC) {
+    wp.style.backgroundImage = 'none';
+    if (!vid) {
+      vid = document.createElement('video');
+      vid.id = MARKER + '-video';
+      vid.setAttribute('autoplay', '');
+      vid.setAttribute('loop', '');
+      vid.setAttribute('muted', '');
+      vid.setAttribute('playsinline', '');
+      vid.muted = true;
+      vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';
+      wp.appendChild(vid);
+    }
+    if (vid.getAttribute('src') !== VIDEO_SRC) {
+      vid.setAttribute('src', VIDEO_SRC);
+      vid.load();
+    }
+    vid.play().catch(function() {});
+  } else {
+    if (vid) vid.remove();
+    if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+      wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
+    } else if (wp) {
+      wp.remove();
+    }
   }
 
   var FIT = ${JSON.stringify(payload.fit ?? "cover")};
@@ -132,8 +159,20 @@ function buildBootstrapScript(payload) {
     bp.dataset.on = '0';
   }
 
+  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  if (!window.__zcodeBeautify.visBound) {
+    window.__zcodeBeautify.visBound = true;
+    document.addEventListener('visibilitychange', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
+    });
+  }
+
   // Persist for the panel's self-heal path (best effort; large wallpapers may
   // exceed the localStorage quota, in which case only the CSS is saved).
+  // Scene videos are never persisted: the src is a serve URL and the loop
+  // file itself would blow the quota.
   try {
     localStorage.setItem(MARKER + ':css', ${JSON.stringify(payload.css)});
     localStorage.setItem(MARKER + ':wallpaper', ${JSON.stringify(payload.wallpaperDataUri ?? "")});
@@ -145,7 +184,7 @@ function buildResetScript(marker = "zcode-beautify") {
   document.getElementById(${JSON.stringify(marker)} + '-style')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-wallpaper')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-backdrop')?.remove();
-  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; }
+  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; window.__zcodeBeautify.videoSrc = null; }
 })();`;
 }
 var CdpError, CdpConnection;
@@ -6027,7 +6066,7 @@ var require_gifframe = __commonJS({
 var require_gifutil = __commonJS({
   "node_modules/gifwrap/src/gifutil.js"(exports) {
     "use strict";
-    var fs7 = __require("fs");
+    var fs12 = __require("fs");
     var ImageQ = require_image_q();
     var BitmapImage2 = require_bitmapimage();
     var { GifFrame: GifFrame2 } = require_gifframe();
@@ -6142,14 +6181,14 @@ var require_gifutil = __commonJS({
       jimpImage.bitmap.data = bitmapImageToShare.bitmap.data;
       return jimpImage;
     };
-    exports.write = function(path5, frames, spec, encoder) {
+    exports.write = function(path11, frames, spec, encoder) {
       encoder = encoder || defaultCodec;
-      const matches = path5.match(/\.[a-zA-Z]+$/);
+      const matches = path11.match(/\.[a-zA-Z]+$/);
       if (matches !== null && INVALID_SUFFIXES.includes(matches[0].toLowerCase())) {
-        throw new Error(`GIF '${path5}' has an unexpected suffix`);
+        throw new Error(`GIF '${path11}' has an unexpected suffix`);
       }
       return encoder.encodeGif(frames, spec).then((gif2) => {
-        return _writeBinary(path5, gif2.buffer).then(() => {
+        return _writeBinary(path11, gif2.buffer).then(() => {
           return gif2;
         });
       });
@@ -6221,9 +6260,9 @@ var require_gifutil = __commonJS({
         }
       }
     }
-    function _readBinary(path5) {
+    function _readBinary(path11) {
       return new Promise((resolve, reject) => {
-        fs7.readFile(path5, (err, buffer) => {
+        fs12.readFile(path11, (err, buffer) => {
           if (err) {
             return reject(err);
           }
@@ -6231,9 +6270,9 @@ var require_gifutil = __commonJS({
         });
       });
     }
-    function _writeBinary(path5, buffer) {
+    function _writeBinary(path11, buffer) {
       return new Promise((resolve, reject) => {
-        fs7.writeFile(path5, buffer, (err) => {
+        fs12.writeFile(path11, buffer, (err) => {
           if (err) {
             return reject(err);
           }
@@ -8244,9 +8283,9 @@ var require_decoder = __commonJS({
         return a2 < 0 ? 0 : a2 > 255 ? 255 : a2;
       }
       constructor.prototype = {
-        load: function load(path5) {
+        load: function load(path11) {
           var xhr = new XMLHttpRequest();
-          xhr.open("GET", path5, true);
+          xhr.open("GET", path11, true);
           xhr.responseType = "arraybuffer";
           xhr.onload = (function() {
             var data = new Uint8Array(xhr.response || xhr.mozResponseArrayBuffer);
@@ -19149,8 +19188,8 @@ var init_parseUtil = __esm({
     init_errors();
     init_en();
     makeIssue = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -19458,11 +19497,11 @@ var init_types2 = __esm({
     init_parseUtil();
     init_util();
     ParseInputLazyPath = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -23275,8 +23314,8 @@ var init_parseUtil2 = __esm({
     init_errors2();
     init_en2();
     makeIssue2 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -23584,11 +23623,11 @@ var init_types3 = __esm({
     init_parseUtil2();
     init_util2();
     ParseInputLazyPath2 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -28186,8 +28225,8 @@ var init_parseUtil3 = __esm({
     init_errors3();
     init_en3();
     makeIssue3 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -28495,11 +28534,11 @@ var init_types4 = __esm({
     init_parseUtil3();
     init_util3();
     ParseInputLazyPath3 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -32340,8 +32379,8 @@ var init_parseUtil4 = __esm({
     init_errors4();
     init_en4();
     makeIssue4 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -32649,11 +32688,11 @@ var init_types5 = __esm({
     init_parseUtil4();
     init_util4();
     ParseInputLazyPath4 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -36776,11 +36815,11 @@ var require_Mime = __commonJS({
         }
       }
     };
-    Mime.prototype.getType = function(path5) {
-      path5 = String(path5);
-      let last = path5.replace(/^.*[/\\]/, "").toLowerCase();
+    Mime.prototype.getType = function(path11) {
+      path11 = String(path11);
+      let last = path11.replace(/^.*[/\\]/, "").toLowerCase();
       let ext = last.replace(/^.*\./, "").toLowerCase();
-      let hasPath = last.length < path5.length;
+      let hasPath = last.length < path11.length;
       let hasDot = ext.length < last.length - 1;
       return (hasDot || !hasPath) && this._types[ext] || null;
     };
@@ -43318,8 +43357,8 @@ function isTokenizerStreamBoundsError(error) {
   }
   return /strtok3[/\\]lib[/\\]stream[/\\]/.test(error.stack);
 }
-async function fileTypeFromFile(path5, options) {
-  return new FileTypeParser2(options).fromFile(path5, options);
+async function fileTypeFromFile(path11, options) {
+  return new FileTypeParser2(options).fromFile(path11, options);
 }
 async function fileTypeFromStream(stream, options) {
   return new FileTypeParser2(options).fromStream(stream);
@@ -43350,9 +43389,9 @@ var init_file_type = __esm({
           }
         }
       }
-      async fromFile(path5) {
+      async fromFile(path11) {
         this.options.signal?.throwIfAborted();
-        const fileHandle = await fs2.open(path5, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
+        const fileHandle = await fs2.open(path11, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
         const fileStat = await fileHandle.stat();
         if (!fileStat.isFile()) {
           await fileHandle.close();
@@ -43361,7 +43400,7 @@ var init_file_type = __esm({
         const tokenizer = new FileTokenizer(fileHandle, {
           ...this.getTokenizerOptions(),
           fileInfo: {
-            path: path5,
+            path: path11,
             size: fileStat.size
           }
         });
@@ -43696,9 +43735,9 @@ function createJimp({ plugins: pluginsArg, formats: formatsArg } = {}) {
      * await image.write("test/output.png");
      * ```
      */
-    async write(path5, options) {
-      const mimeType = import_lite.default.getType(path5);
-      await writeFile(path5, await this.getBuffer(mimeType, options));
+    async write(path11, options) {
+      const mimeType = import_lite.default.getType(path11);
+      await writeFile(path11, await this.getBuffer(mimeType, options));
     }
     /**
      * Clone the image into a new Jimp instance.
@@ -44347,8 +44386,8 @@ var init_parseUtil5 = __esm({
     init_errors5();
     init_en5();
     makeIssue5 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -44656,11 +44695,11 @@ var init_types6 = __esm({
     init_parseUtil5();
     init_util6();
     ParseInputLazyPath5 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -49105,8 +49144,8 @@ var init_parseUtil6 = __esm({
     init_errors6();
     init_en6();
     makeIssue6 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -49414,11 +49453,11 @@ var init_types7 = __esm({
     init_parseUtil6();
     init_util7();
     ParseInputLazyPath6 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -53272,8 +53311,8 @@ var init_parseUtil7 = __esm({
     init_errors7();
     init_en7();
     makeIssue7 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -53581,11 +53620,11 @@ var init_types8 = __esm({
     init_parseUtil7();
     init_util8();
     ParseInputLazyPath7 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -57566,8 +57605,8 @@ var init_parseUtil8 = __esm({
     init_errors8();
     init_en8();
     makeIssue8 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -57875,11 +57914,11 @@ var init_types9 = __esm({
     init_parseUtil8();
     init_util9();
     ParseInputLazyPath8 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -61728,8 +61767,8 @@ var init_parseUtil9 = __esm({
     init_errors9();
     init_en9();
     makeIssue9 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -62037,11 +62076,11 @@ var init_types10 = __esm({
     init_parseUtil9();
     init_util10();
     ParseInputLazyPath9 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -65927,8 +65966,8 @@ var init_parseUtil10 = __esm({
     init_errors10();
     init_en10();
     makeIssue10 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -66236,11 +66275,11 @@ var init_types11 = __esm({
     init_parseUtil10();
     init_util11();
     ParseInputLazyPath10 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -70078,8 +70117,8 @@ var init_parseUtil11 = __esm({
     init_errors11();
     init_en11();
     makeIssue11 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -70387,11 +70426,11 @@ var init_types12 = __esm({
     init_parseUtil11();
     init_util12();
     ParseInputLazyPath11 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -74464,8 +74503,8 @@ var init_parseUtil12 = __esm({
     init_errors12();
     init_en12();
     makeIssue12 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -74773,11 +74812,11 @@ var init_types13 = __esm({
     init_parseUtil12();
     init_util13();
     ParseInputLazyPath12 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -78634,8 +78673,8 @@ var init_parseUtil13 = __esm({
     init_errors13();
     init_en13();
     makeIssue13 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -78943,11 +78982,11 @@ var init_types14 = __esm({
     init_parseUtil13();
     init_util14();
     ParseInputLazyPath13 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -82961,8 +83000,8 @@ var init_parseUtil14 = __esm({
     init_errors14();
     init_en14();
     makeIssue14 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -83270,11 +83309,11 @@ var init_types16 = __esm({
     init_parseUtil14();
     init_util15();
     ParseInputLazyPath14 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -87238,8 +87277,8 @@ var init_parseUtil15 = __esm({
     init_errors15();
     init_en15();
     makeIssue15 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -87547,11 +87586,11 @@ var init_types17 = __esm({
     init_parseUtil15();
     init_util16();
     ParseInputLazyPath15 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -94288,8 +94327,8 @@ var init_parseUtil16 = __esm({
     init_errors16();
     init_en16();
     makeIssue16 = (params) => {
-      const { data, path: path5, errorMaps, issueData } = params;
-      const fullPath = [...path5, ...issueData.path || []];
+      const { data, path: path11, errorMaps, issueData } = params;
+      const fullPath = [...path11, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -94597,11 +94636,11 @@ var init_types18 = __esm({
     init_parseUtil16();
     init_util17();
     ParseInputLazyPath16 = class {
-      constructor(parent, value, path5, key) {
+      constructor(parent, value, path11, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path5;
+        this._path = path11;
         this._key = key;
       }
       get path() {
@@ -109808,10 +109847,12 @@ html, body { background: transparent !important; }
       parts.push(buildTransparencyOverrides({ dim: config.dim }));
     }
   }
-  const wallpaperDataUri = config.wallpaperVisible ? assets?.dataUri : void 0;
+  const wallpaperDataUri = config.sceneVideoUrl || !config.wallpaperVisible ? void 0 : assets?.dataUri;
+  const videoSrc = config.wallpaperVisible ? config.sceneVideoUrl : void 0;
   return {
     css: parts.join("\n"),
     wallpaperDataUri,
+    videoSrc,
     fit: config.wallpaperVisible ? resolved : "cover",
     focusX,
     focusY
@@ -109974,40 +110015,999 @@ var init_launch = __esm({
   }
 });
 
+// dist/core/wallpaperType.js
+import fs4 from "node:fs";
+import path2 from "node:path";
+function detectWallpaperType(input) {
+  const ext = path2.extname(input).toLowerCase();
+  if (IMAGE_EXTENSIONS.has(ext))
+    return "image";
+  if (VIDEO_EXTENSIONS.has(ext))
+    return "video";
+  if (ext === ".pkg")
+    return "scene";
+  let stat;
+  try {
+    stat = fs4.statSync(input);
+  } catch {
+    return "unknown";
+  }
+  if (!stat.isDirectory())
+    return "unknown";
+  return detectDirectoryType(input);
+}
+function detectDirectoryType(dir) {
+  const project = readProjectJson(path2.join(dir, "project.json"));
+  const declared = typeof project?.type === "string" ? project.type.toLowerCase() : "";
+  if (declared === "scene" || declared === "video" || declared === "web") {
+    return declared;
+  }
+  const entryExt = path2.extname(typeof project?.file === "string" ? project.file : "").toLowerCase();
+  if (SCENE_ENTRY_EXTENSIONS.has(entryExt))
+    return "scene";
+  if (VIDEO_EXTENSIONS.has(entryExt))
+    return "video";
+  if (entryExt === ".html" || entryExt === ".htm")
+    return "web";
+  return detectFromDirectoryContents(dir);
+}
+function readProjectJson(file) {
+  try {
+    return JSON.parse(fs4.readFileSync(file, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function detectFromDirectoryContents(dir) {
+  let entries;
+  try {
+    entries = fs4.readdirSync(dir);
+  } catch {
+    return "unknown";
+  }
+  let nested = [];
+  if (entries.some((e2) => e2.toLowerCase() === "files")) {
+    try {
+      nested = fs4.readdirSync(path2.join(dir, "files")).map((e2) => path2.join("files", e2));
+    } catch {
+    }
+  }
+  for (const name of [...entries, ...nested]) {
+    const lower = name.toLowerCase();
+    const ext = path2.extname(lower);
+    if (lower === "scene.pkg" || lower === "scene.json")
+      return "scene";
+    if (ext === ".html" || ext === ".htm")
+      return "web";
+    if (VIDEO_EXTENSIONS.has(ext))
+      return "video";
+  }
+  return "unknown";
+}
+var IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, SCENE_ENTRY_EXTENSIONS;
+var init_wallpaperType = __esm({
+  "dist/core/wallpaperType.js"() {
+    "use strict";
+    IMAGE_EXTENSIONS = /* @__PURE__ */ new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp"]);
+    VIDEO_EXTENSIONS = /* @__PURE__ */ new Set([".mp4", ".webm"]);
+    SCENE_ENTRY_EXTENSIONS = /* @__PURE__ */ new Set([".pkg", ".json"]);
+  }
+});
+
+// dist/core/dependencyCheck.js
+import { execFile as execFile2 } from "node:child_process";
+import fs5 from "node:fs";
+import path3 from "node:path";
+import { promisify as promisify2 } from "node:util";
+async function checkWallpaperEngine() {
+  if (process.platform !== "win32") {
+    return { ok: false, detail: "Wallpaper Engine is Windows-only" };
+  }
+  const running = await findRunningWallpaperProcess();
+  if (running)
+    return { ok: true, path: running, detail: "detected via running wallpaper64.exe process" };
+  const registry = await findWallpaperInRegistry();
+  if (registry)
+    return { ok: true, path: registry, detail: "detected via HKLM\\SOFTWARE\\Wallpaper Engine" };
+  for (const candidate of steamLibraryCandidates()) {
+    const exe = path3.join(candidate, WE_EXE_RELATIVE);
+    if (isFile(exe))
+      return { ok: true, path: exe, detail: `detected via Steam library ${candidate}` };
+  }
+  const onPath = await whereExecutable("wallpaper64.exe");
+  if (onPath[0])
+    return { ok: true, path: onPath[0], detail: "detected on PATH" };
+  return { ok: false, detail: "wallpaper64.exe not found in registry, Steam libraries or PATH" };
+}
+async function checkFfmpeg() {
+  const override = process.env.ZCODE_BEAUTIFY_FFMPEG;
+  const candidates = override ? [override, ...await whereExecutable("ffmpeg")] : await whereExecutable("ffmpeg");
+  for (const candidate of candidates) {
+    const exe = isFile(candidate) ? candidate : void 0;
+    if (!exe)
+      continue;
+    const version = await ffmpegVersion(exe);
+    if (version === void 0)
+      continue;
+    if (version.major < MIN_FFMPEG_MAJOR) {
+      return {
+        ok: false,
+        path: exe,
+        detail: `ffmpeg ${version.raw} found but ddagrab needs >= ${MIN_FFMPEG_MAJOR}.0`
+      };
+    }
+    return { ok: true, path: exe, detail: `ffmpeg ${version.raw}` };
+  }
+  return { ok: false, detail: "ffmpeg not found on PATH" + (override ? ` (env override ${override} not usable)` : "") };
+}
+function getInstallGuide(missing) {
+  const sections = [];
+  if (missing.includes("we")) {
+    sections.push([
+      "## Wallpaper Engine \u672A\u68C0\u6D4B\u5230",
+      "",
+      "1. \u901A\u8FC7 Steam \u5B89\u88C5 Wallpaper Engine\uFF08\u5546\u5E97\u9875\uFF1Ahttps://store.steampowered.com/app/431960\uFF09\u3002",
+      "2. \u542F\u52A8\u4E00\u6B21 Wallpaper Engine\uFF0C\u5E76\u81F3\u5C11\u8BA2\u9605\u4E00\u4E2A\u300C\u573A\u666F\uFF08Scene\uFF09\u300D\u7C7B\u578B\u58C1\u7EB8\u3002",
+      "3. \u5982\u679C\u5B89\u88C5\u5728\u975E\u9ED8\u8BA4 Steam \u5E93\uFF0C\u65E0\u9700\u989D\u5916\u914D\u7F6E\u2014\u2014\u63D2\u4EF6\u4F1A\u81EA\u52A8\u626B\u63CF\u6240\u6709 Steam \u5E93\u3002",
+      "4. \u5B89\u88C5\u5B8C\u6210\u540E\u70B9\u51FB\u300C\u5DF2\u5B89\u88C5\uFF0C\u91CD\u8BD5\u300D\u3002"
+    ].join("\n"));
+  }
+  if (missing.includes("ffmpeg")) {
+    sections.push([
+      "## ffmpeg \u672A\u68C0\u6D4B\u5230\uFF08\u9700\u8981 5.0 \u6216\u66F4\u9AD8\u7248\u672C\uFF09",
+      "",
+      "\u4EFB\u9009\u4E00\u79CD\u65B9\u5F0F\u5B89\u88C5\uFF1A",
+      "",
+      "- winget\uFF1A`winget install Gyan.FFmpeg`\uFF08\u63A8\u8350\uFF0C\u81EA\u52A8\u52A0\u5165 PATH\uFF09",
+      "- \u624B\u52A8\uFF1A\u4ECE https://www.gyan.dev/ffmpeg/builds/ \u4E0B\u8F7D essentials \u7248\uFF0C",
+      "  \u89E3\u538B\u540E\u628A bin \u76EE\u5F55\u52A0\u5165 PATH\uFF0C\u6216\u8BBE\u7F6E\u73AF\u5883\u53D8\u91CF ZCODE_BEAUTIFY_FFMPEG \u6307\u5411 ffmpeg.exe\u3002",
+      "",
+      "\u5B89\u88C5\u5B8C\u6210\u540E\u91CD\u542F\u7EC8\u7AEF\uFF08\u8BA9 PATH \u751F\u6548\uFF09\uFF0C\u518D\u70B9\u51FB\u300C\u5DF2\u5B89\u88C5\uFF0C\u91CD\u8BD5\u300D\u3002"
+    ].join("\n"));
+  }
+  return sections.join("\n\n");
+}
+async function findRunningWallpaperProcess() {
+  try {
+    const { stdout } = await exec("powershell", [
+      "-NoProfile",
+      "-Command",
+      `(Get-CimInstance Win32_Process -Filter "Name='wallpaper64.exe'" | Select-Object -First 1).ExecutablePath`
+    ], { timeout: 8e3 });
+    const p2 = stdout.trim();
+    return p2 && isFile(p2) ? p2 : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function findWallpaperInRegistry() {
+  for (const key of ["HKLM\\SOFTWARE\\Wallpaper Engine", "HKCU\\SOFTWARE\\Wallpaper Engine"]) {
+    try {
+      const { stdout } = await exec("reg", ["query", key, "/v", "InstallPath"], { timeout: 5e3 });
+      const match = /\sInstallPath\s+REG_SZ\s+(.+)/.exec(stdout);
+      const dir = match?.[1]?.trim();
+      if (dir) {
+        const exe = path3.join(dir, "wallpaper64.exe");
+        if (isFile(exe))
+          return exe;
+      }
+    } catch {
+    }
+  }
+  return void 0;
+}
+function steamLibraryCandidates() {
+  const candidates = /* @__PURE__ */ new Set();
+  const vdfRoots = [
+    "C:\\Program Files (x86)\\Steam",
+    "C:\\Program Files\\Steam",
+    ...driveRoots().flatMap((d) => [path3.join(d, "Steam"), path3.join(d, "SteamLibrary")])
+  ];
+  for (const root of vdfRoots) {
+    const vdf = path3.join(root, "steamapps", "libraryfolders.vdf");
+    for (const lib of parseVdfPaths(readFileSafe(vdf)))
+      candidates.add(lib);
+  }
+  for (const drive of driveRoots()) {
+    for (const name of ["SteamLibrary", "Steam", "Games\\Steam", "Program Files (x86)\\Steam"]) {
+      candidates.add(path3.join(drive, name));
+    }
+  }
+  return [...candidates];
+}
+function parseVdfPaths(vdf) {
+  const paths = [];
+  for (const match of vdf.matchAll(/"path"\s*"([^"]+)"/gi)) {
+    paths.push(match[1].replace(/\\\\/g, "\\"));
+  }
+  return paths;
+}
+function driveRoots() {
+  const roots = [];
+  for (let i2 = 67; i2 <= 90; i2++) {
+    const drive = `${String.fromCharCode(i2)}:\\`;
+    try {
+      fs5.accessSync(drive);
+      roots.push(drive);
+    } catch {
+    }
+  }
+  return roots;
+}
+async function whereExecutable(name) {
+  try {
+    const { stdout } = await exec("where", [name], { timeout: 5e3 });
+    return stdout.split(/\r?\n/).map((l2) => l2.trim()).filter((l2) => l2.length > 0);
+  } catch {
+    return [];
+  }
+}
+async function ffmpegVersion(exe) {
+  try {
+    const { stdout } = await exec(exe, ["-version"], { timeout: 8e3 });
+    const match = /ffmpeg version (\S+)/.exec(stdout);
+    if (!match)
+      return void 0;
+    const raw = match[1];
+    const numeric = raw.replace(/^n/i, "").match(/^(\d+)/);
+    if (!numeric)
+      return { raw, major: Number.MAX_SAFE_INTEGER };
+    return { raw, major: Number(numeric[1]) };
+  } catch {
+    return void 0;
+  }
+}
+function isFile(p2) {
+  try {
+    return fs5.statSync(p2).isFile();
+  } catch {
+    return false;
+  }
+}
+function readFileSafe(p2) {
+  try {
+    return fs5.readFileSync(p2, "utf8");
+  } catch {
+    return "";
+  }
+}
+var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
+var init_dependencyCheck = __esm({
+  "dist/core/dependencyCheck.js"() {
+    "use strict";
+    exec = promisify2(execFile2);
+    WE_EXE_RELATIVE = path3.join("wallpaper_engine", "wallpaper64.exe");
+    MIN_FFMPEG_MAJOR = 5;
+  }
+});
+
+// dist/core/weLauncher.js
+import { spawn as spawn2 } from "node:child_process";
+import { execFile as execFile3 } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
+async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
+  const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
+  if (!exe)
+    throw new SceneWindowError("Wallpaper Engine not found \u2014 cannot open scene window");
+  const proc = spawn2(exe, [
+    "-control",
+    "openWallpaper",
+    "-file",
+    pkgPath,
+    "-playInWindow",
+    opts.title,
+    "-width",
+    String(opts.width),
+    "-height",
+    String(opts.height)
+  ], { stdio: "ignore", detached: false });
+  proc.unref();
+  const hwnd = await waitForWindow(opts.title, 15e3);
+  if (hwnd === null) {
+    throw new SceneWindowError(`Window "${opts.title}" did not appear within 15s`);
+  }
+  const client = await positionWindow(hwnd, opts);
+  return { title: opts.title, hwnd, client, proc };
+}
+async function closeSceneWindow(handle, wallpaperExePath) {
+  const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
+  if (!exe)
+    throw new SceneWindowError("Wallpaper Engine not found \u2014 cannot close scene window");
+  await exec2(exe, ["-control", "closeWallpaper", "-playInWindow", handle.title], { timeout: 1e4 });
+  const deadline = Date.now() + 1e4;
+  while (Date.now() < deadline) {
+    const still = await findWindowOnce(handle.title);
+    if (still === null)
+      return;
+    await sleep(300);
+  }
+  throw new SceneWindowError(`Window "${handle.title}" still present 10s after closeWallpaper`);
+}
+async function waitForWindow(title, timeoutMs) {
+  const script = `${PS_WINDOW_HELPERS}
+$deadline = (Get-Date).AddMilliseconds(${timeoutMs})
+while ((Get-Date) -lt $deadline) {
+  $h = Find-WindowByTitle '${title}'
+  if ($null -ne $h) { Write-Output $h; exit 0 }
+  Start-Sleep -Milliseconds 300
+}
+exit 3`;
+  try {
+    const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: timeoutMs + 1e4 });
+    const hwnd = Number(stdout.trim());
+    return Number.isFinite(hwnd) && hwnd > 0 ? hwnd : null;
+  } catch {
+    return null;
+  }
+}
+async function findWindowOnce(title) {
+  const script = `${PS_WINDOW_HELPERS}
+$h = Find-WindowByTitle '${title}'
+if ($null -ne $h) { Write-Output $h }`;
+  try {
+    const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+    const hwnd = Number(stdout.trim());
+    return Number.isFinite(hwnd) && hwnd > 0 ? hwnd : null;
+  } catch {
+    return null;
+  }
+}
+async function positionWindow(hwnd, opts) {
+  const script = `${PS_WINDOW_HELPERS}
+$h = [IntPtr]${hwnd}
+$x = ${opts.x ?? -1}; $y = ${opts.y ?? -1}
+$w = ${opts.width}; $hh = ${opts.height}
+if ($x -eq -1 -or $y -eq -1) {
+  Add-Type -AssemblyName System.Windows.Forms
+  $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  $x = [int](($b.Width - $w) / 2); $y = [int](($b.Height - $hh) / 2)
+}
+[Native.Win]::SetWindowPos($h, [IntPtr]::Zero, $x, $y, $w, $hh, 0x0004) | Out-Null  # SWP_NOZORDER
+Start-Sleep -Milliseconds 200
+$c = Measure-Client $h
+Write-Output ("{0},{1},{2},{3}" -f $c[0], $c[1], $c[2], $c[3])`;
+  const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+  return parseClientRect(stdout, opts.title);
+}
+async function measureClientRect(hwnd, title) {
+  const script = `${PS_WINDOW_HELPERS}
+$c = Measure-Client ([IntPtr]${hwnd})
+Write-Output ("{0},{1},{2},{3}" -f $c[0], $c[1], $c[2], $c[3])`;
+  const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+  return parseClientRect(stdout, title);
+}
+function parseClientRect(stdout, title) {
+  const [x2, y2, width, height] = stdout.trim().split(",").map(Number);
+  if (![x2, y2, width, height].every(Number.isFinite) || width <= 0 || height <= 0) {
+    throw new SceneWindowError(`Failed to measure client rect for "${title}" (got "${stdout.trim()}")`);
+  }
+  return { x: x2, y: y2, width, height };
+}
+function sleep(ms) {
+  return new Promise((r2) => setTimeout(r2, ms));
+}
+var exec2, SceneWindowError, PS_WINDOW_HELPERS;
+var init_weLauncher = __esm({
+  "dist/core/weLauncher.js"() {
+    "use strict";
+    init_dependencyCheck();
+    exec2 = promisify3(execFile3);
+    SceneWindowError = class extends Error {
+    };
+    PS_WINDOW_HELPERS = `
+# ddagrab captures PHYSICAL pixels; without DPI awareness PowerShell returns
+# logical (virtualized) coordinates and the crop lands on the wrong region.
+Add-Type -Namespace N -Name Dpi -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
+[N.Dpi]::SetProcessDPIAware() | Out-Null
+Add-Type -Namespace Native -Name Win -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern bool SetWindowPos(IntPtr h, IntPtr after, int X, int Y, int cx, int cy, uint flags);
+[DllImport("user32.dll")]
+public static extern bool GetClientRect(IntPtr h, out RECT r);
+[DllImport("user32.dll")]
+public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+public struct RECT { public int Left, Top, Right, Bottom; }
+public struct POINT { public int X, Y; }
+'@
+Add-Type @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class WinEnum {
+  public delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int m);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+  public static string FindExact(string title) {
+    string hit = null;
+    EnumWindows((h, l) => {
+      if (!IsWindowVisible(h)) return true;
+      var sb = new StringBuilder(256);
+      GetWindowText(h, sb, 256);
+      if (sb.ToString() == title) { hit = h.ToString(); return false; }
+      return true;
+    }, IntPtr.Zero);
+    return hit;
+  }
+}
+'@
+function Find-WindowByTitle([string]$Title) {
+  # FindWindowW misbehaves under PowerShell string marshaling for these
+  # windows (verified: EnumWindows sees WE_Render, FindWindowW returns 0).
+  $r = [WinEnum]::FindExact($Title)
+  if ($r) { [long]$r } else { $null }
+}
+function Measure-Client([IntPtr]$h) {
+  $cr = New-Object Native.Win+RECT
+  [Native.Win]::GetClientRect($h, [ref]$cr) | Out-Null
+  $pt = New-Object Native.Win+POINT
+  [Native.Win]::ClientToScreen($h, [ref]$pt) | Out-Null
+  ,@($pt.X, $pt.Y, ($cr.Right - $cr.Left), ($cr.Bottom - $cr.Top))
+}
+`;
+  }
+});
+
+// dist/core/recorder.js
+import { execFile as execFile4 } from "node:child_process";
+import { mkdirSync } from "node:fs";
+import path4 from "node:path";
+import { promisify as promisify4 } from "node:util";
+async function recordSceneWindow(handle, out, opts, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new RecordError("ffmpeg not found \u2014 cannot record scene window");
+  mkdirSync(path4.dirname(path4.resolve(out)), { recursive: true });
+  const client = await measureClientRect(handle.hwnd, handle.title);
+  const { x: x2, y: y2, width, height } = client;
+  const outW = opts.outWidth ?? 1920;
+  const outH = opts.outHeight ?? 1080;
+  const args = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-f",
+    "lavfi",
+    "-i",
+    `ddagrab=output_idx=0:framerate=${opts.fps}:draw_mouse=0`,
+    "-t",
+    String(opts.duration),
+    "-vf",
+    `hwdownload,format=bgra,crop=${width}:${height}:${x2}:${y2},scale=${outW}:${outH}`,
+    "-c:v",
+    "libx264",
+    "-preset",
+    "ultrafast",
+    "-pix_fmt",
+    "yuv420p",
+    "-an",
+    out
+  ];
+  await setTopmost(handle.hwnd, true);
+  try {
+    await exec3(ffmpeg, args, { timeout: (opts.duration + 30) * 1e3, maxBuffer: 16 * 1024 * 1024 });
+  } catch (err) {
+    throw new RecordError(`ffmpeg ddagrab capture failed: ${err.message}`);
+  } finally {
+    await setTopmost(handle.hwnd, false).catch(() => void 0);
+  }
+}
+async function analyzeBlackness(file, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new RecordError("ffmpeg not found \u2014 cannot analyze footage");
+  let stderr = "";
+  try {
+    await exec3(ffmpeg, [
+      "-hide_banner",
+      "-i",
+      file,
+      "-vf",
+      "blackdetect=d=0.5:pix_th=0.05",
+      "-an",
+      "-f",
+      "null",
+      "-"
+    ], { timeout: 12e4, maxBuffer: 16 * 1024 * 1024 }).then((r2) => stderr = r2.stderr);
+  } catch (err) {
+    stderr = err.stderr ?? String(err);
+  }
+  const durationSec = Number(/Duration: (\d+):(\d+):([\d.]+)/.exec(stderr)?.slice(1).reduce((acc, v) => acc * 60 + Number(v), 0) ?? 0);
+  const blackRanges = [...stderr.matchAll(/black_start:[\d.]+ black_end:([\d.]+) black_duration:([\d.]+)/g)];
+  const blackSec = blackRanges.reduce((sum, m) => sum + Number(m[2]), 0);
+  const blackFraction = durationSec > 0 ? blackSec / durationSec : 1;
+  const meanLuma = await meanLumaOf(file, ffmpeg);
+  return { blackFraction, meanLuma, durationSec };
+}
+async function meanLumaOf(file, ffmpeg) {
+  try {
+    const { stdout } = await exec3(ffmpeg, [
+      "-hide_banner",
+      "-i",
+      file,
+      "-vf",
+      "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+      "-an",
+      "-f",
+      "null",
+      "-"
+    ], { timeout: 12e4, maxBuffer: 16 * 1024 * 1024 });
+    const values = [...stdout.matchAll(/YAVG=([\d.]+)/g)].map((m) => Number(m[1]));
+    if (values.length === 0)
+      return -1;
+    return values.reduce((a2, b) => a2 + b, 0) / values.length;
+  } catch {
+    return -1;
+  }
+}
+async function setTopmost(hwnd, topmost) {
+  const after = topmost ? -1 : -2;
+  await exec3("powershell", [
+    "-NoProfile",
+    "-Command",
+    `Add-Type -Namespace N -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
+[N.W]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]${after}, 0, 0, 0, 0, 0x0003)`
+  ], { timeout: 1e4 });
+}
+var exec3, RecordError;
+var init_recorder = __esm({
+  "dist/core/recorder.js"() {
+    "use strict";
+    init_dependencyCheck();
+    init_weLauncher();
+    exec3 = promisify4(execFile4);
+    RecordError = class extends Error {
+    };
+  }
+});
+
+// dist/core/loopProcessor.js
+import { execFile as execFile5 } from "node:child_process";
+import { mkdirSync as mkdirSync2 } from "node:fs";
+import path5 from "node:path";
+import { promisify as promisify5 } from "node:util";
+async function makeSeamless(input, output, fadeSec, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new LoopError("ffmpeg not found \u2014 cannot process loop");
+  const duration = await probeDuration(input, ffmpeg);
+  if (!Number.isFinite(duration) || duration <= fadeSec + 1) {
+    throw new LoopError(`Input too short for a ${fadeSec}s crossfade (duration ${duration}s)`);
+  }
+  const tailStart = duration - fadeSec;
+  const mainEnd = duration - fadeSec;
+  const filter = [
+    `[0:v]split[base][src]`,
+    // crossfade base: the source tail, head image fades in over it
+    `[src]trim=start=${tailStart.toFixed(4)},setpts=PTS-STARTPTS[tail]`,
+    `[base]trim=end=${fadeSec.toFixed(4)},setpts=PTS-STARTPTS,format=yuva420p,fade=t=in:d=${fadeSec.toFixed(4)}:alpha=1[head]`,
+    `[tail][head]overlay=format=auto[xfade]`,
+    // main body: the source between the crossfade end and the tail start
+    `[base]trim=start=${fadeSec.toFixed(4)}:end=${mainEnd.toFixed(4)},setpts=PTS-STARTPTS[main]`,
+    `[xfade][main]concat=n=2:v=1:a=0[out]`
+  ].join(";");
+  mkdirSync2(path5.dirname(path5.resolve(output)), { recursive: true });
+  await exec4(ffmpeg, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "warning",
+    "-i",
+    input,
+    "-filter_complex",
+    filter,
+    "-map",
+    "[out]",
+    "-c:v",
+    "libx264",
+    "-crf",
+    "18",
+    "-preset",
+    "veryfast",
+    "-pix_fmt",
+    "yuv420p",
+    "-movflags",
+    "+faststart",
+    "-an",
+    output
+  ], { timeout: 3e5, maxBuffer: 16 * 1024 * 1024 });
+  const outputDuration = await probeDuration(output, ffmpeg);
+  return { inputDuration: duration, outputDuration };
+}
+async function probeDuration(file, ffmpegPath) {
+  const ffprobe = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
+  try {
+    const { stdout } = await exec4(ffprobe, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { timeout: 3e4 });
+    return Number(stdout.trim());
+  } catch {
+    const { stderr } = await exec4(ffmpegPath, ["-hide_banner", "-i", file, "-f", "null", "-"], { timeout: 3e4, maxBuffer: 4 * 1024 * 1024 });
+    const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
+    return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number.NaN;
+  }
+}
+var exec4, LoopError;
+var init_loopProcessor = __esm({
+  "dist/core/loopProcessor.js"() {
+    "use strict";
+    init_dependencyCheck();
+    exec4 = promisify5(execFile5);
+    LoopError = class extends Error {
+    };
+  }
+});
+
+// dist/core/cacheManager.js
+import crypto from "node:crypto";
+import fs6 from "node:fs";
+import path6 from "node:path";
+function scenesCacheRoot() {
+  return path6.join(dataDir(), "scenes");
+}
+function getCachePath(hash) {
+  return path6.join(scenesCacheRoot(), hash, "loop.mp4");
+}
+function hasCache(hash) {
+  try {
+    return fs6.statSync(getCachePath(hash)).isFile() && fs6.statSync(getCachePath(hash)).size > 0;
+  } catch {
+    return false;
+  }
+}
+function computeHash(pkgPath, opts) {
+  const md5 = crypto.createHash("md5");
+  md5.update(fingerprint(pkgPath));
+  md5.update(JSON.stringify(normalizeOpts(opts)));
+  return md5.digest("hex");
+}
+function touchCache(hash) {
+  const file = getCachePath(hash);
+  const now = /* @__PURE__ */ new Date();
+  try {
+    fs6.utimesSync(file, now, now);
+  } catch {
+  }
+}
+function enforceLimit(maxBytes) {
+  const root = scenesCacheRoot();
+  let entries;
+  try {
+    entries = fs6.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  const sized = entries.filter((e2) => e2.isDirectory()).map((e2) => {
+    const dir = path6.join(root, e2.name);
+    try {
+      return { dir, size: dirSize(dir), lru: lastUseMs(dir) };
+    } catch {
+      return { dir, size: 0, lru: 0 };
+    }
+  });
+  let total = sized.reduce((sum, e2) => sum + e2.size, 0);
+  if (total <= maxBytes)
+    return total;
+  sized.sort((a2, b) => a2.lru - b.lru);
+  for (const entry of sized) {
+    if (total <= maxBytes)
+      break;
+    try {
+      fs6.rmSync(entry.dir, { recursive: true, force: true });
+    } catch {
+      continue;
+    }
+    total -= entry.size;
+  }
+  return total;
+}
+function normalizeOpts(opts) {
+  const sorted = {};
+  for (const key of Object.keys(opts).sort()) {
+    sorted[key] = opts[key];
+  }
+  return sorted;
+}
+function fingerprint(p2) {
+  let stat;
+  try {
+    stat = fs6.statSync(p2);
+  } catch {
+    return `missing:${p2}`;
+  }
+  if (stat.isFile()) {
+    const buf = crypto.createHash("md5");
+    buf.update(fs6.readFileSync(p2));
+    return `file:${stat.size}:${buf.digest("hex")}`;
+  }
+  if (stat.isDirectory()) {
+    const manifest = [];
+    const walk = (abs, rel) => {
+      let items;
+      try {
+        items = fs6.readdirSync(abs, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const item of items) {
+        const childAbs = path6.join(abs, item.name);
+        const childRel = rel ? `${rel}/${item.name}` : item.name;
+        if (item.isDirectory()) {
+          walk(childAbs, childRel);
+        } else if (item.isFile()) {
+          let size = 0;
+          try {
+            size = fs6.statSync(childAbs).size;
+          } catch {
+          }
+          if (size <= 16 * 1024 * 1024) {
+            let content = "";
+            try {
+              content = crypto.createHash("md5").update(fs6.readFileSync(childAbs)).digest("hex");
+            } catch {
+              content = "unreadable";
+            }
+            manifest.push(`${childRel}:${size}:${content}`);
+          } else {
+            manifest.push(`${childRel}:${size}`);
+          }
+        }
+      }
+    };
+    walk(p2, "");
+    manifest.sort();
+    const buf = crypto.createHash("md5");
+    buf.update(manifest.join("\n"));
+    return `dir:${manifest.length}:${buf.digest("hex")}`;
+  }
+  return `other:${p2}`;
+}
+function dirSize(dir) {
+  let total = 0;
+  walkSize(dir);
+  return total;
+  function walkSize(dir2) {
+    let items;
+    try {
+      items = fs6.readdirSync(dir2, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const item of items) {
+      const child = path6.join(dir2, item.name);
+      if (item.isDirectory())
+        walkSize(child);
+      else if (item.isFile()) {
+        try {
+          total += fs6.statSync(child).size;
+        } catch {
+        }
+      }
+    }
+  }
+}
+function lastUseMs(dir) {
+  let newest = 0;
+  const consider = (st) => {
+    if (st?.isFile())
+      newest = Math.max(newest, st.mtimeMs);
+  };
+  let items;
+  try {
+    items = fs6.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  for (const item of items) {
+    try {
+      const st = fs6.statSync(path6.join(dir, item.name));
+      consider(st);
+      if (item.isDirectory()) {
+        for (const inner of fs6.readdirSync(path6.join(dir, item.name), { withFileTypes: true })) {
+          try {
+            consider(fs6.statSync(path6.join(dir, item.name, inner.name)));
+          } catch {
+          }
+        }
+      }
+    } catch {
+    }
+  }
+  return newest;
+}
+var init_cacheManager = __esm({
+  "dist/core/cacheManager.js"() {
+    "use strict";
+    init_launch();
+  }
+});
+
+// dist/core/scenePipeline.js
+var scenePipeline_exports = {};
+__export(scenePipeline_exports, {
+  DEFAULT_SCENE_OPTIONS: () => DEFAULT_SCENE_OPTIONS,
+  MissingDependencyError: () => MissingDependencyError,
+  SceneImportError: () => SceneImportError,
+  extractPoster: () => extractPoster,
+  importScene: () => importScene,
+  resolveSceneInput: () => resolveSceneInput
+});
+import { execFile as execFile6 } from "node:child_process";
+import fs7 from "node:fs";
+import path7 from "node:path";
+import { promisify as promisify6 } from "node:util";
+function resolveSceneInput(input) {
+  let stat;
+  try {
+    stat = fs7.statSync(input);
+  } catch {
+    return input;
+  }
+  if (stat.isDirectory())
+    return input;
+  if (input.toLowerCase().endsWith(".pkg"))
+    return input;
+  let dir = path7.dirname(path7.resolve(input));
+  for (let hop = 0; hop < 4; hop++) {
+    if (fs7.existsSync(path7.join(dir, "project.json")))
+      return dir;
+    const parent = path7.dirname(dir);
+    if (parent === dir)
+      break;
+    dir = parent;
+  }
+  return input;
+}
+async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath) {
+  const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
+  pkgPath = resolveSceneInput(pkgPath);
+  onProgress("detect", pkgPath);
+  const type = detectWallpaperType(pkgPath);
+  if (type !== "scene") {
+    throw new SceneImportError(`Not a scene wallpaper (${type}): ${pkgPath}`);
+  }
+  onProgress("deps");
+  const missing = [];
+  if (!(await checkWallpaperEngine()).ok)
+    missing.push("we");
+  if (!(await checkFfmpeg()).ok)
+    missing.push("ffmpeg");
+  if (missing.length > 0)
+    throw new MissingDependencyError(missing);
+  const hash = computeHash(pkgPath, {
+    width: opts.width,
+    height: opts.height,
+    fps: opts.fps,
+    duration: opts.duration,
+    fadeSec: opts.fadeSec
+  });
+  const loopPath = getCachePath(hash);
+  const posterPath = path7.join(path7.dirname(loopPath), "poster.jpg");
+  if (hasCache(hash)) {
+    onProgress("cache-hit", hash);
+    touchCache(hash);
+    enforceLimit(opts.maxCacheBytes);
+    return { loopPath, posterPath, hash, blackness: { blackFraction: -1, meanLuma: -1, durationSec: -1 }, fromCache: true };
+  }
+  onProgress("opening", `window "${opts.title}"`);
+  const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
+  try {
+    onProgress("render-ready", JSON.stringify(handle.client));
+    await new Promise((r2) => setTimeout(r2, 3e3));
+    onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
+    const rawPath = path7.join(path7.dirname(loopPath), `raw-${Date.now()}.mp4`);
+    fs7.mkdirSync(path7.dirname(rawPath), { recursive: true });
+    try {
+      await recordSceneWindow(handle, rawPath, { duration: opts.duration, fps: opts.fps, outWidth: opts.width, outHeight: opts.height }, ffmpegPath);
+    } finally {
+      onProgress("closing");
+      await closeSceneWindow(handle).catch(() => void 0);
+    }
+    onProgress("processing", `crossfade ${opts.fadeSec}s`);
+    const tmpLoop = `${loopPath}.tmp.mp4`;
+    await makeSeamless(rawPath, tmpLoop, opts.fadeSec, ffmpegPath);
+    onProgress("poster");
+    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    onProgress("saving", hash);
+    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.renameSync(tmpLoop, loopPath);
+    fs7.rmSync(rawPath, { force: true });
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    enforceLimit(opts.maxCacheBytes);
+    onProgress("done", loopPath);
+    return { loopPath, posterPath, hash, blackness, fromCache: false };
+  } finally {
+    await closeSceneWindow(handle).catch(() => void 0);
+  }
+}
+async function extractPoster(loopFile, posterPath, ffmpegPath) {
+  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new SceneImportError("ffmpeg not found");
+  fs7.mkdirSync(path7.dirname(path7.resolve(posterPath)), { recursive: true });
+  await execFileP(ffmpeg, [
+    "-y",
+    "-loglevel",
+    "error",
+    "-ss",
+    "1",
+    // skip the crossfade's darkest opening moment
+    "-i",
+    loopFile,
+    "-frames:v",
+    "1",
+    "-update",
+    "1",
+    "-q:v",
+    "2",
+    posterPath
+  ], { timeout: 6e4 });
+}
+function execFileP(cmd, args, opts) {
+  return promisify6(execFile6)(cmd, args, opts);
+}
+var MissingDependencyError, SceneImportError, DEFAULT_SCENE_OPTIONS;
+var init_scenePipeline = __esm({
+  "dist/core/scenePipeline.js"() {
+    "use strict";
+    init_wallpaperType();
+    init_dependencyCheck();
+    init_weLauncher();
+    init_recorder();
+    init_loopProcessor();
+    init_cacheManager();
+    MissingDependencyError = class extends Error {
+      missing;
+      constructor(missing) {
+        super(`Missing dependencies: ${missing.join(", ")}`);
+        this.missing = missing;
+      }
+    };
+    SceneImportError = class extends Error {
+    };
+    DEFAULT_SCENE_OPTIONS = {
+      width: 1920,
+      height: 1080,
+      fps: 30,
+      duration: 15,
+      fadeSec: 1,
+      title: "WE_Render",
+      maxCacheBytes: 10 * 1024 ** 3
+    };
+  }
+});
+
 // dist/core/session.js
 var session_exports = {};
 __export(session_exports, {
+  MissingDependencyError: () => MissingDependencyError,
   applyColorsOnly: () => applyColorsOnly,
+  applySceneWallpaper: () => applySceneWallpaper,
   applyWallpaper: () => applyWallpaper,
   buildPayloadFromConfig: () => buildPayloadFromConfig,
+  getInstallGuide: () => getInstallGuide,
   reapplyStored: () => reapplyStored,
   resetAppearance: () => resetAppearance
 });
-import fs4 from "node:fs";
-import path2 from "node:path";
+import fs8 from "node:fs";
+import path8 from "node:path";
 async function reapplyStored() {
   const config = mergedConfig();
   return applyToZCode(config, await buildPayloadFromConfig(config));
 }
 async function applyWallpaper(imagePath, opts) {
-  const abs = path2.resolve(imagePath);
-  if (!fs4.existsSync(abs))
+  const abs = path8.resolve(imagePath);
+  if (!fs8.existsSync(abs))
     throw new Error(`Image not found: ${abs}`);
+  if (detectWallpaperType(abs) === "scene") {
+    const result = await applySceneWallpaper(abs, opts);
+    return { windows: result.windows, config: result.config };
+  }
   const stored = loadConfig();
-  const config = {
-    ...DEFAULT_CONFIG,
-    ...stored,
-    port: opts.port ?? stored.port ?? DEFAULT_CONFIG.port,
-    blur: opts.blur ?? stored.blur ?? DEFAULT_CONFIG.blur,
-    dim: opts.dim ?? stored.dim ?? DEFAULT_CONFIG.dim,
-    monet: opts.monet ?? stored.monet ?? DEFAULT_CONFIG.monet,
-    wallpaperVisible: opts.wallpaperVisible ?? stored.wallpaperVisible ?? DEFAULT_CONFIG.wallpaperVisible,
-    fit: opts.fit ?? stored.fit ?? DEFAULT_CONFIG.fit
-  };
-  fs4.mkdirSync(dataDir(), { recursive: true });
-  const dest = path2.join(dataDir(), "wallpaper" + path2.extname(abs).toLowerCase());
+  const config = { ...baseConfig(opts, stored), mediaType: "image", sceneHash: void 0 };
+  fs8.mkdirSync(dataDir(), { recursive: true });
+  const dest = path8.join(dataDir(), "wallpaper" + path8.extname(abs).toLowerCase());
   if (dest !== abs)
-    fs4.copyFileSync(abs, dest);
+    fs8.copyFileSync(abs, dest);
   const assets = await loadWallpaper(dest);
   const payload = buildPayload(config, assets);
   saveConfig({ ...config, wallpaperPath: dest });
@@ -110016,7 +111016,12 @@ async function applyWallpaper(imagePath, opts) {
 }
 async function applyColorsOnly(opts) {
   const stored = loadConfig();
-  const config = {
+  const config = baseConfig(opts, stored);
+  saveConfig(config);
+  return applyToZCode(config, await buildPayloadFromConfig(config));
+}
+function baseConfig(opts, stored) {
+  return {
     ...DEFAULT_CONFIG,
     ...stored,
     port: opts.port ?? stored.port ?? DEFAULT_CONFIG.port,
@@ -110026,18 +111031,63 @@ async function applyColorsOnly(opts) {
     wallpaperVisible: opts.wallpaperVisible ?? stored.wallpaperVisible ?? DEFAULT_CONFIG.wallpaperVisible,
     fit: opts.fit ?? stored.fit ?? DEFAULT_CONFIG.fit
   };
-  saveConfig(config);
-  return applyToZCode(config, await buildPayloadFromConfig(config));
+}
+async function applySceneWallpaper(scenePath, opts = {}) {
+  const abs = path8.resolve(scenePath);
+  const { importScene: importScene2 } = await Promise.resolve().then(() => (init_scenePipeline(), scenePipeline_exports));
+  const scene = await importScene2(abs, opts.onProgress ?? (() => void 0));
+  const stored = loadConfig();
+  const config = baseConfig(opts, stored);
+  const apiPort = stored.apiPort ?? 9223;
+  const sceneVideoUrl = `http://127.0.0.1:${apiPort}/media/scene/${scene.hash}.mp4`;
+  const served = await isServeAlive(apiPort);
+  const next = {
+    ...config,
+    mediaType: "video",
+    sceneHash: scene.hash,
+    wallpaperPath: scene.loopPath,
+    apiPort,
+    ...served ? { sceneVideoUrl } : {}
+  };
+  saveConfig(next);
+  if (!served) {
+    console.warn("scene loop stored, but serve is not running \u2014 applying the poster frame as a static wallpaper.\nRun `zcode-beautify serve --detach` and `refresh_theme` to enable motion.");
+    const assets = await loadWallpaper(scene.posterPath);
+    const payload = buildPayload({ ...next, sceneVideoUrl: void 0 }, assets);
+    const windows2 = await applyToZCode({ ...next, sceneVideoUrl: void 0 }, payload);
+    return { windows: windows2, config: next, scene, served: false };
+  }
+  const windows = await applyToZCode(next, await buildPayloadFromConfig(next));
+  return { windows, config: next, scene, served: true };
+}
+async function isServeAlive(apiPort) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1200) });
+    return (await res.json())?.service === "zcode-beautify";
+  } catch {
+    return false;
+  }
 }
 async function resetAppearance(port) {
   const stored = loadConfig();
   await resetZCode(port ?? stored.port ?? DEFAULT_CONFIG.port);
-  saveConfig({ ...stored, wallpaperPath: void 0 });
+  saveConfig({ ...stored, wallpaperPath: void 0, mediaType: void 0, sceneHash: void 0, sceneVideoUrl: void 0 });
   return 0;
 }
 async function buildPayloadFromConfig(config) {
   let assets;
-  if (config.wallpaperPath && fs4.existsSync(config.wallpaperPath)) {
+  if (config.mediaType === "video" && config.wallpaperPath && fs8.existsSync(config.wallpaperPath)) {
+    const posterPath = path8.join(path8.dirname(config.wallpaperPath), "poster.jpg");
+    if (fs8.existsSync(posterPath)) {
+      assets = await loadWallpaper(posterPath);
+    }
+    const apiPort = config.apiPort ?? 9223;
+    if (!config.sceneVideoUrl && config.sceneHash) {
+      config = { ...config, sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${config.sceneHash}.mp4` };
+    }
+    return buildPayload(config, assets);
+  }
+  if (config.wallpaperPath && fs8.existsSync(config.wallpaperPath)) {
     assets = await loadWallpaper(config.wallpaperPath);
   }
   return buildPayload(config, assets);
@@ -110050,6 +111100,9 @@ var init_session = __esm({
     "use strict";
     init_inject();
     init_launch();
+    init_wallpaperType();
+    init_scenePipeline();
+    init_dependencyCheck();
   }
 });
 
@@ -110092,6 +111145,21 @@ function buildPanelScript(apiPort) {
       ' background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.14); color: inherit; font-size: 12px; }',
     '.zb-btn:hover { background: rgba(255,255,255,.16); }',
     '#zb-status { min-height: 14px; padding: 2px 12px 0; opacity: .6; font-size: 11px; }',
+    '#zb-scene-path { width: 100%; padding: 5px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,.14);',
+      ' background: rgba(0,0,0,.3); color: inherit; font-size: 11px; outline: none; }',
+    '#zb-scene-path:focus { border-color: rgba(122,162,247,.6); }',
+    '#zb-progress { position: relative; height: 14px; border-radius: 7px; overflow: hidden;',
+      ' background: rgba(255,255,255,.08); font-size: 10px; line-height: 14px; text-align: center; }',
+    '#zb-progress-bar { position: absolute; inset: 0; width: 0%; background: rgba(122,162,247,.5); transition: width .4s; }',
+    '#zb-progress span { position: relative; }',
+    '#zb-guide { padding: 8px 10px; background: rgba(120,53,15,.55); border-radius: 8px; font-size: 11px;',
+      ' line-height: 1.5; white-space: pre-wrap; user-select: text; max-height: 180px; overflow: auto; }',
+    '.zb-lib { max-height: 120px; overflow: auto; font-size: 11px; }',
+    '.zb-lib .zb-lib-head { opacity: .55; margin: 4px 0 2px; }',
+    '.zb-lib .zb-item { padding: 3px 6px; border-radius: 6px; cursor: pointer; overflow: hidden;',
+      ' text-overflow: ellipsis; white-space: nowrap; }',
+    '.zb-lib .zb-item:hover { background: rgba(255,255,255,.1); }',
+    '.zb-lib .zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
     '#zb-offline { display: flex; flex-direction: column; gap: 6px; align-items: center;',
       ' padding: 10px 12px; background: rgba(120,53,15,.55); font-size: 11px; line-height: 1.5; text-align: center; }',
     '#zb-offline[hidden] { display: none; }',
@@ -110138,6 +111206,19 @@ function buildPanelScript(apiPort) {
     '      <label class="zb-btn" for="zb-file" title="\u9009\u62E9\u4E00\u5F20\u56FE\u7247\u4F5C\u4E3A\u80CC\u666F\u58C1\u7EB8,UI \u914D\u8272\u968F\u4E4B\u66F4\u65B0">\u66F4\u6362\u56FE\u7247\u2026</label>' +
     '      <input type="file" id="zb-file" accept="image/*" hidden>' +
     '    </div>' +
+    '    <div class="zb-row"><label style="opacity:.85"><span>\u573A\u666F\u58C1\u7EB8 (Wallpaper Engine)</span></label>' +
+    '      <div class="zb-actions" style="margin:2px 0 6px">' +
+    '        <button class="zb-btn" id="zb-pick" title="\u6253\u5F00\u6587\u4EF6\u9009\u62E9\u5668,\u9009 .pkg \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6(\u4F1A\u81EA\u52A8\u5B9A\u4F4D\u58C1\u7EB8\u76EE\u5F55)\u5E76\u5F00\u59CB\u5BFC\u5165">\u9009\u62E9\u5E76\u5BFC\u5165\u2026</button>' +
+    '      </div>' +
+    '      <input type="text" id="zb-scene-path" placeholder="\u6216\u7C98\u8D34 .pkg / \u58C1\u7EB8\u76EE\u5F55\u5B8C\u6574\u8DEF\u5F84\u2026" spellcheck="false">' +
+    '      <div class="zb-actions" style="margin-top:6px">' +
+    '        <button class="zb-btn" id="zb-import" title="\u6E32\u67D3\u5E76\u5F55\u5236\u573A\u666F\u58C1\u7EB8,\u751F\u6210\u65E0\u7F1D\u5FAA\u73AF\u52A8\u6001\u80CC\u666F">\u5BFC\u5165\u7C98\u8D34\u7684\u8DEF\u5F84</button>' +
+    '      </div>' +
+    '      <div id="zb-progress" hidden><div id="zb-progress-bar"></div><span>\u2026</span></div>' +
+    '      <div id="zb-guide" hidden></div>' +
+    '      <div class="zb-actions" style="margin-top:6px"><button class="zb-btn" id="zb-guide-retry" hidden>\u5DF2\u5B89\u88C5,\u91CD\u8BD5</button></div>' +
+    '    </div>' +
+    '    <div class="zb-row zb-lib" id="zb-lib"></div>' +
     '    <div class="zb-row zb-actions">' +
     '      <button class="zb-btn" id="zb-reset" title="\u79FB\u9664\u58C1\u7EB8\u4E0E\u914D\u8272,\u8FD8\u539F ZCode \u9ED8\u8BA4\u5916\u89C2(\u58C1\u7EB8\u4F1A\u88AB\u8BB0\u4F4F,\u53EF\u518D\u6B21\u6062\u590D)">\u8FD8\u539F\u9ED8\u8BA4\u5916\u89C2</button>' +
     '    </div>' +
@@ -110275,6 +111356,123 @@ function buildPanelScript(apiPort) {
     fr.readAsDataURL(f);
   });
 
+  // --- scene wallpaper import ------------------------------------------------
+  var STAGE_LABELS = {
+    starting: '\u51C6\u5907\u4E2D', detect: '\u8BC6\u522B\u4E2D', deps: '\u68C0\u67E5\u4F9D\u8D56', opening: '\u6E32\u67D3\u4E2D', 'render-ready': '\u6E32\u67D3\u4E2D',
+    recording: '\u5F55\u5236\u4E2D', closing: '\u5F55\u5236\u4E2D', processing: '\u5904\u7406\u4E2D', poster: '\u5904\u7406\u4E2D', saving: '\u4FDD\u5B58\u4E2D',
+    'cache-hit': '\u7F13\u5B58\u547D\u4E2D', done: '\u5B8C\u6210', error: '\u5931\u8D25'
+  };
+  var importTimer = null;
+  function setProgress(on, stage, fromCache) {
+    var box = $('zb-progress');
+    box.hidden = !on;
+    if (on) {
+      var label = STAGE_LABELS[stage] || stage || '\u2026';
+      // The pipeline stages advance in order; map them onto a smooth bar.
+      var order = ['starting', 'detect', 'deps', 'opening', 'render-ready', 'recording', 'closing', 'processing', 'poster', 'saving', 'done'];
+      var pct = stage === 'done' ? 100 : (stage === 'cache-hit' ? 100 : 8 + 88 * Math.max(0, order.indexOf(stage)) / (order.length - 1));
+      $('zb-progress-bar').style.width = pct + '%';
+      box.firstElementChild.nextSibling.textContent = label + (stage === 'cache-hit' ? '(\u7F13\u5B58)' : '');
+    }
+  }
+  function showGuide(guide, retryable) {
+    var g = $('zb-guide');
+    g.hidden = !guide;
+    g.textContent = guide || '';
+    $('zb-guide-retry').hidden = !retryable;
+  }
+  $('zb-pick').addEventListener('click', function () {
+    var btn = this;
+    btn.textContent = '\u6253\u5F00\u9009\u62E9\u5668\u2026';
+    fetch(API + '/api/pick-scene', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.textContent = '\u9009\u62E9\u5E76\u5BFC\u5165\u2026';
+        if (!d || !d.ok || !d.path) return; // user cancelled the dialog
+        $('zb-scene-path').value = d.path;
+        $('zb-import').click();
+      })
+      .catch(function () { btn.textContent = '\u9009\u62E9\u5E76\u5BFC\u5165\u2026'; status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable'); });
+  });
+
+  $('zb-import').addEventListener('click', function () {
+    var p = $('zb-scene-path').value.trim();
+    if (!p) { status('\u8BF7\u5148\u7C98\u8D34\u573A\u666F\u58C1\u7EB8\u8DEF\u5F84'); return; }
+    showGuide('', false);
+    post('/api/import-scene', { path: p }, function (d) {
+      if (d && d.error) { status(d.error); return; }
+      setProgress(true, 'starting');
+      if (importTimer) clearInterval(importTimer);
+      importTimer = setInterval(pollImport, 600);
+    });
+  });
+  function pollImport() {
+    fetch(API + '/api/import-status')
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        setProgress(j.running || j.stage === 'done', j.stage);
+        if (j.error) {
+          clearInterval(importTimer); importTimer = null;
+          setProgress(false);
+          showGuide(j.guide || ('\u5BFC\u5165\u5931\u8D25: ' + j.error), Boolean(j.guide));
+          return;
+        }
+        if (!j.running && j.stage === 'done') {
+          clearInterval(importTimer); importTimer = null;
+          status(j.result && j.result.fromCache ? '\u5DF2\u4ECE\u7F13\u5B58\u8F7D\u5165' : '\u52A8\u6001\u58C1\u7EB8\u5DF2\u5E94\u7528');
+          refresh();
+        }
+      })
+      .catch(function () { /* transient */ });
+  }
+  $('zb-guide-retry').addEventListener('click', function () {
+    showGuide('', false);
+    $('zb-import').click();
+  });
+
+  // --- library (static images + imported scene loops) ------------------------
+  function loadLibrary() {
+    fetch(API + '/api/library')
+      .then(function (r) { return r.json(); })
+      .then(function (lib) {
+        var el = $('zb-lib');
+        el.innerHTML = '';
+        var head1 = document.createElement('div');
+        head1.className = 'zb-lib-head'; head1.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u573A\u666F';
+        el.appendChild(head1);
+        (lib.scenes || []).forEach(function (s) {
+          el.appendChild(libItem('\u573A\u666F ' + s.hash.slice(0, 8), { hash: s.hash }, s.hash));
+        });
+        var head2 = document.createElement('div');
+        head2.className = 'zb-lib-head'; head2.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u56FE\u7247';
+        el.appendChild(head2);
+        (lib.images || []).forEach(function (im) {
+          el.appendChild(libItem(im.name, { path: im.path }, im.path));
+        });
+        if (!(lib.scenes || []).length && !(lib.images || []).length) {
+          el.innerHTML = '<div class="zb-lib-head">\u58C1\u7EB8\u5E93\u4E3A\u7A7A \u2014 \u5BFC\u5165\u6216\u66F4\u6362\u58C1\u7EB8\u540E\u51FA\u73B0\u5728\u8FD9\u91CC</div>';
+        }
+      })
+      .catch(function () { /* offline */ });
+  }
+  function libItem(label, applyBody, key) {
+    var d = document.createElement('div');
+    d.className = 'zb-item';
+    d.textContent = label;
+    d.title = label;
+    var cur = localStorage.getItem('zcode-beautify:current-key');
+    if (cur === key) d.setAttribute('data-current', '1');
+    d.addEventListener('click', function () {
+      post('/api/apply-wallpaper', applyBody, function (r) {
+        if (r && r.error) { status(r.error); return; }
+        try { localStorage.setItem('zcode-beautify:current-key', key); } catch (e) {}
+        status('\u5DF2\u5E94\u7528 applied');
+        loadLibrary();
+      });
+    });
+    return d;
+  }
+
   $('zb-reset').addEventListener('click', function () {
     var mode = this.getAttribute('data-mode') || 'reset';
     post(mode === 'restore' ? '/api/restore' : '/api/reset', {}, function () {
@@ -110298,6 +111496,7 @@ function buildPanelScript(apiPort) {
     p.hidden = !p.hidden;
     if (!p.hidden) {
       refresh();
+      loadLibrary();
       beat(true);
     } else if (root.getAttribute('data-offline') !== '1') {
       beat(false);
@@ -110360,6 +111559,67 @@ var init_panelScript = __esm({
   }
 });
 
+// dist/core/media.js
+import fs9 from "node:fs";
+function sendMediaFile(req, res, filePath) {
+  let stat;
+  try {
+    stat = fs9.statSync(filePath);
+  } catch {
+    return false;
+  }
+  const type = MIME[filePath.toLowerCase().split(".").pop() ?? ""] ?? "application/octet-stream";
+  const headers = {
+    "Content-Type": type,
+    "Accept-Ranges": "bytes",
+    "Cache-Control": "no-store",
+    "Access-Control-Allow-Origin": "*"
+  };
+  const range = /bytes=(\d*)-(\d*)/.exec(req.headers.range ?? "");
+  if (range && (range[1] !== "" || range[2] !== "")) {
+    let start;
+    let end;
+    if (range[1] === "") {
+      start = Math.max(0, stat.size - Number(range[2]));
+      end = stat.size - 1;
+    } else if (range[2] === "") {
+      start = Number(range[1]);
+      end = stat.size - 1;
+    } else {
+      start = Number(range[1]);
+      end = Math.min(Number(range[2]), stat.size - 1);
+    }
+    if (start >= stat.size || start > end) {
+      res.writeHead(416, { "Content-Range": `bytes */${stat.size}` });
+      res.end();
+      return true;
+    }
+    res.writeHead(206, {
+      ...headers,
+      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+      "Content-Length": end - start + 1
+    });
+    fs9.createReadStream(filePath, { start, end }).pipe(res);
+  } else {
+    res.writeHead(200, { ...headers, "Content-Length": stat.size });
+    fs9.createReadStream(filePath).pipe(res);
+  }
+  return true;
+}
+var MIME;
+var init_media = __esm({
+  "dist/core/media.js"() {
+    "use strict";
+    MIME = {
+      ".mp4": "video/mp4",
+      ".webm": "video/webm",
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png"
+    };
+  }
+});
+
 // dist/core/server.js
 var server_exports = {};
 __export(server_exports, {
@@ -110367,27 +111627,37 @@ __export(server_exports, {
   startServe: () => startServe
 });
 import http from "node:http";
-import fs5 from "node:fs";
-import path3 from "node:path";
-async function getAssets(wallpaperPath) {
-  if (!wallpaperPath || !fs5.existsSync(wallpaperPath))
+import fs10 from "node:fs";
+import path9 from "node:path";
+import { execFile as execFile7 } from "node:child_process";
+import { promisify as promisify7 } from "node:util";
+async function getAssets(config) {
+  const wallpaperPath = config.wallpaperPath;
+  if (!wallpaperPath || !fs10.existsSync(wallpaperPath))
     return void 0;
-  const mtimeMs = fs5.statSync(wallpaperPath).mtimeMs;
-  if (cachedAssets?.file === wallpaperPath && cachedAssets.mtimeMs === mtimeMs) {
+  const sourcePath = config.mediaType === "video" ? path9.join(path9.dirname(wallpaperPath), "poster.jpg") : wallpaperPath;
+  if (!fs10.existsSync(sourcePath))
+    return void 0;
+  const mtimeMs = fs10.statSync(sourcePath).mtimeMs;
+  if (cachedAssets?.file === sourcePath && cachedAssets.mtimeMs === mtimeMs) {
     return cachedAssets.assets;
   }
-  const assets = await loadWallpaper(wallpaperPath);
-  cachedAssets = { file: wallpaperPath, mtimeMs, assets };
-  return assets;
+  try {
+    const assets = await loadWallpaper(sourcePath);
+    cachedAssets = { file: sourcePath, mtimeMs, assets };
+    return assets;
+  } catch {
+    return void 0;
+  }
 }
 function currentConfig() {
   return { ...DEFAULT_CONFIG, ...loadConfig() };
 }
 function backupFile() {
-  return path3.join(dataDir(), "config.backup.json");
+  return path9.join(dataDir(), "config.backup.json");
 }
 function hasBackup() {
-  return fs5.existsSync(backupFile());
+  return fs10.existsSync(backupFile());
 }
 function publicConfig(config) {
   return {
@@ -110396,9 +111666,11 @@ function publicConfig(config) {
     monet: config.monet,
     wallpaperVisible: config.wallpaperVisible,
     fit: config.fit,
-    wallpaperSet: Boolean(config.wallpaperPath && fs5.existsSync(config.wallpaperPath)),
+    wallpaperSet: Boolean(config.wallpaperPath && fs10.existsSync(config.wallpaperPath)),
     hasBackup: hasBackup(),
-    cdpPort: config.port
+    cdpPort: config.port,
+    mediaType: config.mediaType ?? "image",
+    sceneHash: config.sceneHash
   };
 }
 function sanitize(body) {
@@ -110425,11 +111697,12 @@ async function holdSession(target, config, apiPort) {
   const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
   await conn.send("Page.enable");
   const session = { conn };
-  const assets = await getAssets(config.wallpaperPath);
+  const assets = await getAssets(config);
   const payload = buildPayload(config, assets);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
+    videoSrc: payload.videoSrc,
     fit: payload.fit
   });
   const { identifier } = await conn.send("Page.addScriptToEvaluateOnNewDocument", {
@@ -110443,11 +111716,12 @@ async function holdSession(target, config, apiPort) {
   held.set(target.id, session);
 }
 async function pushConfigToSessions(config) {
-  const assets = await getAssets(config.wallpaperPath);
+  const assets = await getAssets(config);
   const payload = buildPayload(config, assets);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
+    videoSrc: payload.videoSrc,
     fit: payload.fit
   });
   let ok = 0;
@@ -110578,10 +111852,10 @@ async function startServe(opts) {
           throw new Error(`image too large (max ${MAX_WALLPAPER_BYTES / 1024 / 1024} MB)`);
         }
         const config = runtimeConfig();
-        fs5.mkdirSync(dataDir(), { recursive: true });
-        const dest = path3.join(dataDir(), "wallpaper" + IMAGE_EXT[m[1]]);
-        fs5.writeFileSync(dest, bytes);
-        cachedAssets = { file: dest, mtimeMs: fs5.statSync(dest).mtimeMs, assets: await loadWallpaper(dest) };
+        fs10.mkdirSync(dataDir(), { recursive: true });
+        const dest = path9.join(dataDir(), "wallpaper" + IMAGE_EXT[m[1]]);
+        fs10.writeFileSync(dest, bytes);
+        cachedAssets = { file: dest, mtimeMs: fs10.statSync(dest).mtimeMs, assets: await loadWallpaper(dest) };
         saveConfig(persisted({ ...config, wallpaperPath: dest }));
         const windows = await pushConfigToSessions({ ...config, wallpaperPath: dest }).catch(() => 0);
         sendJson(res, 200, { ok: true, windows, ...publicConfig({ ...config, wallpaperPath: dest }) });
@@ -110589,9 +111863,9 @@ async function startServe(opts) {
       }
       if (req.method === "POST" && url.pathname === "/api/reset") {
         const stored = loadConfig();
-        if (stored.wallpaperPath && fs5.existsSync(stored.wallpaperPath)) {
-          fs5.mkdirSync(dataDir(), { recursive: true });
-          fs5.writeFileSync(backupFile(), JSON.stringify(stored));
+        if (stored.wallpaperPath && fs10.existsSync(stored.wallpaperPath)) {
+          fs10.mkdirSync(dataDir(), { recursive: true });
+          fs10.writeFileSync(backupFile(), JSON.stringify(stored));
         }
         for (const [id, session] of held) {
           try {
@@ -110606,7 +111880,7 @@ async function startServe(opts) {
             held.delete(id);
           }
         }
-        saveConfig({ ...stored, wallpaperPath: void 0 });
+        saveConfig({ ...stored, wallpaperPath: void 0, mediaType: void 0, sceneHash: void 0, sceneVideoUrl: void 0 });
         cachedAssets = void 0;
         sendJson(res, 200, { ok: true, hasBackup: true });
         return;
@@ -110614,7 +111888,7 @@ async function startServe(opts) {
       if (req.method === "POST" && url.pathname === "/api/restore") {
         let saved;
         try {
-          saved = JSON.parse(fs5.readFileSync(backupFile(), "utf8"));
+          saved = JSON.parse(fs10.readFileSync(backupFile(), "utf8"));
         } catch {
           throw new Error("no wallpaper backup available");
         }
@@ -110626,6 +111900,126 @@ async function startServe(opts) {
       }
       if (req.method === "GET" && url.pathname === "/api/health") {
         sendJson(res, 200, { ok: true, service: "zcode-beautify", pid: process.pid });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/pick-scene") {
+        const picked = await pickFileViaDialog();
+        sendJson(res, 200, { ok: Boolean(picked), path: picked });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/import-scene") {
+        const body = JSON.parse(await readBody(req));
+        const scenePath = typeof body?.path === "string" ? body.path.trim() : "";
+        if (!scenePath)
+          throw new Error("path is required");
+        if (importJob.running) {
+          sendJson(res, 409, { error: "another import is already running", stage: importJob.stage });
+          return;
+        }
+        importJob = { running: true, stage: "starting" };
+        void importScene(scenePath, (stage, detail) => {
+          importJob.stage = stage;
+          importJob.detail = detail;
+        }).then(async (result) => {
+          importJob = {
+            running: false,
+            stage: "done",
+            result: { loopPath: result.loopPath, posterPath: result.posterPath, hash: result.hash, fromCache: result.fromCache }
+          };
+          const config = runtimeConfig();
+          const next = {
+            ...config,
+            mediaType: "video",
+            sceneHash: result.hash,
+            wallpaperPath: result.loopPath,
+            apiPort,
+            sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${result.hash}.mp4`
+          };
+          saveConfig(persisted(next));
+          await pushConfigToSessions(next).catch(() => 0);
+        }).catch((err) => {
+          importJob = {
+            running: false,
+            stage: "error",
+            error: err.message,
+            guide: err instanceof MissingDependencyError ? getInstallGuide(err.missing) : void 0
+          };
+        });
+        sendJson(res, 200, { ok: true, started: true });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/import-status") {
+        sendJson(res, 200, importJob);
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/apply-wallpaper") {
+        const body = JSON.parse(await readBody(req));
+        const config = runtimeConfig();
+        if (typeof body?.hash === "string") {
+          const loopPath = path9.join(scenesCacheRoot(), body.hash, "loop.mp4");
+          if (!fs10.existsSync(loopPath))
+            throw new Error("unknown scene hash");
+          const next = {
+            ...config,
+            mediaType: "video",
+            sceneHash: body.hash,
+            wallpaperPath: loopPath,
+            apiPort,
+            sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${body.hash}.mp4`
+          };
+          saveConfig(persisted(next));
+          const windows = await pushConfigToSessions(next).catch(() => 0);
+          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
+          return;
+        }
+        if (typeof body?.path === "string" && fs10.existsSync(body.path)) {
+          const next = {
+            ...config,
+            wallpaperPath: body.path,
+            mediaType: "image",
+            sceneHash: void 0,
+            sceneVideoUrl: void 0
+          };
+          saveConfig(persisted(next));
+          const windows = await pushConfigToSessions(next).catch(() => 0);
+          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
+          return;
+        }
+        throw new Error("provide hash or existing path");
+      }
+      if (req.method === "GET" && url.pathname === "/api/library") {
+        const images = [];
+        for (const f2 of fs10.readdirSync(dataDir())) {
+          if (/\.(jpe?g|png|webp|bmp)$/i.test(f2) && f2.startsWith("wallpaper")) {
+            images.push({ name: f2, path: path9.join(dataDir(), f2) });
+          }
+        }
+        const scenes = [];
+        try {
+          for (const d of fs10.readdirSync(scenesCacheRoot())) {
+            const loop = path9.join(scenesCacheRoot(), d, "loop.mp4");
+            try {
+              const st = fs10.statSync(loop);
+              scenes.push({ hash: d, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+            } catch {
+            }
+          }
+        } catch {
+        }
+        scenes.sort((a2, b) => b.mtimeMs - a2.mtimeMs);
+        sendJson(res, 200, { images, scenes });
+        return;
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/media/scene/")) {
+        const hash = /^\/media\/scene\/([a-f0-9]{8,64})\.mp4$/.exec(url.pathname)?.[1];
+        if (!hash) {
+          sendJson(res, 400, { error: "bad scene media path" });
+          return;
+        }
+        const file = path9.join(scenesCacheRoot(), hash, "loop.mp4");
+        if (!sendMediaFile(req, res, file)) {
+          sendJson(res, 404, { error: "scene media not found" });
+        }
         return;
       }
       sendJson(res, 404, { error: "not found" });
@@ -110648,7 +112042,23 @@ async function startServe(opts) {
     await poll(runtimeConfig(), apiPort);
   }
 }
-var MAX_WALLPAPER_BYTES, MAX_BODY_BYTES, POLL_MS, cachedAssets, held, IMAGE_EXT;
+async function pickFileViaDialog() {
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$d = New-Object System.Windows.Forms.OpenFileDialog
+$d.Title = '\u9009\u62E9 Wallpaper Engine \u573A\u666F\u58C1\u7EB8 (.pkg \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6)'
+$d.Filter = 'Wallpaper Engine \u58C1\u7EB8 (*.pkg;*.json;*.gif;*.jpg;*.png)|*.pkg;*.json;*.gif;*.jpg;*.png|\u6240\u6709\u6587\u4EF6 (*.*)|*.*'
+if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`;
+  try {
+    const { stdout } = await promisify7(execFile7)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 3e5 });
+    return stdout.trim();
+  } catch {
+    return "";
+  }
+}
+var MAX_WALLPAPER_BYTES, MAX_BODY_BYTES, POLL_MS, cachedAssets, importJob, held, IMAGE_EXT;
 var init_server = __esm({
   "dist/core/server.js"() {
     "use strict";
@@ -110657,9 +112067,14 @@ var init_server = __esm({
     init_monet();
     init_panelScript();
     init_launch();
+    init_media();
+    init_scenePipeline();
+    init_dependencyCheck();
+    init_cacheManager();
     MAX_WALLPAPER_BYTES = 20 * 1024 * 1024;
     MAX_BODY_BYTES = MAX_WALLPAPER_BYTES + 1024 * 1024;
     POLL_MS = 1500;
+    importJob = { running: false, stage: "idle" };
     held = /* @__PURE__ */ new Map();
     IMAGE_EXT = {
       "image/jpeg": ".jpg",
@@ -110675,8 +112090,8 @@ var init_server = __esm({
 init_inject();
 init_launch();
 init_session();
-import fs6 from "node:fs";
-import path4 from "node:path";
+import fs11 from "node:fs";
+import path10 from "node:path";
 var USAGE = `zcode-beautify <command> [options]
 
 Commands:
@@ -110687,6 +112102,13 @@ Commands:
     --fit <mode>                 cover | contain | smart (default cover)
     --no-monet                   Keep ZCode's original colors
     --port <N>                   CDP port (default 9222)
+  apply-scene <pkg-or-dir> [options]
+                                 Import a Wallpaper Engine scene wallpaper,
+                                 render it to a seamless loop and apply it.
+                                 Accepts the same flags as 'apply'. Requires
+                                 Wallpaper Engine + ffmpeg 5+; a running
+                                 'serve' is needed for motion (otherwise the
+                                 poster frame is applied).
   colors [--port N]              Re-apply stored theme without wallpaper change
   reset [--port N]               Remove wallpaper and color overrides
   status [--port N]              Show CDP reachability and renderer targets
@@ -110733,6 +112155,28 @@ Quit ZCode completely (including any tray icon), then run \`zcode-beautify launc
           fit: flag("--fit")
         });
         console.log(`Applied wallpaper + theme to ${windows} window(s).`);
+        break;
+      }
+      case "apply-scene": {
+        const scenePath = rest.find((a2) => !a2.startsWith("--"));
+        if (!scenePath) {
+          console.error(USAGE);
+          process.exitCode = 1;
+          return;
+        }
+        const { applySceneWallpaper: applySceneWallpaper2 } = await Promise.resolve().then(() => (init_session(), session_exports));
+        const { windows, served, scene } = await applySceneWallpaper2(scenePath, {
+          port,
+          blur: Number(flag("--blur") ?? 0),
+          dim: Number(flag("--dim") ?? 25),
+          monet: !has("--no-monet"),
+          fit: flag("--fit"),
+          onProgress: (stage, detail) => console.log(`  [${stage}]${detail ? ` ${detail}` : ""}`)
+        });
+        console.log(`Scene ${scene.fromCache ? "loaded from cache" : "imported"} (${scene.hash.slice(0, 8)}) and applied to ${windows} window(s).`);
+        if (!served) {
+          console.log("Motion requires the serve media endpoint: run `zcode-beautify serve --detach`, then `zcode-beautify colors`.");
+        }
         break;
       }
       case "colors": {
@@ -110789,18 +112233,18 @@ Quit ZCode completely (including any tray icon), then run \`zcode-beautify launc
   }
 }
 async function startServeDetached(cdpPort, apiPort) {
-  const { spawn: spawn2 } = await import("node:child_process");
+  const { spawn: spawn3 } = await import("node:child_process");
   const { existingServePid: existingServePid2 } = await Promise.resolve().then(() => (init_server(), server_exports));
   const already = await existingServePid2(apiPort);
   if (already !== void 0) {
     throw new Error(`a beautify service is already running on http://127.0.0.1:${apiPort} (pid ${already}) \u2014 open its panel, or stop that process first`);
   }
-  fs6.mkdirSync(dataDir(), { recursive: true });
-  const logFile = path4.join(dataDir(), "serve.log");
-  const out = fs6.openSync(logFile, "a");
-  const child = spawn2(process.execPath, [process.argv[1], "serve", "--port", String(cdpPort), "--api-port", String(apiPort)], { detached: true, stdio: ["ignore", out, out], windowsHide: true });
+  fs11.mkdirSync(dataDir(), { recursive: true });
+  const logFile = path10.join(dataDir(), "serve.log");
+  const out = fs11.openSync(logFile, "a");
+  const child = spawn3(process.execPath, [process.argv[1], "serve", "--port", String(cdpPort), "--api-port", String(apiPort)], { detached: true, stdio: ["ignore", out, out], windowsHide: true });
   child.unref();
-  fs6.closeSync(out);
+  fs11.closeSync(out);
   for (let i2 = 0; i2 < 20; i2++) {
     await new Promise((r2) => setTimeout(r2, 500));
     try {
