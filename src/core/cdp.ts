@@ -111,6 +111,13 @@ export interface InjectionPayload {
   css: string;
   /** Optional data-URI wallpaper image; empty to skip the wallpaper layer. */
   wallpaperDataUri?: string;
+  /**
+   * Optional scene-wallpaper loop video URL (http://127.0.0.1 from serve).
+   * Rendered as a <video> inside the wallpaper layer container: file:/// URLs
+   * are unreliable in the renderer, and a 1080p data URI would blow the
+   * localStorage quota, so scene videos skip persistence entirely.
+   */
+  videoSrc?: string;
   /** Unique-ish id so re-injection is idempotent. */
   marker?: string;
   /** "contain" additionally drives a blurred backdrop layer behind the image. */
@@ -143,11 +150,14 @@ export async function injectIntoTarget(
 
 export function buildBootstrapScript(payload: InjectionPayload): string {
   const marker = payload.marker ?? "zcode-beautify";
+  const videoSrc = payload.videoSrc ?? "";
   return `(function(){
   var MARKER = ${JSON.stringify(marker)};
   if (!window.__zcodeBeautify) window.__zcodeBeautify = {};
-  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)}) return;
+  var VIDEO_SRC = ${JSON.stringify(videoSrc)};
+  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)} && window.__zcodeBeautify.videoSrc === VIDEO_SRC) return;
   window.__zcodeBeautify.cssText = ${JSON.stringify(payload.css)};
+  window.__zcodeBeautify.videoSrc = VIDEO_SRC;
 
   var style = document.getElementById(MARKER + '-style');
   if (!style) {
@@ -158,15 +168,39 @@ export function buildBootstrapScript(payload: InjectionPayload): string {
   style.textContent = ${JSON.stringify(payload.css)};
 
   var wp = document.getElementById(MARKER + '-wallpaper');
-  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))} || VIDEO_SRC) {
     if (!wp) {
       wp = document.createElement('div');
       wp.id = MARKER + '-wallpaper';
       document.documentElement.appendChild(wp);
     }
-    wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
-  } else if (wp) {
-    wp.remove();
+  }
+  var vid = document.getElementById(MARKER + '-video');
+  if (VIDEO_SRC) {
+    wp.style.backgroundImage = 'none';
+    if (!vid) {
+      vid = document.createElement('video');
+      vid.id = MARKER + '-video';
+      vid.setAttribute('autoplay', '');
+      vid.setAttribute('loop', '');
+      vid.setAttribute('muted', '');
+      vid.setAttribute('playsinline', '');
+      vid.muted = true;
+      vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';
+      wp.appendChild(vid);
+    }
+    if (vid.getAttribute('src') !== VIDEO_SRC) {
+      vid.setAttribute('src', VIDEO_SRC);
+      vid.load();
+    }
+    vid.play().catch(function() {});
+  } else {
+    if (vid) vid.remove();
+    if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+      wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
+    } else if (wp) {
+      wp.remove();
+    }
   }
 
   var FIT = ${JSON.stringify(payload.fit ?? "cover")};
@@ -183,8 +217,20 @@ export function buildBootstrapScript(payload: InjectionPayload): string {
     bp.dataset.on = '0';
   }
 
+  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  if (!window.__zcodeBeautify.visBound) {
+    window.__zcodeBeautify.visBound = true;
+    document.addEventListener('visibilitychange', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
+    });
+  }
+
   // Persist for the panel's self-heal path (best effort; large wallpapers may
   // exceed the localStorage quota, in which case only the CSS is saved).
+  // Scene videos are never persisted: the src is a serve URL and the loop
+  // file itself would blow the quota.
   try {
     localStorage.setItem(MARKER + ':css', ${JSON.stringify(payload.css)});
     localStorage.setItem(MARKER + ':wallpaper', ${JSON.stringify(payload.wallpaperDataUri ?? "")});
@@ -198,6 +244,6 @@ export function buildResetScript(marker = "zcode-beautify"): string {
   document.getElementById(${JSON.stringify(marker)} + '-style')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-wallpaper')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-backdrop')?.remove();
-  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; }
+  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; window.__zcodeBeautify.videoSrc = null; }
 })();`;
 }

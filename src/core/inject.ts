@@ -3,7 +3,7 @@
  * overrides, plus helpers to apply a theme to a running ZCode instance.
  */
 
-import { CdpConnection, injectIntoTarget, listTargets, pickRendererTargets, buildResetScript } from "./cdp.js";
+import { CdpConnection, injectIntoTarget, listTargets, pickRendererTargets, buildBootstrapScript, buildResetScript } from "./cdp.js";
 import { loadWallpaper, type WallpaperAssets } from "./monet.js";
 import { buildVariableOverrides, buildTransparencyOverrides } from "./tokens.js";
 
@@ -17,6 +17,17 @@ export interface BeautifyConfig {
   monet: boolean;
   wallpaperVisible: boolean;
   fit: WallpaperFit;
+  /**
+   * Scene wallpapers: URL of the cached loop video (serve media endpoint).
+   * When set, the wallpaper layer renders a <video> instead of an image.
+   */
+  sceneVideoUrl?: string;
+  /** "video" when the current wallpaper is an imported scene wallpaper. */
+  mediaType?: "image" | "video";
+  /** Cache hash of the imported scene (loop at scenes/<hash>/loop.mp4). */
+  sceneHash?: string;
+  /** Serve API port used to derive sceneVideoUrl (default 9223). */
+  apiPort?: number;
 }
 
 export const DEFAULT_CONFIG: BeautifyConfig = {
@@ -31,6 +42,8 @@ export const DEFAULT_CONFIG: BeautifyConfig = {
 export interface BuiltPayload {
   css: string;
   wallpaperDataUri?: string;
+  /** Set for scene wallpapers: the loop video URL for the <video> layer. */
+  videoSrc?: string;
   /** How the wallpaper layer is framed; "contain" adds a blurred backdrop. */
   fit: "cover" | "contain";
   /** Normalized focus point for background-position. */
@@ -97,15 +110,68 @@ html, body { background: transparent !important; }
       parts.push(buildTransparencyOverrides({ dim: config.dim }));
     }
   }
-  const wallpaperDataUri = config.wallpaperVisible ? assets?.dataUri : undefined;
+  const wallpaperDataUri =
+    config.sceneVideoUrl || !config.wallpaperVisible ? undefined : assets?.dataUri;
+  const videoSrc = config.wallpaperVisible ? config.sceneVideoUrl : undefined;
 
   return {
     css: parts.join("\n"),
     wallpaperDataUri,
+    videoSrc,
     fit: config.wallpaperVisible ? resolved : "cover",
     focusX,
     focusY,
   };
+}
+
+export interface InjectScriptInput {
+  mediaType: "image" | "video";
+  /** Image file path / data URI, or the loop video URL for video type. */
+  path: string;
+  blur: number;
+  dim: number;
+  fit?: "cover" | "contain";
+}
+
+/**
+ * Thin convenience wrapper that builds a standalone injection script from a
+ * minimal input — used by tests and quick one-off injections. Full theming
+ * flows through buildPayload().
+ */
+export function buildInjectScript(input: InjectScriptInput): string {
+  let css = `
+html, body { background: transparent !important; }
+#zcode-beautify-wallpaper {
+  position: fixed;
+  inset: 0;
+  z-index: -2147483646;
+  pointer-events: none;
+  filter: blur(${input.blur}px);
+  transform: scale(${input.blur > 0 ? 1.04 : 1});
+}
+#zcode-beautify-wallpaper > video,
+#zcode-beautify-wallpaper {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}`;
+  if (input.dim > 0) {
+    css += `
+#zcode-beautify-wallpaper::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / ${input.dim / 100});
+}`;
+  }
+
+  if (input.mediaType === "video") {
+    return buildBootstrapScript({ css, videoSrc: input.path, fit: input.fit ?? "cover" });
+  }
+  const src = /^(data:|https?:|file:)/i.test(input.path)
+    ? input.path
+    : `file:///${input.path.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+  return buildBootstrapScript({ css, wallpaperDataUri: src, fit: input.fit ?? "cover" });
 }
 
 /** Apply config to a running ZCode instance. Returns how many windows got it. */
