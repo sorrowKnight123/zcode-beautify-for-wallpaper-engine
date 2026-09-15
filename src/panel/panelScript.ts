@@ -37,7 +37,6 @@ export function buildPanelScript(apiPort: number): string {
     '#zb-panel[hidden] { display: none; }',
     '#zb-head { padding: 9px 12px; font-weight: 600; cursor: move; border-bottom: 1px solid rgba(255,255,255,.1);',
       ' display: flex; justify-content: space-between; align-items: center; }',
-    '#zb-close { cursor: pointer; opacity: .7; padding: 0 4px; } #zb-close:hover { opacity: 1; }',
     '#zb-body { padding: 10px 12px 0; }',
     '.zb-row { margin-bottom: 10px; }',
     '.zb-row label { display: flex; justify-content: space-between; margin-bottom: 4px; opacity: .85; }',
@@ -60,10 +59,15 @@ export function buildPanelScript(apiPort: number): string {
       ' line-height: 1.5; white-space: pre-wrap; user-select: text; max-height: 180px; overflow: auto; }',
     '.zb-lib { max-height: 120px; overflow: auto; font-size: 11px; }',
     '.zb-lib .zb-lib-head { opacity: .55; margin: 4px 0 2px; }',
-    '.zb-lib .zb-item { padding: 3px 6px; border-radius: 6px; cursor: pointer; overflow: hidden;',
-      ' text-overflow: ellipsis; white-space: nowrap; }',
-    '.zb-lib .zb-item:hover { background: rgba(255,255,255,.1); }',
-    '.zb-lib .zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
+    '.zb-item { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 6px; }',
+    '.zb-item:hover { background: rgba(255,255,255,.1); }',
+    '.zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
+    '.zb-item .zb-label { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+    '.zb-item .zb-label-input { flex: 1; min-width: 0; padding: 1px 4px; border-radius: 4px; border: 1px solid rgba(122,162,247,.6);',
+      ' background: rgba(0,0,0,.35); color: inherit; font-size: 11px; outline: none; }',
+    '.zb-item .zb-act { cursor: pointer; opacity: .5; padding: 0 3px; font-size: 11px; background: none; border: none; color: inherit; }',
+    '.zb-item .zb-act:hover { opacity: 1; }',
+    '.zb-item .zb-act[data-armed="1"] { opacity: 1; color: #f87171; }',
     '#zb-offline { display: flex; flex-direction: column; gap: 6px; align-items: center;',
       ' padding: 10px 12px; background: rgba(120,53,15,.55); font-size: 11px; line-height: 1.5; text-align: center; }',
     '#zb-offline[hidden] { display: none; }',
@@ -88,7 +92,7 @@ export function buildPanelScript(apiPort: number): string {
   root.innerHTML =
     '<div id="zb-fab" title="ZCode Beautify">🎨</div>' +
     '<div id="zb-panel" hidden>' +
-    '  <div id="zb-head"><span>ZCode Beautify</span><span id="zb-close">✕</span></div>' +
+    '  <div id="zb-head"><span>ZCode Beautify</span></div>' +
     '  <div id="zb-offline" hidden>' +
     '    <div>⚠ 美化服务未运行,面板不可用</div>' +
     '    <div class="zb-hint">在插件目录执行 <code>node dist/cli.js serve --detach</code> 启动</div>' +
@@ -345,13 +349,13 @@ export function buildPanelScript(apiPort: number): string {
         head1.className = 'zb-lib-head'; head1.textContent = '壁纸库 — 动态';
         el.appendChild(head1);
         (lib.scenes || []).forEach(function (s) {
-          el.appendChild(libItem('场景 ' + s.hash.slice(0, 8), { hash: s.hash }, s.hash));
+          el.appendChild(libItem(s.name || ('场景 ' + s.hash.slice(0, 8)), { hash: s.hash }, s.hash, 'scene', s.hash));
         });
         var head2 = document.createElement('div');
         head2.className = 'zb-lib-head'; head2.textContent = '壁纸库 — 图片';
         el.appendChild(head2);
         (lib.images || []).forEach(function (im) {
-          el.appendChild(libItem(im.name, { path: im.path }, im.path));
+          el.appendChild(libItem(im.name, { path: im.path }, im.path, 'image', im.path));
         });
         if (!(lib.scenes || []).length && !(lib.images || []).length) {
           el.innerHTML = '<div class="zb-lib-head">壁纸库为空 — 导入或更换壁纸后出现在这里</div>';
@@ -359,14 +363,18 @@ export function buildPanelScript(apiPort: number): string {
       })
       .catch(function () { /* offline */ });
   }
-  function libItem(label, applyBody, key) {
-    var d = document.createElement('div');
-    d.className = 'zb-item';
-    d.textContent = label;
-    d.title = label;
+  /** One library row: click-to-apply label + rename (inline) + two-step delete. */
+  function libItem(label, applyBody, key, kind, ref) {
+    var row = document.createElement('div');
+    row.className = 'zb-item';
     var cur = localStorage.getItem('zcode-beautify:current-key');
-    if (cur === key) d.setAttribute('data-current', '1');
-    d.addEventListener('click', function () {
+    if (cur === key) row.setAttribute('data-current', '1');
+
+    var labelEl = document.createElement('span');
+    labelEl.className = 'zb-label';
+    labelEl.textContent = label;
+    labelEl.title = label;
+    labelEl.addEventListener('click', function () {
       post('/api/apply-wallpaper', applyBody, function (r) {
         if (r && r.error) { status(r.error); return; }
         try { localStorage.setItem('zcode-beautify:current-key', key); } catch (e) {}
@@ -374,7 +382,58 @@ export function buildPanelScript(apiPort: number): string {
         loadLibrary();
       });
     });
-    return d;
+    row.appendChild(labelEl);
+
+    function renameEditor() {
+      var input = document.createElement('input');
+      input.className = 'zb-label-input';
+      input.value = label;
+      row.replaceChild(input, labelEl);
+      input.focus(); input.select();
+      var done = function (save) {
+        if (save && input.value.trim() && input.value.trim() !== label) {
+          post('/api/library-rename', { kind: kind, hash: applyBody.hash, path: applyBody.path, name: input.value.trim() },
+            function (r) {
+              if (r && r.error) { status(r.error); }
+              loadLibrary();
+            });
+        } else {
+          loadLibrary();
+        }
+      };
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') done(true);
+        if (e.key === 'Escape') done(false);
+      });
+      input.addEventListener('blur', function () { done(true); });
+    }
+
+    var ren = document.createElement('button');
+    ren.className = 'zb-act'; ren.textContent = '✎'; ren.title = '重命名';
+    ren.addEventListener('click', renameEditor);
+    row.appendChild(ren);
+
+    var del = document.createElement('button');
+    del.className = 'zb-act'; del.textContent = '🗑'; del.title = '删除';
+    var disarm = null;
+    del.addEventListener('click', function () {
+      if (del.getAttribute('data-armed') !== '1') {
+        del.setAttribute('data-armed', '1'); del.textContent = '确认删除?';
+        disarm = setTimeout(function () { del.removeAttribute('data-armed'); del.textContent = '🗑'; }, 3000);
+        return;
+      }
+      clearTimeout(disarm);
+      post('/api/library-delete', { kind: kind, hash: applyBody.hash, path: applyBody.path }, function (r) {
+        if (r && r.error) { status(r.error); del.removeAttribute('data-armed'); del.textContent = '🗑'; return; }
+        if (localStorage.getItem('zcode-beautify:current-key') === key) {
+          try { localStorage.removeItem('zcode-beautify:current-key'); } catch (e) {}
+        }
+        status('已删除 deleted');
+        loadLibrary();
+      });
+    });
+    row.appendChild(del);
+    return row;
   }
 
   $('zb-reset').addEventListener('click', function () {
@@ -405,10 +464,6 @@ export function buildPanelScript(apiPort: number): string {
     } else if (root.getAttribute('data-offline') !== '1') {
       beat(false);
     }
-  });
-  $('zb-close').addEventListener('click', function () {
-    $('zb-panel').hidden = true;
-    if (root.getAttribute('data-offline') !== '1') beat(false);
   });
 
   // Fill in the fit label (and control values) right away, not just on open.

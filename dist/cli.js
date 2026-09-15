@@ -111232,7 +111232,6 @@ function buildPanelScript(apiPort) {
     '#zb-panel[hidden] { display: none; }',
     '#zb-head { padding: 9px 12px; font-weight: 600; cursor: move; border-bottom: 1px solid rgba(255,255,255,.1);',
       ' display: flex; justify-content: space-between; align-items: center; }',
-    '#zb-close { cursor: pointer; opacity: .7; padding: 0 4px; } #zb-close:hover { opacity: 1; }',
     '#zb-body { padding: 10px 12px 0; }',
     '.zb-row { margin-bottom: 10px; }',
     '.zb-row label { display: flex; justify-content: space-between; margin-bottom: 4px; opacity: .85; }',
@@ -111255,10 +111254,15 @@ function buildPanelScript(apiPort) {
       ' line-height: 1.5; white-space: pre-wrap; user-select: text; max-height: 180px; overflow: auto; }',
     '.zb-lib { max-height: 120px; overflow: auto; font-size: 11px; }',
     '.zb-lib .zb-lib-head { opacity: .55; margin: 4px 0 2px; }',
-    '.zb-lib .zb-item { padding: 3px 6px; border-radius: 6px; cursor: pointer; overflow: hidden;',
-      ' text-overflow: ellipsis; white-space: nowrap; }',
-    '.zb-lib .zb-item:hover { background: rgba(255,255,255,.1); }',
-    '.zb-lib .zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
+    '.zb-item { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 6px; }',
+    '.zb-item:hover { background: rgba(255,255,255,.1); }',
+    '.zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
+    '.zb-item .zb-label { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+    '.zb-item .zb-label-input { flex: 1; min-width: 0; padding: 1px 4px; border-radius: 4px; border: 1px solid rgba(122,162,247,.6);',
+      ' background: rgba(0,0,0,.35); color: inherit; font-size: 11px; outline: none; }',
+    '.zb-item .zb-act { cursor: pointer; opacity: .5; padding: 0 3px; font-size: 11px; background: none; border: none; color: inherit; }',
+    '.zb-item .zb-act:hover { opacity: 1; }',
+    '.zb-item .zb-act[data-armed="1"] { opacity: 1; color: #f87171; }',
     '#zb-offline { display: flex; flex-direction: column; gap: 6px; align-items: center;',
       ' padding: 10px 12px; background: rgba(120,53,15,.55); font-size: 11px; line-height: 1.5; text-align: center; }',
     '#zb-offline[hidden] { display: none; }',
@@ -111283,7 +111287,7 @@ function buildPanelScript(apiPort) {
   root.innerHTML =
     '<div id="zb-fab" title="ZCode Beautify">\u{1F3A8}</div>' +
     '<div id="zb-panel" hidden>' +
-    '  <div id="zb-head"><span>ZCode Beautify</span><span id="zb-close">\u2715</span></div>' +
+    '  <div id="zb-head"><span>ZCode Beautify</span></div>' +
     '  <div id="zb-offline" hidden>' +
     '    <div>\u26A0 \u7F8E\u5316\u670D\u52A1\u672A\u8FD0\u884C,\u9762\u677F\u4E0D\u53EF\u7528</div>' +
     '    <div class="zb-hint">\u5728\u63D2\u4EF6\u76EE\u5F55\u6267\u884C <code>node dist/cli.js serve --detach</code> \u542F\u52A8</div>' +
@@ -111540,13 +111544,13 @@ function buildPanelScript(apiPort) {
         head1.className = 'zb-lib-head'; head1.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u52A8\u6001';
         el.appendChild(head1);
         (lib.scenes || []).forEach(function (s) {
-          el.appendChild(libItem('\u573A\u666F ' + s.hash.slice(0, 8), { hash: s.hash }, s.hash));
+          el.appendChild(libItem(s.name || ('\u573A\u666F ' + s.hash.slice(0, 8)), { hash: s.hash }, s.hash, 'scene', s.hash));
         });
         var head2 = document.createElement('div');
         head2.className = 'zb-lib-head'; head2.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u56FE\u7247';
         el.appendChild(head2);
         (lib.images || []).forEach(function (im) {
-          el.appendChild(libItem(im.name, { path: im.path }, im.path));
+          el.appendChild(libItem(im.name, { path: im.path }, im.path, 'image', im.path));
         });
         if (!(lib.scenes || []).length && !(lib.images || []).length) {
           el.innerHTML = '<div class="zb-lib-head">\u58C1\u7EB8\u5E93\u4E3A\u7A7A \u2014 \u5BFC\u5165\u6216\u66F4\u6362\u58C1\u7EB8\u540E\u51FA\u73B0\u5728\u8FD9\u91CC</div>';
@@ -111554,14 +111558,18 @@ function buildPanelScript(apiPort) {
       })
       .catch(function () { /* offline */ });
   }
-  function libItem(label, applyBody, key) {
-    var d = document.createElement('div');
-    d.className = 'zb-item';
-    d.textContent = label;
-    d.title = label;
+  /** One library row: click-to-apply label + rename (inline) + two-step delete. */
+  function libItem(label, applyBody, key, kind, ref) {
+    var row = document.createElement('div');
+    row.className = 'zb-item';
     var cur = localStorage.getItem('zcode-beautify:current-key');
-    if (cur === key) d.setAttribute('data-current', '1');
-    d.addEventListener('click', function () {
+    if (cur === key) row.setAttribute('data-current', '1');
+
+    var labelEl = document.createElement('span');
+    labelEl.className = 'zb-label';
+    labelEl.textContent = label;
+    labelEl.title = label;
+    labelEl.addEventListener('click', function () {
       post('/api/apply-wallpaper', applyBody, function (r) {
         if (r && r.error) { status(r.error); return; }
         try { localStorage.setItem('zcode-beautify:current-key', key); } catch (e) {}
@@ -111569,7 +111577,58 @@ function buildPanelScript(apiPort) {
         loadLibrary();
       });
     });
-    return d;
+    row.appendChild(labelEl);
+
+    function renameEditor() {
+      var input = document.createElement('input');
+      input.className = 'zb-label-input';
+      input.value = label;
+      row.replaceChild(input, labelEl);
+      input.focus(); input.select();
+      var done = function (save) {
+        if (save && input.value.trim() && input.value.trim() !== label) {
+          post('/api/library-rename', { kind: kind, hash: applyBody.hash, path: applyBody.path, name: input.value.trim() },
+            function (r) {
+              if (r && r.error) { status(r.error); }
+              loadLibrary();
+            });
+        } else {
+          loadLibrary();
+        }
+      };
+      input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') done(true);
+        if (e.key === 'Escape') done(false);
+      });
+      input.addEventListener('blur', function () { done(true); });
+    }
+
+    var ren = document.createElement('button');
+    ren.className = 'zb-act'; ren.textContent = '\u270E'; ren.title = '\u91CD\u547D\u540D';
+    ren.addEventListener('click', renameEditor);
+    row.appendChild(ren);
+
+    var del = document.createElement('button');
+    del.className = 'zb-act'; del.textContent = '\u{1F5D1}'; del.title = '\u5220\u9664';
+    var disarm = null;
+    del.addEventListener('click', function () {
+      if (del.getAttribute('data-armed') !== '1') {
+        del.setAttribute('data-armed', '1'); del.textContent = '\u786E\u8BA4\u5220\u9664?';
+        disarm = setTimeout(function () { del.removeAttribute('data-armed'); del.textContent = '\u{1F5D1}'; }, 3000);
+        return;
+      }
+      clearTimeout(disarm);
+      post('/api/library-delete', { kind: kind, hash: applyBody.hash, path: applyBody.path }, function (r) {
+        if (r && r.error) { status(r.error); del.removeAttribute('data-armed'); del.textContent = '\u{1F5D1}'; return; }
+        if (localStorage.getItem('zcode-beautify:current-key') === key) {
+          try { localStorage.removeItem('zcode-beautify:current-key'); } catch (e) {}
+        }
+        status('\u5DF2\u5220\u9664 deleted');
+        loadLibrary();
+      });
+    });
+    row.appendChild(del);
+    return row;
   }
 
   $('zb-reset').addEventListener('click', function () {
@@ -111600,10 +111659,6 @@ function buildPanelScript(apiPort) {
     } else if (root.getAttribute('data-offline') !== '1') {
       beat(false);
     }
-  });
-  $('zb-close').addEventListener('click', function () {
-    $('zb-panel').hidden = true;
-    if (root.getAttribute('data-offline') !== '1') beat(false);
   });
 
   // Fill in the fit label (and control values) right away, not just on open.
@@ -112099,7 +112154,12 @@ async function startServe(opts) {
             const loop = path9.join(scenesCacheRoot(), d, "loop.mp4");
             try {
               const st = fs10.statSync(loop);
-              scenes.push({ hash: d, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+              let name;
+              try {
+                name = JSON.parse(fs10.readFileSync(path9.join(scenesCacheRoot(), d, "name.json"), "utf8")).name;
+              } catch {
+              }
+              scenes.push({ hash: d, name, sizeBytes: st.size, mtimeMs: st.mtimeMs });
             } catch {
             }
           }
@@ -112108,6 +112168,60 @@ async function startServe(opts) {
         scenes.sort((a2, b) => b.mtimeMs - a2.mtimeMs);
         sendJson(res, 200, { images, scenes });
         return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/library-rename") {
+        const body = JSON.parse(await readBody(req));
+        const name = typeof body?.name === "string" ? body.name.trim().slice(0, 60) : "";
+        if (!name)
+          throw new Error("name is required");
+        if (name.includes("/") || name.includes("\\") || name.includes(".."))
+          throw new Error("invalid name");
+        if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
+          const dir = path9.join(scenesCacheRoot(), body.hash);
+          if (!fs10.existsSync(dir))
+            throw new Error("unknown scene hash");
+          fs10.writeFileSync(path9.join(dir, "name.json"), JSON.stringify({ name }));
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (body?.kind === "image" && typeof body?.path === "string") {
+          const oldPath = path9.resolve(body.path);
+          const renamed = renameLibraryImage(oldPath, name);
+          if (runtimeConfig().wallpaperPath === oldPath) {
+            saveConfig(persisted({ ...runtimeConfig(), wallpaperPath: renamed }));
+          }
+          sendJson(res, 200, { ok: true, path: renamed });
+          return;
+        }
+        throw new Error("kind must be scene (with hash) or image (with path)");
+      }
+      if (req.method === "POST" && url.pathname === "/api/library-delete") {
+        const body = JSON.parse(await readBody(req));
+        const config = runtimeConfig();
+        if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
+          if (config.sceneHash === body.hash) {
+            throw new Error("\u8BE5\u58C1\u7EB8\u6B63\u5728\u4F7F\u7528\u4E2D \u2014 \u5148\u5207\u6362\u5230\u5176\u4ED6\u58C1\u7EB8\u518D\u5220\u9664");
+          }
+          const dir = path9.join(scenesCacheRoot(), body.hash);
+          if (!fs10.existsSync(dir))
+            throw new Error("unknown scene hash");
+          fs10.rmSync(dir, { recursive: true, force: true });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (body?.kind === "image" && typeof body?.path === "string") {
+          const target = path9.resolve(body.path);
+          if (config.wallpaperPath === target) {
+            throw new Error("\u8BE5\u58C1\u7EB8\u6B63\u5728\u4F7F\u7528\u4E2D \u2014 \u5148\u5207\u6362\u5230\u5176\u4ED6\u58C1\u7EB8\u518D\u5220\u9664");
+          }
+          if (!isInsideDataDir(target) || !path9.basename(target).startsWith("wallpaper")) {
+            throw new Error("only plugin-managed wallpapers can be deleted here");
+          }
+          fs10.rmSync(target, { force: true });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        throw new Error("kind must be scene (with hash) or image (with path)");
       }
       if (req.method === "GET" && url.pathname.startsWith("/media/scene/")) {
         const hash = /^\/media\/scene\/([a-f0-9]{8,64})\.mp4$/.exec(url.pathname)?.[1];
@@ -112156,6 +112270,21 @@ if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-O
   } catch {
     return "";
   }
+}
+function renameLibraryImage(oldPath, name) {
+  if (!isInsideDataDir(oldPath) || !path9.basename(oldPath).startsWith("wallpaper")) {
+    throw new Error("only plugin-managed wallpapers can be renamed here");
+  }
+  const ext = path9.extname(oldPath);
+  const safe = name.replace(/[\/:*?"<>|]/g, "").trim() || "wallpaper";
+  const newPath = path9.join(path9.dirname(oldPath), safe + ext);
+  if (newPath !== oldPath)
+    fs10.renameSync(oldPath, newPath);
+  return newPath;
+}
+function isInsideDataDir(target) {
+  const rel = path9.relative(path9.resolve(dataDir()), path9.resolve(target));
+  return rel !== "" && !rel.startsWith("..");
 }
 var MAX_WALLPAPER_BYTES, MAX_BODY_BYTES, POLL_MS, cachedAssets, importJob, held, IMAGE_EXT;
 var init_server = __esm({

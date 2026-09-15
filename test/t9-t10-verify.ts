@@ -64,7 +64,7 @@ for (const n of ["import_scene_wallpaper", "set_background", "apply_options", "b
 
 // --- serve surface (static checks against source) --------------------------------
 const serverSrc = fs.readFileSync(path.resolve("./src/core/server.ts"), "utf8");
-for (const endpoint of ["/api/import-scene", "/api/import-status", "/api/library", "/api/apply-wallpaper", "/media/scene/"]) {
+for (const endpoint of ["/api/import-scene", "/api/import-status", "/api/library", "/api/apply-wallpaper", "/api/library-rename", "/api/library-delete", "/api/pick-scene", "/media/scene/"]) {
   check(`serve endpoint ${endpoint}`, serverSrc.includes(endpoint));
 }
 check("serve persists mediaType video on import done", serverSrc.includes('mediaType: "video"'));
@@ -74,6 +74,8 @@ for (const ui of ["zb-import", "zb-progress", "zb-guide", "zb-guide-retry", "zb-
   check(`panel element ${ui}`, panelSrc.includes(ui));
 }
 check("panel polls import status", panelSrc.includes("/api/import-status"));
+check("panel has rename/delete actions", panelSrc.includes("library-rename") && panelSrc.includes("library-delete"));
+check("panel close button removed", !panelSrc.includes("zb-close"));
 check("panel groups library image/scene", panelSrc.includes("壁纸库 — 动态") && panelSrc.includes("壁纸库 — 图片"));
 
 const cliSrc = fs.readFileSync(path.resolve("./src/cli.ts"), "utf8");

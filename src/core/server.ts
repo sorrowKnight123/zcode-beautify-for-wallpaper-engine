@@ -502,13 +502,19 @@ export async function startServe(opts: ServeOptions): Promise<void> {
             images.push({ name: f, path: path.join(dataDir(), f) });
           }
         }
-        const scenes: Array<{ hash: string; sizeBytes: number; mtimeMs: number }> = [];
+        const scenes: Array<{ hash: string; name?: string; sizeBytes: number; mtimeMs: number }> = [];
         try {
           for (const d of fs.readdirSync(scenesCacheRoot())) {
             const loop = path.join(scenesCacheRoot(), d, "loop.mp4");
             try {
               const st = fs.statSync(loop);
-              scenes.push({ hash: d, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+              let name: string | undefined;
+              try {
+                name = (JSON.parse(fs.readFileSync(path.join(scenesCacheRoot(), d, "name.json"), "utf8")) as { name?: string }).name;
+              } catch {
+                /* unnamed entry */
+              }
+              scenes.push({ hash: d, name, sizeBytes: st.size, mtimeMs: st.mtimeMs });
             } catch {
               /* incomplete entry */
             }
@@ -519,6 +525,62 @@ export async function startServe(opts: ServeOptions): Promise<void> {
         scenes.sort((a, b) => b.mtimeMs - a.mtimeMs);
         sendJson(res, 200, { images, scenes });
         return;
+      }
+
+      // Rename / delete library entries. Scenes are content-addressed, so a
+      // display name lives in a small sidecar (name.json) and never affects
+      // cache identity; images are plain files inside dataDir.
+      if (req.method === "POST" && url.pathname === "/api/library-rename") {
+        const body = JSON.parse(await readBody(req));
+        const name = typeof body?.name === "string" ? body.name.trim().slice(0, 60) : "";
+        if (!name) throw new Error("name is required");
+        if (name.includes("/") || name.includes("\\") || name.includes("..")) throw new Error("invalid name");
+
+        if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
+          const dir = path.join(scenesCacheRoot(), body.hash);
+          if (!fs.existsSync(dir)) throw new Error("unknown scene hash");
+          fs.writeFileSync(path.join(dir, "name.json"), JSON.stringify({ name }));
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (body?.kind === "image" && typeof body?.path === "string") {
+          const oldPath = path.resolve(body.path);
+          const renamed = renameLibraryImage(oldPath, name);
+          if (runtimeConfig().wallpaperPath === oldPath) {
+            saveConfig(persisted({ ...runtimeConfig(), wallpaperPath: renamed }));
+          }
+          sendJson(res, 200, { ok: true, path: renamed });
+          return;
+        }
+        throw new Error("kind must be scene (with hash) or image (with path)");
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/library-delete") {
+        const body = JSON.parse(await readBody(req));
+        const config = runtimeConfig();
+        if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
+          if (config.sceneHash === body.hash) {
+            throw new Error("该壁纸正在使用中 — 先切换到其他壁纸再删除");
+          }
+          const dir = path.join(scenesCacheRoot(), body.hash);
+          if (!fs.existsSync(dir)) throw new Error("unknown scene hash");
+          fs.rmSync(dir, { recursive: true, force: true });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        if (body?.kind === "image" && typeof body?.path === "string") {
+          const target = path.resolve(body.path);
+          if (config.wallpaperPath === target) {
+            throw new Error("该壁纸正在使用中 — 先切换到其他壁纸再删除");
+          }
+          if (!isInsideDataDir(target) || !path.basename(target).startsWith("wallpaper")) {
+            throw new Error("only plugin-managed wallpapers can be deleted here");
+          }
+          fs.rmSync(target, { force: true });
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+        throw new Error("kind must be scene (with hash) or image (with path)");
       }
 
       // Loop video streaming for the injected <video> layer (Range-capable).
@@ -584,4 +646,21 @@ if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-O
   } catch {
     return "";
   }
+}
+
+/** Renames a plugin-managed wallpaper image, keeping its extension. */
+function renameLibraryImage(oldPath: string, name: string): string {
+  if (!isInsideDataDir(oldPath) || !path.basename(oldPath).startsWith("wallpaper")) {
+    throw new Error("only plugin-managed wallpapers can be renamed here");
+  }
+  const ext = path.extname(oldPath);
+  const safe = name.replace(/[\/:*?"<>|]/g, "").trim() || "wallpaper";
+  const newPath = path.join(path.dirname(oldPath), safe + ext);
+  if (newPath !== oldPath) fs.renameSync(oldPath, newPath);
+  return newPath;
+}
+
+function isInsideDataDir(target: string): boolean {
+  const rel = path.relative(path.resolve(dataDir()), path.resolve(target));
+  return rel !== "" && !rel.startsWith("..");
 }
