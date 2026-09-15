@@ -2,16 +2,18 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-美化 **ZCode 桌面客户端**：任意图片一键设为背景壁纸，并用 Material Design 3（莫奈取色）动态配色适配整个 UI——还附带实时悬浮设置面板。
+美化 **ZCode 桌面客户端**：任意图片——或任意**视频 / Wallpaper Engine 场景壁纸**——一键设为背景壁纸，并用 Material Design 3（莫奈取色）动态配色适配整个 UI——还附带实时悬浮设置面板。
 
 > 📷 欢迎贡献截图——向 `docs/screenshot.png` 提 PR 即可。
 
 ## 功能
 
+- **动态壁纸**——导入 Wallpaper Engine **场景**（`.pkg` 或工坊目录）或普通**视频**（`.mp4`/`.webm`）：场景在专属 WE 窗口中渲染，经 Desktop Duplication 捕获后处理成完美无缝循环（首帧 == 末帧）；长视频自动截取中段。循环以内容寻址缓存并经本地 HTTP 流式注入渲染器——只有动画,没有交互和声音。
 - **壁纸**——任意本地图片作为固定背景层,铺在 UI 之下;三种取景模式:`cover`(填满裁剪)、`contain`(完整显示,背后是同图模糊放大底)、`smart`(AI 适应:本地分析画面主体,自动选择最佳取景与焦点位置)。
 - **莫奈配色**——用 Google 官方 MD3 算法从壁纸提取 source color,生成 light/dark 双套调色板,映射覆盖 ZCode 的 35+ 个语义 CSS 变量。
-- **实时设置面板**——ZCode 窗口内可拖拽的悬浮面板:blur/dim 滑块、Monet 开关、壁纸透显开关、一键换图、还原;所有调整即时预览并自动保存。
-- **对话控制**——内置 `/beautify` 斜杠命令与 MCP 工具,让 ZCode 智能体代你设壁纸、调主题。
+- **实时设置面板**——ZCode 窗口内可拖拽的悬浮面板:blur/dim 滑块、Monet 开关、壁纸透显开关、一键换图、原生文件选择器导入动态壁纸(带进度条与依赖安装引导)、分组壁纸库、还原;所有调整即时预览并自动保存。
+- **零操作服务**——MCP server 在 ZCode 启动时自动拉起后台 serve,面板无需手动启动,开箱即有。
+- **对话控制**——内置 `/beautify` 斜杠命令与 MCP 工具(`set_background`、`import_scene_wallpaper`、`apply_options` 等),让 ZCode 智能体代你设壁纸、调主题。
 - **自愈**——`serve` 运行期间主题在渲染器刷新后自动恢复;上次外观还会缓存到 `localStorage` 作为兜底。
 
 ## 原理
@@ -28,6 +30,10 @@ ZCode 是 Electron 应用,UI 主题由 Tailwind v4 的 `--color-*` CSS 自定义
 不修改任何安装文件,ZCode 升级不受影响。
 
 ## 环境要求
+
+- Node.js ≥ 20,已加入 PATH。
+- ZCode 桌面客户端(Windows / macOS / Linux)。
+- 动态壁纸(可选):**Wallpaper Engine**(Steam)与 **ffmpeg ≥ 5.0**(PATH)——两者均自动检测,缺失时面板会给出安装引导。捕获依赖 Desktop Duplication API,动态导入仅限 **Windows**;静态图片壁纸全平台可用。
 
 - Node.js ≥ 20(在 PATH 中)。
 - ZCode 桌面客户端(Windows / macOS / Linux)。

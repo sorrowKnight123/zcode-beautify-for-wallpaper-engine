@@ -2,16 +2,18 @@
 
 [English](README.md) | [中文](README.zh-CN.md)
 
-Beautify the **ZCode desktop client**: use any image as a background wallpaper and adapt the whole UI with Material Design 3 (Monet) dynamic color — plus a live settings panel for real-time tuning.
+Beautify the **ZCode desktop client**: use any image — or any **video / Wallpaper Engine scene wallpaper** — as a background wallpaper and adapt the whole UI with Material Design 3 (Monet) dynamic color — plus a live settings panel for real-time tuning.
 
 > 📷 Screenshot welcome — PRs adding one to `docs/screenshot.png` are appreciated.
 
 ## Features
 
+- **Dynamic wallpapers** — import a Wallpaper Engine **scene** (`.pkg` or workshop directory) or a plain **video** (`.mp4`/`.webm`): scenes are rendered in a dedicated Wallpaper Engine window, captured through Desktop Duplication and processed into a perfectly seamless loop (first frame == last frame); long videos are trimmed to a middle segment. Loops are cached content-addressed and streamed to the renderer over HTTP — motion with no interaction and no sound.
 - **Wallpaper** — any local image becomes a fixed background layer behind the UI, with three framing modes: `cover` (fill and crop), `contain` (letterboxed over a blurred backdrop of the same picture), and `smart` — a local AI-style analysis that finds the salient subject and picks the best framing and focus point automatically.
 - **Monet theming** — a source color is extracted from the wallpaper with Google's official MD3 algorithm; light/dark palettes are mapped onto ZCode's semantic CSS variables (35+ tokens).
-- **Live settings panel** — a draggable panel inside ZCode with blur/dim sliders, Monet and wallpaper-visibility toggles, one-click wallpaper swap, and reset. Changes preview instantly and persist.
-- **Conversation control** — bundled slash command `/beautify` and MCP tools let the ZCode agent set the wallpaper or tune the theme on your behalf.
+- **Live settings panel** — a draggable panel inside ZCode with blur/dim sliders, Monet and wallpaper-visibility toggles, one-click wallpaper swap, a native file-picker import for dynamic wallpapers (with progress bar and dependency guidance), a grouped wallpaper library, and reset. Changes preview instantly and persist.
+- **Zero-touch serve** — the MCP server starts the background service automatically when ZCode launches, so the panel is simply always there.
+- **Conversation control** — bundled slash command `/beautify` and MCP tools (`set_background`, `import_scene_wallpaper`, `apply_options`, …) let the ZCode agent set the wallpaper or tune the theme on your behalf.
 - **Self-healing** — while `serve` runs, the theme survives renderer reloads automatically; the last look is also cached in `localStorage` as a fallback.
 
 ## How it works
@@ -31,6 +33,7 @@ It never modifies ZCode's installation files, so ZCode upgrades are unaffected.
 
 - Node.js ≥ 20 available on your PATH.
 - ZCode desktop client (Windows / macOS / Linux).
+- For dynamic wallpapers (optional): **Wallpaper Engine** (Steam) and **ffmpeg ≥ 5.0** on PATH — both are auto-detected, and the panel shows install guidance when missing. Capture uses the Desktop Duplication API, so dynamic import is **Windows-only**; static image wallpapers work everywhere.
 
 ## Two packages, both installable by handing an AI the link
 
