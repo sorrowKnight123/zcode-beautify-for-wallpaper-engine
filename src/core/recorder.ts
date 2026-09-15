@@ -20,7 +20,9 @@ import { promisify } from "node:util";
 import { checkFfmpeg } from "./dependencyCheck.js";
 import { measureClientRect, type SceneWindowHandle } from "./weLauncher.js";
 
-const exec = promisify(execFile);
+const execRaw = promisify(execFile);
+/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
+const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
 
 export interface RecordOptions {
   duration: number;

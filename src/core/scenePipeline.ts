@@ -256,5 +256,5 @@ function execFileP(
   args: string[],
   opts: { timeout: number },
 ): Promise<{ stdout: string; stderr: string }> {
-  return promisify(execFile)(cmd, args, opts);
+  return promisify(execFile)(cmd, args, { windowsHide: true, ...opts });
 }

@@ -19,7 +19,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { checkWallpaperEngine } from "./dependencyCheck.js";
 
-const exec = promisify(execFile);
+const execRaw = promisify(execFile);
+/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
+const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
 
 export interface SceneWindowOptions {
   width: number;
@@ -114,7 +116,7 @@ export async function openSceneWindow(
     "-playInWindow", opts.title,
     "-width", String(opts.width),
     "-height", String(opts.height),
-  ], { stdio: "ignore", detached: false });
+  ], { stdio: "ignore", detached: false, windowsHide: true });
   proc.unref();
 
   const hwnd = await waitForWindow(opts.title, 15_000);

@@ -37207,11 +37207,12 @@ function readFileSafe(p2) {
     return "";
   }
 }
-var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
+var execRaw, exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
 var init_dependencyCheck = __esm({
   "dist/core/dependencyCheck.js"() {
     "use strict";
-    exec = promisify2(execFile2);
+    execRaw = promisify2(execFile2);
+    exec = ((cmd, args, opts) => execRaw(cmd, args, { windowsHide: true, ...opts }));
     WE_EXE_RELATIVE = path3.join("wallpaper_engine", "wallpaper64.exe");
     MIN_FFMPEG_MAJOR = 5;
   }
@@ -37236,7 +37237,7 @@ async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
     String(opts.width),
     "-height",
     String(opts.height)
-  ], { stdio: "ignore", detached: false });
+  ], { stdio: "ignore", detached: false, windowsHide: true });
   proc.unref();
   const hwnd = await waitForWindow(opts.title, 15e3);
   if (hwnd === null) {
@@ -37322,12 +37323,13 @@ function parseClientRect(stdout, title) {
 function sleep(ms) {
   return new Promise((r2) => setTimeout(r2, ms));
 }
-var exec2, SceneWindowError, PS_WINDOW_HELPERS;
+var execRaw2, exec2, SceneWindowError, PS_WINDOW_HELPERS;
 var init_weLauncher = __esm({
   "dist/core/weLauncher.js"() {
     "use strict";
     init_dependencyCheck();
-    exec2 = promisify3(execFile3);
+    execRaw2 = promisify3(execFile3);
+    exec2 = ((cmd, args, opts) => execRaw2(cmd, args, { windowsHide: true, ...opts }));
     SceneWindowError = class extends Error {
     };
     PS_WINDOW_HELPERS = `
@@ -37486,13 +37488,14 @@ async function setTopmost(hwnd, topmost) {
 [N.W]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]${after}, 0, 0, 0, 0, 0x0003)`
   ], { timeout: 1e4 });
 }
-var exec3, RecordError;
+var execRaw3, exec3, RecordError;
 var init_recorder = __esm({
   "dist/core/recorder.js"() {
     "use strict";
     init_dependencyCheck();
     init_weLauncher();
-    exec3 = promisify4(execFile4);
+    execRaw3 = promisify4(execFile4);
+    exec3 = ((cmd, args, opts) => execRaw3(cmd, args, { windowsHide: true, ...opts }));
     RecordError = class extends Error {
     };
   }
@@ -37573,12 +37576,13 @@ async function probeDuration(file2, ffmpegPath) {
     return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number.NaN;
   }
 }
-var exec4, LoopError;
+var execRaw4, exec4, LoopError;
 var init_loopProcessor = __esm({
   "dist/core/loopProcessor.js"() {
     "use strict";
     init_dependencyCheck();
-    exec4 = promisify5(execFile5);
+    execRaw4 = promisify5(execFile5);
+    exec4 = ((cmd, args, opts) => execRaw4(cmd, args, { windowsHide: true, ...opts }));
     LoopError = class extends Error {
     };
   }
@@ -37942,7 +37946,7 @@ async function extractPoster(loopFile, posterPath, ffmpegPath) {
   ], { timeout: 6e4 });
 }
 function execFileP(cmd, args, opts) {
-  return promisify6(execFile6)(cmd, args, opts);
+  return promisify6(execFile6)(cmd, args, { windowsHide: true, ...opts });
 }
 var MissingDependencyError, SceneImportError, DEFAULT_SCENE_OPTIONS;
 var init_scenePipeline = __esm({

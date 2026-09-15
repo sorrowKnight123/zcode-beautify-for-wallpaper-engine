@@ -28,7 +28,9 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { checkFfmpeg } from "./dependencyCheck.js";
 
-const exec = promisify(execFile);
+const execRaw = promisify(execFile);
+/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
+const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
 
 export class LoopError extends Error {}
 
