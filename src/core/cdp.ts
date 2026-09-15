@@ -217,7 +217,11 @@ export function buildBootstrapScript(payload: InjectionPayload): string {
     bp.dataset.on = '0';
   }
 
-  // Pause the loop video while the renderer is hidden so the GPU/CPU idle.
+  // Keep the loop alive. Chromium's media suspension can freeze a nominally
+  // playing wallpaper video (paused:false but the clock stops — occlusion
+  // misdetection is common with transparent Electron windows), so a watchdog
+  // samples currentTime and kicks the element whenever the page is visible
+  // but the clock is frozen, paused, or ended.
   if (!window.__zcodeBeautify.visBound) {
     window.__zcodeBeautify.visBound = true;
     document.addEventListener('visibilitychange', function() {
@@ -225,6 +229,36 @@ export function buildBootstrapScript(payload: InjectionPayload): string {
       if (!v) return;
       if (document.hidden) { v.pause(); } else { v.play().catch(function() {}); }
     });
+    window.addEventListener('focus', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+    window.addEventListener('pageshow', function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (v) v.play().catch(function() {});
+    });
+  }
+  if (!window.__zcodeBeautify.watchdog) {
+    window.__zcodeBeautify.stallCount = 0;
+    window.__zcodeBeautify.lastClock = -1;
+    window.__zcodeBeautify.watchdog = setInterval(function() {
+      var v = document.getElementById(MARKER + '-video');
+      if (!v) return;
+      var S = window.__zcodeBeautify;
+      if (document.hidden) { S.lastClock = -1; return; }
+      if (v.ended || (v.paused && v.autoplay)) {
+        S.stallCount = 0;
+        v.play().catch(function() {});
+      } else if (!v.paused && v.readyState >= 2 && S.lastClock === v.currentTime) {
+        // nominally playing but the media clock is frozen
+        S.stallCount++;
+        if (S.stallCount >= 2) { v.load(); }
+        v.play().catch(function() {});
+      } else {
+        S.stallCount = 0;
+      }
+      S.lastClock = v.currentTime;
+    }, 2000);
   }
 
   // Persist for the panel's self-heal path (best effort; large wallpapers may
