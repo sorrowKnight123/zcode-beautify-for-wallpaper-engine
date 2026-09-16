@@ -112148,7 +112148,7 @@ async function startServe(opts) {
       if (req.method === "GET" && url.pathname === "/api/library") {
         const images = [];
         for (const f2 of fs10.readdirSync(dataDir())) {
-          if (/\.(jpe?g|png|webp|bmp)$/i.test(f2) && f2.startsWith("wallpaper")) {
+          if (/\.(jpe?g|png|webp|bmp)$/i.test(f2)) {
             images.push({ name: f2, path: path9.join(dataDir(), f2) });
           }
         }
@@ -112218,7 +112218,7 @@ async function startServe(opts) {
           if (config.wallpaperPath === target) {
             throw new Error("\u8BE5\u58C1\u7EB8\u6B63\u5728\u4F7F\u7528\u4E2D \u2014 \u5148\u5207\u6362\u5230\u5176\u4ED6\u58C1\u7EB8\u518D\u5220\u9664");
           }
-          if (!isInsideDataDir(target) || !path9.basename(target).startsWith("wallpaper")) {
+          if (!isInsideDataDir(target) || !/\.(jpe?g|png|webp|bmp)$/i.test(target)) {
             throw new Error("only plugin-managed wallpapers can be deleted here");
           }
           fs10.rmSync(target, { force: true });
@@ -112276,7 +112276,7 @@ if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-O
   }
 }
 function renameLibraryImage(oldPath, name) {
-  if (!isInsideDataDir(oldPath) || !path9.basename(oldPath).startsWith("wallpaper")) {
+  if (!isInsideDataDir(oldPath) || !/\.(jpe?g|png|webp|bmp)$/i.test(oldPath)) {
     throw new Error("only plugin-managed wallpapers can be renamed here");
   }
   const ext = path9.extname(oldPath);

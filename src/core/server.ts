@@ -498,7 +498,7 @@ export async function startServe(opts: ServeOptions): Promise<void> {
       if (req.method === "GET" && url.pathname === "/api/library") {
         const images: Array<{ name: string; path: string }> = [];
         for (const f of fs.readdirSync(dataDir())) {
-          if (/\.(jpe?g|png|webp|bmp)$/i.test(f) && f.startsWith("wallpaper")) {
+          if (/\.(jpe?g|png|webp|bmp)$/i.test(f)) {
             images.push({ name: f, path: path.join(dataDir(), f) });
           }
         }
@@ -573,7 +573,7 @@ export async function startServe(opts: ServeOptions): Promise<void> {
           if (config.wallpaperPath === target) {
             throw new Error("该壁纸正在使用中 — 先切换到其他壁纸再删除");
           }
-          if (!isInsideDataDir(target) || !path.basename(target).startsWith("wallpaper")) {
+          if (!isInsideDataDir(target) || !/\.(jpe?g|png|webp|bmp)$/i.test(target)) {
             throw new Error("only plugin-managed wallpapers can be deleted here");
           }
           fs.rmSync(target, { force: true });
@@ -650,7 +650,7 @@ if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-O
 
 /** Renames a plugin-managed wallpaper image, keeping its extension. */
 function renameLibraryImage(oldPath: string, name: string): string {
-  if (!isInsideDataDir(oldPath) || !path.basename(oldPath).startsWith("wallpaper")) {
+  if (!isInsideDataDir(oldPath) || !/\.(jpe?g|png|webp|bmp)$/i.test(oldPath)) {
     throw new Error("only plugin-managed wallpapers can be renamed here");
   }
   const ext = path.extname(oldPath);
