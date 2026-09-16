@@ -34,10 +34,18 @@ function bootstrapServe(): void {
       })
       .catch(() => {
         try {
+          // ZCode launches MCP servers with ZCODE_BEAUTIFY_DATA_DIR pointed at
+          // a plugin-scoped directory (<plugin>@<marketplace>); letting the
+          // serve inherit it splits the store from manually-started serves
+          // (empty-looking library). Strip it so every serve uses the default
+          // data dir.
+          const childEnv = { ...process.env };
+          delete childEnv.ZCODE_BEAUTIFY_DATA_DIR;
           spawn(process.execPath, [cliJs, "serve", "--detach"], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
+            env: childEnv,
           }).unref();
         } catch {
           /* best effort */

@@ -145835,10 +145835,13 @@ function bootstrapServe() {
         throw new Error("foreign service");
     }).catch(() => {
       try {
+        const childEnv = { ...process.env };
+        delete childEnv.ZCODE_BEAUTIFY_DATA_DIR;
         spawn3(process.execPath, [cliJs, "serve", "--detach"], {
           detached: true,
           stdio: "ignore",
-          windowsHide: true
+          windowsHide: true,
+          env: childEnv
         }).unref();
       } catch {
       }
