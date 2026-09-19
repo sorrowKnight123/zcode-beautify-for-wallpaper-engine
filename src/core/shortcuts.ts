@@ -8,12 +8,9 @@
  * prompted (no UAC popups from a background serve).
  */
 
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
-
-const exec = promisify(execFile);
+import { execFileP as exec } from "./exec.js";
 
 export interface ShortcutSyncResult {
   /** Shortcuts that gained the flag this run. */

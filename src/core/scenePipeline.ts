@@ -9,11 +9,10 @@
  * upload — and the result is served over the serve-mode media endpoint.
  */
 
-import { execFile } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import { detectWallpaperType } from "./wallpaperType.js";
+import { execFileP } from "./exec.js";
 import { checkWallpaperEngine, checkFfmpeg } from "./dependencyCheck.js";
 import { openSceneWindow, closeSceneWindow } from "./weLauncher.js";
 import { recordSceneWindow, analyzeBlackness } from "./recorder.js";
@@ -251,10 +250,3 @@ export async function extractPoster(loopFile: string, posterPath: string, ffmpeg
   ], { timeout: 60_000 });
 }
 
-function execFileP(
-  cmd: string,
-  args: string[],
-  opts: { timeout: number },
-): Promise<{ stdout: string; stderr: string }> {
-  return promisify(execFile)(cmd, args, { windowsHide: true, ...opts });
-}

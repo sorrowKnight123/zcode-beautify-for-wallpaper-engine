@@ -3,6 +3,13 @@
 > 基于 fork 上游 0.2.1（27d8699）。所有改动均为增量，静态壁纸原有链路保持不变。
 > 0.3.0：场景壁纸 + 视频壁纸（.mp4/.webm 直接导入）+ 循环冻结看门狗 + ZCode 启动自动拉起 serve。
 
+## 0.3.1
+
+- **快捷方式 CDP 标志自动持久化**：新增 `src/core/shortcuts.ts`，扫描桌面（含一层子文件夹、OneDrive 重定向）、用户/全局开始菜单、任务栏固定区的 `ZCode*.lnk`，自动补 `--remote-debugging-port`；接入 `launch` 命令与 MCP bootstrap（每次 ZCode 启动自愈）。上游同名提交只有文档，此为实现。
+- **serve 数据目录统一**：MCP 启动的 serve 不再继承插件级 `ZCODE_BEAUTIFY_DATA_DIR`（`<plugin>@<marketplace>` 目录），手动/自动启动共用默认数据目录——修复"重启后面板壁纸库为空"。
+- **壁纸库重命名/删除**：场景条目改名存 `name.json` 附属文件（不影响缓存身份），两段式删除，正在使用的条目拒绝删除；库列表不再按 `wallpaper*` 前缀过滤（修复"重命名后图片消失"）。
+- **子进程不再弹终端窗**：统一 `windowsHide`（`src/core/exec.ts` 共享 helper，替换 5 处重复包装器）。
+
 ## 功能概述
 
 - 支持导入 Wallpaper Engine **场景壁纸**（`.pkg` 或含 `project.json` 的工坊目录）：

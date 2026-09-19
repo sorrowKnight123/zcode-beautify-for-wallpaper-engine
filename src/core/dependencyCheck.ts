@@ -12,14 +12,11 @@
  * roots instead of trusting a single hardcoded path.
  */
 
-import { execFile } from "node:child_process";
 import fs from "node:fs";
+import { execFileP } from "./exec.js";
 import path from "node:path";
-import { promisify } from "node:util";
 
-const execRaw = promisify(execFile);
-/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
-const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
+const exec = execFileP;
 
 export interface DependencyStatus {
   ok: boolean;

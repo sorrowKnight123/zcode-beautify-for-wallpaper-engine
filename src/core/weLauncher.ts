@@ -15,13 +15,10 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { checkWallpaperEngine } from "./dependencyCheck.js";
+import { execFileP } from "./exec.js";
 
-const execRaw = promisify(execFile);
-/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
-const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
+const exec = execFileP;
 
 export interface SceneWindowOptions {
   width: number;

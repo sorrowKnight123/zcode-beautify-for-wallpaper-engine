@@ -110128,11 +110128,21 @@ var init_wallpaperType = __esm({
   }
 });
 
-// dist/core/dependencyCheck.js
+// dist/core/exec.js
 import { execFile as execFile2 } from "node:child_process";
+import { promisify as promisify2 } from "node:util";
+var execRaw, execFileP;
+var init_exec = __esm({
+  "dist/core/exec.js"() {
+    "use strict";
+    execRaw = promisify2(execFile2);
+    execFileP = ((cmd, args, opts = {}) => execRaw(cmd, args, { windowsHide: true, ...opts }));
+  }
+});
+
+// dist/core/dependencyCheck.js
 import fs5 from "node:fs";
 import path3 from "node:path";
-import { promisify as promisify2 } from "node:util";
 async function checkWallpaperEngine() {
   if (process.platform !== "win32") {
     return { ok: false, detail: "Wallpaper Engine is Windows-only" };
@@ -110305,12 +110315,12 @@ function readFileSafe(p2) {
     return "";
   }
 }
-var execRaw, exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
+var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
 var init_dependencyCheck = __esm({
   "dist/core/dependencyCheck.js"() {
     "use strict";
-    execRaw = promisify2(execFile2);
-    exec = ((cmd, args, opts) => execRaw(cmd, args, { windowsHide: true, ...opts }));
+    init_exec();
+    exec = execFileP;
     WE_EXE_RELATIVE = path3.join("wallpaper_engine", "wallpaper64.exe");
     MIN_FFMPEG_MAJOR = 5;
   }
@@ -110318,8 +110328,6 @@ var init_dependencyCheck = __esm({
 
 // dist/core/weLauncher.js
 import { spawn as spawn2 } from "node:child_process";
-import { execFile as execFile3 } from "node:child_process";
-import { promisify as promisify3 } from "node:util";
 async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
   const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
   if (!exe)
@@ -110421,13 +110429,13 @@ function parseClientRect(stdout, title) {
 function sleep(ms) {
   return new Promise((r2) => setTimeout(r2, ms));
 }
-var execRaw2, exec2, SceneWindowError, PS_WINDOW_HELPERS;
+var exec2, SceneWindowError, PS_WINDOW_HELPERS;
 var init_weLauncher = __esm({
   "dist/core/weLauncher.js"() {
     "use strict";
     init_dependencyCheck();
-    execRaw2 = promisify3(execFile3);
-    exec2 = ((cmd, args, opts) => execRaw2(cmd, args, { windowsHide: true, ...opts }));
+    init_exec();
+    exec2 = execFileP;
     SceneWindowError = class extends Error {
     };
     PS_WINDOW_HELPERS = `
@@ -110485,10 +110493,8 @@ function Measure-Client([IntPtr]$h) {
 });
 
 // dist/core/recorder.js
-import { execFile as execFile4 } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path4 from "node:path";
-import { promisify as promisify4 } from "node:util";
 async function recordSceneWindow(handle, out, opts, ffmpegPath) {
   const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
@@ -110586,24 +110592,22 @@ async function setTopmost(hwnd, topmost) {
 [N.W]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]${after}, 0, 0, 0, 0, 0x0003)`
   ], { timeout: 1e4 });
 }
-var execRaw3, exec3, RecordError;
+var exec3, RecordError;
 var init_recorder = __esm({
   "dist/core/recorder.js"() {
     "use strict";
     init_dependencyCheck();
+    init_exec();
     init_weLauncher();
-    execRaw3 = promisify4(execFile4);
-    exec3 = ((cmd, args, opts) => execRaw3(cmd, args, { windowsHide: true, ...opts }));
+    exec3 = execFileP;
     RecordError = class extends Error {
     };
   }
 });
 
 // dist/core/loopProcessor.js
-import { execFile as execFile5 } from "node:child_process";
 import { mkdirSync as mkdirSync2 } from "node:fs";
 import path5 from "node:path";
-import { promisify as promisify5 } from "node:util";
 async function makeSeamless(input, output, fadeSec, ffmpegPath, options = {}) {
   const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
@@ -110674,13 +110678,13 @@ async function probeDuration(file, ffmpegPath) {
     return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number.NaN;
   }
 }
-var execRaw4, exec4, LoopError;
+var exec4, LoopError;
 var init_loopProcessor = __esm({
   "dist/core/loopProcessor.js"() {
     "use strict";
     init_dependencyCheck();
-    execRaw4 = promisify5(execFile5);
-    exec4 = ((cmd, args, opts) => execRaw4(cmd, args, { windowsHide: true, ...opts }));
+    init_exec();
+    exec4 = execFileP;
     LoopError = class extends Error {
     };
   }
@@ -110880,10 +110884,8 @@ __export(scenePipeline_exports, {
   importScene: () => importScene,
   resolveSceneInput: () => resolveSceneInput
 });
-import { execFile as execFile6 } from "node:child_process";
 import fs7 from "node:fs";
 import path7 from "node:path";
-import { promisify as promisify6 } from "node:util";
 function findVideoInDir(dir) {
   for (const subdir of ["", "files"]) {
     const base = path7.join(dir, subdir);
@@ -111043,14 +111045,12 @@ async function extractPoster(loopFile, posterPath, ffmpegPath) {
     posterPath
   ], { timeout: 6e4 });
 }
-function execFileP(cmd, args, opts) {
-  return promisify6(execFile6)(cmd, args, { windowsHide: true, ...opts });
-}
 var MissingDependencyError, SceneImportError, DEFAULT_SCENE_OPTIONS;
 var init_scenePipeline = __esm({
   "dist/core/scenePipeline.js"() {
     "use strict";
     init_wallpaperType();
+    init_exec();
     init_dependencyCheck();
     init_weLauncher();
     init_recorder();
@@ -111214,10 +111214,8 @@ var shortcuts_exports = {};
 __export(shortcuts_exports, {
   ensureShortcutsHaveCdpFlag: () => ensureShortcutsHaveCdpFlag
 });
-import { execFile as execFile7 } from "node:child_process";
 import fs9 from "node:fs";
 import path9 from "node:path";
-import { promisify as promisify7 } from "node:util";
 function shortcutDirs() {
   const home = process.env.USERPROFILE ?? "";
   const appData = process.env.APPDATA ?? "";
@@ -111268,7 +111266,7 @@ try {
   Write-Output 'updated'
 } catch { Write-Output ('err|' + $_.Exception.Message) }`;
     try {
-      const { stdout } = await exec5("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3, windowsHide: true });
+      const { stdout } = await execFileP("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3, windowsHide: true });
       const out = stdout.trim();
       if (out.startsWith("updated"))
         result.updated.push(lnk);
@@ -111282,11 +111280,10 @@ try {
   }
   return result;
 }
-var exec5;
 var init_shortcuts = __esm({
   "dist/core/shortcuts.js"() {
     "use strict";
-    exec5 = promisify7(execFile7);
+    init_exec();
   }
 });
 
@@ -111868,8 +111865,8 @@ __export(server_exports, {
 import http from "node:http";
 import fs11 from "node:fs";
 import path10 from "node:path";
-import { execFile as execFile8 } from "node:child_process";
-import { promisify as promisify8 } from "node:util";
+import { execFile as execFile3 } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
 async function getAssets(config) {
   const wallpaperPath = config.wallpaperPath;
   if (!wallpaperPath || !fs11.existsSync(wallpaperPath))
@@ -112350,7 +112347,7 @@ $d.Title = '\u9009\u62E9\u52A8\u6001\u58C1\u7EB8 (\u573A\u666F .pkg / \u89C6\u98
 $d.Filter = '\u52A8\u6001\u58C1\u7EB8 (*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm)|*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm|\u6240\u6709\u6587\u4EF6 (*.*)|*.*'
 if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`;
   try {
-    const { stdout } = await promisify8(execFile8)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 3e5, windowsHide: true });
+    const { stdout } = await promisify3(execFile3)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 3e5, windowsHide: true });
     return stdout.trim();
   } catch {
     return "";

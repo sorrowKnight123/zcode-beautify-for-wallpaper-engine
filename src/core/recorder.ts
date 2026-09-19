@@ -13,16 +13,13 @@
  * - draw_mouse=0 keeps the cursor out of the loop video.
  */
 
-import { execFile } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import { checkFfmpeg } from "./dependencyCheck.js";
+import { execFileP } from "./exec.js";
 import { measureClientRect, type SceneWindowHandle } from "./weLauncher.js";
 
-const execRaw = promisify(execFile);
-/** windowsHide: console helpers (powershell/ffmpeg) must never flash a terminal window. */
-const exec = ((cmd: any, args: any, opts: any) => execRaw(cmd, args, { windowsHide: true, ...opts })) as unknown as typeof execRaw;
+const exec = execFileP;
 
 export interface RecordOptions {
   duration: number;
