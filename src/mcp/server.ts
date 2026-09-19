@@ -51,6 +51,11 @@ function bootstrapServe(): void {
           /* best effort */
         }
       });
+    // Self-heal launch shortcuts: without the CDP flag a start-menu launch
+    // gets no injection for the whole session. Fire-and-forget, silent.
+    import("../core/shortcuts.js")
+      .then((m) => m.ensureShortcutsHaveCdpFlag(9222))
+      .catch(() => undefined);
   } catch {
     /* best effort */
   }

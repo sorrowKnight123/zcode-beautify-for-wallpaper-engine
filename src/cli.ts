@@ -56,6 +56,15 @@ async function main(): Promise<void> {
     switch (cmd) {
       case "launch": {
         const r = await launchZcode(port);
+        // Keep every launch path (start menu, taskbar…) able to reach CDP:
+        // append the flag to any ZCode shortcut that lacks it.
+        const { ensureShortcutsHaveCdpFlag } = await import("./core/shortcuts.js");
+        const sync = await ensureShortcutsHaveCdpFlag(port);
+        for (const p of sync.updated) console.log(`shortcut updated: ${p}`);
+        if (sync.failed.length > 0) {
+          console.log(`some shortcuts need one elevated run to update:`);
+          for (const f of sync.failed) console.log(`  - ${f.path} (${f.reason})`);
+        }
         if (r.started) {
           console.log(`ZCode started with CDP on port ${port}.`);
         } else if (r.reason === "running-without-cdp") {

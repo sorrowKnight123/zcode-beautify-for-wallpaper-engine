@@ -3276,8 +3276,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path10) {
-      let input2 = path10;
+    function removeDotSegments(path11) {
+      let input2 = path11;
       const output2 = [];
       let nextSlash = -1;
       let len = 0;
@@ -3686,8 +3686,8 @@ var require_schemes = __commonJS({
       }
       if (wsComponent.resourceName) {
         const queryIndex = wsComponent.resourceName.indexOf("?");
-        const path10 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
-        wsComponent.path = path10 && path10 !== "/" ? path10 : void 0;
+        const path11 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
+        wsComponent.path = path11 && path11 !== "/" ? path11 : void 0;
         wsComponent.query = queryIndex === -1 ? void 0 : wsComponent.resourceName.slice(queryIndex + 1);
         wsComponent.resourceName = void 0;
       }
@@ -7199,12 +7199,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f2;
     };
-    function addFormats(ajv, list, fs9, exportName) {
+    function addFormats(ajv, list, fs10, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f2 of list)
-        ajv.addFormat(f2, fs9[f2]);
+        ajv.addFormat(f2, fs10[f2]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -11435,7 +11435,7 @@ var require_gifframe = __commonJS({
 var require_gifutil = __commonJS({
   "node_modules/gifwrap/src/gifutil.js"(exports) {
     "use strict";
-    var fs9 = __require("fs");
+    var fs10 = __require("fs");
     var ImageQ = require_image_q();
     var BitmapImage2 = require_bitmapimage();
     var { GifFrame: GifFrame2 } = require_gifframe();
@@ -11550,14 +11550,14 @@ var require_gifutil = __commonJS({
       jimpImage.bitmap.data = bitmapImageToShare.bitmap.data;
       return jimpImage;
     };
-    exports.write = function(path10, frames, spec, encoder) {
+    exports.write = function(path11, frames, spec, encoder) {
       encoder = encoder || defaultCodec;
-      const matches = path10.match(/\.[a-zA-Z]+$/);
+      const matches = path11.match(/\.[a-zA-Z]+$/);
       if (matches !== null && INVALID_SUFFIXES.includes(matches[0].toLowerCase())) {
-        throw new Error(`GIF '${path10}' has an unexpected suffix`);
+        throw new Error(`GIF '${path11}' has an unexpected suffix`);
       }
       return encoder.encodeGif(frames, spec).then((gif2) => {
-        return _writeBinary(path10, gif2.buffer).then(() => {
+        return _writeBinary(path11, gif2.buffer).then(() => {
           return gif2;
         });
       });
@@ -11629,9 +11629,9 @@ var require_gifutil = __commonJS({
         }
       }
     }
-    function _readBinary(path10) {
+    function _readBinary(path11) {
       return new Promise((resolve, reject) => {
-        fs9.readFile(path10, (err, buffer) => {
+        fs10.readFile(path11, (err, buffer) => {
           if (err) {
             return reject(err);
           }
@@ -11639,9 +11639,9 @@ var require_gifutil = __commonJS({
         });
       });
     }
-    function _writeBinary(path10, buffer) {
+    function _writeBinary(path11, buffer) {
       return new Promise((resolve, reject) => {
-        fs9.writeFile(path10, buffer, (err) => {
+        fs10.writeFile(path11, buffer, (err) => {
           if (err) {
             return reject(err);
           }
@@ -13620,9 +13620,9 @@ var require_decoder = __commonJS({
         return a2 < 0 ? 0 : a2 > 255 ? 255 : a2;
       }
       constructor.prototype = {
-        load: function load(path10) {
+        load: function load(path11) {
           var xhr = new XMLHttpRequest();
-          xhr.open("GET", path10, true);
+          xhr.open("GET", path11, true);
           xhr.responseType = "arraybuffer";
           xhr.onload = (function() {
             var data = new Uint8Array(xhr.response || xhr.mozResponseArrayBuffer);
@@ -24049,11 +24049,11 @@ var require_Mime = __commonJS({
         }
       }
     };
-    Mime.prototype.getType = function(path10) {
-      path10 = String(path10);
-      let last = path10.replace(/^.*[/\\]/, "").toLowerCase();
+    Mime.prototype.getType = function(path11) {
+      path11 = String(path11);
+      let last = path11.replace(/^.*[/\\]/, "").toLowerCase();
       let ext = last.replace(/^.*\./, "").toLowerCase();
-      let hasPath = last.length < path10.length;
+      let hasPath = last.length < path11.length;
       let hasDot = ext.length < last.length - 1;
       return (hasDot || !hasPath) && this._types[ext] || null;
     };
@@ -30240,8 +30240,8 @@ function isTokenizerStreamBoundsError(error62) {
   }
   return /strtok3[/\\]lib[/\\]stream[/\\]/.test(error62.stack);
 }
-async function fileTypeFromFile(path10, options) {
-  return new FileTypeParser2(options).fromFile(path10, options);
+async function fileTypeFromFile(path11, options) {
+  return new FileTypeParser2(options).fromFile(path11, options);
 }
 async function fileTypeFromStream(stream, options) {
   return new FileTypeParser2(options).fromStream(stream);
@@ -30272,9 +30272,9 @@ var init_file_type = __esm({
           }
         }
       }
-      async fromFile(path10) {
+      async fromFile(path11) {
         this.options.signal?.throwIfAborted();
-        const fileHandle = await fs2.open(path10, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
+        const fileHandle = await fs2.open(path11, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
         const fileStat = await fileHandle.stat();
         if (!fileStat.isFile()) {
           await fileHandle.close();
@@ -30283,7 +30283,7 @@ var init_file_type = __esm({
         const tokenizer = new FileTokenizer(fileHandle, {
           ...this.getTokenizerOptions(),
           fileInfo: {
-            path: path10,
+            path: path11,
             size: fileStat.size
           }
         });
@@ -37980,10 +37980,91 @@ var init_scenePipeline = __esm({
   }
 });
 
+// dist/core/shortcuts.js
+var shortcuts_exports = {};
+__export(shortcuts_exports, {
+  ensureShortcutsHaveCdpFlag: () => ensureShortcutsHaveCdpFlag
+});
+import { execFile as execFile7 } from "node:child_process";
+import fs9 from "node:fs";
+import path9 from "node:path";
+import { promisify as promisify7 } from "node:util";
+function shortcutDirs() {
+  const home = process.env.USERPROFILE ?? "";
+  const appData = process.env.APPDATA ?? "";
+  return [
+    // Desktop may be OneDrive-redirected; cover both physical locations.
+    path9.join(home, "Desktop"),
+    ...process.env.OneDrive ? [path9.join(process.env.OneDrive, "Desktop")] : [],
+    path9.join(appData, "Microsoft", "Windows", "Start Menu", "Programs"),
+    path9.join("C:", "ProgramData", "Microsoft", "Windows", "Start Menu", "Programs"),
+    path9.join(appData, "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar")
+  ];
+}
+async function ensureShortcutsHaveCdpFlag(port) {
+  if (process.platform !== "win32")
+    return { updated: [], skipped: [], failed: [] };
+  const flag = `--remote-debugging-port=${port}`;
+  const result = { updated: [], skipped: [], failed: [] };
+  const links = [];
+  const collect = (dir) => {
+    links.push(...fs9.readdirSync(dir).filter((f2) => /^zcode/i.test(f2) && f2.endsWith(".lnk")).map((f2) => path9.join(dir, f2)));
+  };
+  for (const dir of shortcutDirs()) {
+    try {
+      collect(dir);
+      for (const sub of fs9.readdirSync(dir, { withFileTypes: true })) {
+        if (!sub.isDirectory())
+          continue;
+        try {
+          collect(path9.join(dir, sub.name));
+        } catch {
+        }
+      }
+    } catch {
+    }
+  }
+  if (links.length === 0)
+    return result;
+  for (const lnk of links) {
+    const script = `
+$ErrorActionPreference = 'Stop'
+try {
+  $ws = New-Object -ComObject WScript.Shell
+  $s = $ws.CreateShortcut('${lnk.replace(/'/g, "''")}')
+  if ($s.TargetPath -notmatch 'ZCode.exe$') { Write-Output 'ok|not-zcode'; exit }
+  if ($s.Arguments -like '*--remote-debugging-port*') { Write-Output 'ok|has-flag'; exit }
+  $s.Arguments = ($s.Arguments.Trim() + ' ${flag}').Trim()
+  $s.Save()
+  Write-Output 'updated'
+} catch { Write-Output ('err|' + $_.Exception.Message) }`;
+    try {
+      const { stdout } = await exec5("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3, windowsHide: true });
+      const out = stdout.trim();
+      if (out.startsWith("updated"))
+        result.updated.push(lnk);
+      else if (out.startsWith("err"))
+        result.failed.push({ path: lnk, reason: out.slice(4) });
+      else
+        result.skipped.push(lnk);
+    } catch (err) {
+      result.failed.push({ path: lnk, reason: err.message });
+    }
+  }
+  return result;
+}
+var exec5;
+var init_shortcuts = __esm({
+  "dist/core/shortcuts.js"() {
+    "use strict";
+    exec5 = promisify7(execFile7);
+  }
+});
+
 // dist/mcp/server.js
 import { spawn as spawn3 } from "node:child_process";
 import { existsSync as existsSync2, statSync } from "node:fs";
-import path9 from "node:path";
+import path10 from "node:path";
 
 // node_modules/zod/v3/helpers/util.js
 var util;
@@ -38359,8 +38440,8 @@ function getErrorMap() {
 
 // node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -38475,11 +38556,11 @@ var errorUtil;
 
 // node_modules/zod/v3/types.js
 var ParseInputLazyPath = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -42433,10 +42514,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path10) {
-  if (!path10)
+function getElementAtPath(obj, path11) {
+  if (!path11)
     return obj;
-  return path10.reduce((acc, key) => acc?.[key], obj);
+  return path11.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -42776,11 +42857,11 @@ function explicitlyAborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path10, issues) {
+function prefixIssues(path11, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path10);
+    iss.path.unshift(path11);
     return iss;
   });
 }
@@ -43230,16 +43311,16 @@ function flattenError(error62, mapper = (issue2) => issue2.message) {
 }
 function formatError(error62, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error63, path10 = []) => {
+  const processError = (error63, path11 = []) => {
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path10, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path11, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else {
-        const fullpath = [...path10, ...issue2.path];
+        const fullpath = [...path11, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -43278,17 +43359,17 @@ function formatError(error62, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error62, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error63, path10 = []) => {
+  const processError = (error63, path11 = []) => {
     var _a3;
     for (const issue2 of error63.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path10, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path11, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path10, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else {
-        const fullpath = [...path10, ...issue2.path];
+        const fullpath = [...path11, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -43327,8 +43408,8 @@ function treeifyError(error62, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path10 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path10) {
+  const path11 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path11) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -58843,11 +58924,11 @@ function normalizeObjectSchema(schema) {
   }
   return void 0;
 }
-function getDotPath(path10) {
-  if (path10.length === 0) {
+function getDotPath(path11) {
+  if (path11.length === 0) {
     return "object root";
   }
-  return path10.reduce((acc, seg, index) => {
+  return path11.reduce((acc, seg, index) => {
     if (index === 0) {
       return String(seg);
     }
@@ -61074,13 +61155,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path10 = ref.slice(1).split("/").filter(Boolean);
-  if (path10.length === 0) {
+  const path11 = ref.slice(1).split("/").filter(Boolean);
+  if (path11.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path10[0] === defsKey) {
-    const key = path10[1] === void 0 ? void 0 : decodeJSONPointerSegment(path10[1]);
+  if (path11[0] === defsKey) {
+    const key = path11[1] === void 0 ? void 0 : decodeJSONPointerSegment(path11[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -69652,8 +69733,8 @@ function getErrorMap3() {
 
 // node_modules/@jimp/types/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue2 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -69769,11 +69850,11 @@ var errorUtil2;
 
 // node_modules/@jimp/types/node_modules/zod/v3/types.js
 var ParseInputLazyPath2 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -73708,8 +73789,8 @@ function getErrorMap4() {
 
 // node_modules/@jimp/plugin-blit/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue3 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -73825,11 +73906,11 @@ var errorUtil3;
 
 // node_modules/@jimp/plugin-blit/node_modules/zod/v3/types.js
 var ParseInputLazyPath3 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -78534,8 +78615,8 @@ function getErrorMap5() {
 
 // node_modules/@jimp/plugin-circle/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue4 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -78651,11 +78732,11 @@ var errorUtil4;
 
 // node_modules/@jimp/plugin-circle/node_modules/zod/v3/types.js
 var ParseInputLazyPath4 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -82617,8 +82698,8 @@ function getErrorMap6() {
 
 // node_modules/@jimp/plugin-color/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue5 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -82734,11 +82815,11 @@ var errorUtil5;
 
 // node_modules/@jimp/plugin-color/node_modules/zod/v3/types.js
 var ParseInputLazyPath5 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -87454,9 +87535,9 @@ function createJimp({ plugins: pluginsArg, formats: formatsArg } = {}) {
      * await image.write("test/output.png");
      * ```
      */
-    async write(path10, options) {
-      const mimeType = import_lite.default.getType(path10);
-      await writeFile(path10, await this.getBuffer(mimeType, options));
+    async write(path11, options) {
+      const mimeType = import_lite.default.getType(path11);
+      await writeFile(path11, await this.getBuffer(mimeType, options));
     }
     /**
      * Clone the image into a new Jimp instance.
@@ -88147,8 +88228,8 @@ function getErrorMap7() {
 
 // node_modules/@jimp/plugin-resize/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue6 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -88264,11 +88345,11 @@ var errorUtil6;
 
 // node_modules/@jimp/plugin-resize/node_modules/zod/v3/types.js
 var ParseInputLazyPath6 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -92820,8 +92901,8 @@ function getErrorMap8() {
 
 // node_modules/@jimp/plugin-contain/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue7 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -92937,11 +93018,11 @@ var errorUtil7;
 
 // node_modules/@jimp/plugin-contain/node_modules/zod/v3/types.js
 var ParseInputLazyPath7 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -96912,8 +96993,8 @@ function getErrorMap9() {
 
 // node_modules/@jimp/plugin-crop/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue8 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -97029,11 +97110,11 @@ var errorUtil8;
 
 // node_modules/@jimp/plugin-crop/node_modules/zod/v3/types.js
 var ParseInputLazyPath8 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -101134,8 +101215,8 @@ function getErrorMap10() {
 
 // node_modules/@jimp/plugin-cover/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue9 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -101251,11 +101332,11 @@ var errorUtil9;
 
 // node_modules/@jimp/plugin-cover/node_modules/zod/v3/types.js
 var ParseInputLazyPath9 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -105222,8 +105303,8 @@ function getErrorMap11() {
 
 // node_modules/@jimp/plugin-displace/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue10 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -105339,11 +105420,11 @@ var errorUtil10;
 
 // node_modules/@jimp/plugin-displace/node_modules/zod/v3/types.js
 var ParseInputLazyPath10 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -109343,8 +109424,8 @@ function getErrorMap12() {
 
 // node_modules/@jimp/plugin-fisheye/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue11 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -109460,11 +109541,11 @@ var errorUtil11;
 
 // node_modules/@jimp/plugin-fisheye/node_modules/zod/v3/types.js
 var ParseInputLazyPath11 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -113422,8 +113503,8 @@ function getErrorMap13() {
 
 // node_modules/@jimp/plugin-flip/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue12 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -113539,11 +113620,11 @@ var errorUtil12;
 
 // node_modules/@jimp/plugin-flip/node_modules/zod/v3/types.js
 var ParseInputLazyPath12 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -117655,8 +117736,8 @@ function getErrorMap14() {
 
 // node_modules/@jimp/plugin-mask/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue13 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -117772,11 +117853,11 @@ var errorUtil13;
 
 // node_modules/@jimp/plugin-mask/node_modules/zod/v3/types.js
 var ParseInputLazyPath13 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -121753,8 +121834,8 @@ function getErrorMap15() {
 
 // node_modules/@jimp/plugin-print/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue14 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -121870,11 +121951,11 @@ var errorUtil14;
 
 // node_modules/@jimp/plugin-print/node_modules/zod/v3/types.js
 var ParseInputLazyPath14 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -125994,8 +126075,8 @@ function getErrorMap16() {
 
 // node_modules/@jimp/plugin-rotate/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue15 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -126111,11 +126192,11 @@ var errorUtil15;
 
 // node_modules/@jimp/plugin-rotate/node_modules/zod/v3/types.js
 var ParseInputLazyPath15 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -130196,8 +130277,8 @@ function getErrorMap17() {
 
 // node_modules/@jimp/plugin-threshold/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue16 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -130313,11 +130394,11 @@ var errorUtil16;
 
 // node_modules/@jimp/plugin-threshold/node_modules/zod/v3/types.js
 var ParseInputLazyPath16 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -137168,8 +137249,8 @@ function getErrorMap18() {
 
 // node_modules/@jimp/plugin-quantize/node_modules/zod/v3/helpers/parseUtil.js
 var makeIssue17 = (params) => {
-  const { data, path: path10, errorMaps, issueData } = params;
-  const fullPath = [...path10, ...issueData.path || []];
+  const { data, path: path11, errorMaps, issueData } = params;
+  const fullPath = [...path11, ...issueData.path || []];
   const fullIssue = {
     ...issueData,
     path: fullPath
@@ -137285,11 +137366,11 @@ var errorUtil17;
 
 // node_modules/@jimp/plugin-quantize/node_modules/zod/v3/types.js
 var ParseInputLazyPath17 = class {
-  constructor(parent, value, path10, key) {
+  constructor(parent, value, path11, key) {
     this._cachedPath = [];
     this.parent = parent;
     this.data = value;
-    this._path = path10;
+    this._path = path11;
     this._key = key;
   }
   get path() {
@@ -145826,9 +145907,9 @@ init_wallpaperType();
 init_launch();
 function bootstrapServe() {
   try {
-    const serverFile = path9.resolve(process.argv[1] ?? "");
-    const cliJs = path9.join(path9.dirname(serverFile), "..", "cli.js");
-    if (path9.basename(serverFile) !== "server.js" || !existsSync2(cliJs))
+    const serverFile = path10.resolve(process.argv[1] ?? "");
+    const cliJs = path10.join(path10.dirname(serverFile), "..", "cli.js");
+    if (path10.basename(serverFile) !== "server.js" || !existsSync2(cliJs))
       return;
     fetch("http://127.0.0.1:9223/api/health", { signal: AbortSignal.timeout(1500) }).then((r2) => r2.json()).then((body) => {
       if (body?.service !== "zcode-beautify")
@@ -145846,6 +145927,7 @@ function bootstrapServe() {
       } catch {
       }
     });
+    Promise.resolve().then(() => (init_shortcuts(), shortcuts_exports)).then((m) => m.ensureShortcutsHaveCdpFlag(9222)).catch(() => void 0);
   } catch {
   }
 }
