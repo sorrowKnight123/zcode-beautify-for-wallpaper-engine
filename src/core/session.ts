@@ -47,13 +47,24 @@ export async function applyWallpaper(imagePath: string, opts: ApplyOptions): Pro
   if (dest !== abs) fs.copyFileSync(abs, dest);
 
   const assets = await loadWallpaper(dest);
-  const payload = buildPayload(config, assets);
+  const payload = buildPayload(config, assets, serveMediaToken());
   // Persist first: even if the app is not running yet, `launch` + `refresh_theme`
   // can pick the stored theme up later.
   saveConfig({ ...config, wallpaperPath: dest });
 
   const windows = await applyToZCode(config, payload);
   return { windows, config };
+}
+
+/** The running serve's per-start token (read from disk). Injected media URLs
+ *  must carry ?t= — the serve auth gate 401s a bare <video>/background-image
+ *  URL, which reads as a blank/black wallpaper. */
+function serveMediaToken(): string {
+  try {
+    return fs.readFileSync(path.join(dataDir(), "serve.token"), "utf8").trim();
+  } catch {
+    return "";
+  }
 }
 
 export async function applyColorsOnly(opts: ApplyOptions): Promise<number> {
@@ -116,7 +127,7 @@ export async function applySceneWallpaper(
         "Run `zcode-beautify serve --detach` and `refresh_theme` to enable motion.",
     );
     const assets = await loadWallpaper(scene.posterPath);
-    const payload = buildPayload({ ...next, sceneVideoUrl: undefined }, assets);
+    const payload = buildPayload({ ...next, sceneVideoUrl: undefined }, assets, serveMediaToken());
     const windows = await applyToZCode({ ...next, sceneVideoUrl: undefined }, payload);
     return { windows, config: next, scene, served: false };
   }
@@ -155,12 +166,12 @@ export async function buildPayloadFromConfig(config: BeautifyConfig): Promise<Bu
     if (!config.sceneVideoUrl && config.sceneHash) {
       config = { ...config, sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${config.sceneHash}.mp4` };
     }
-    return buildPayload(config, assets);
+    return buildPayload(config, assets, serveMediaToken());
   }
   if (config.wallpaperPath && fs.existsSync(config.wallpaperPath)) {
     assets = await loadWallpaper(config.wallpaperPath);
   }
-  return buildPayload(config, assets);
+  return buildPayload(config, assets, serveMediaToken());
 }
 
 function mergedConfig(): BeautifyConfig {

@@ -3,11 +3,87 @@
  * overrides, plus helpers to apply a theme to a running ZCode instance.
  */
 
-import { CdpConnection, injectIntoTarget, listTargets, pickRendererTargets, buildBootstrapScript, buildResetScript } from "./cdp.js";
+import { CdpConnection, injectIntoTarget, isUpdaterTarget, listTargets, pickRendererTargets, buildBootstrapScript, buildResetScript } from "./cdp.js";
 import { loadWallpaper, type WallpaperAssets } from "./monet.js";
 import { buildVariableOverrides, buildTransparencyOverrides } from "./tokens.js";
+import { dataDir } from "./launch.js";
+import path from "node:path";
 
 export type WallpaperFit = "cover" | "contain" | "smart";
+
+/** Wallpaper switching effects; compositor-friendly where possible. */
+export type WallpaperTransition = "fade" | "none" | "slide" | "zoom" | "blur";
+
+/**
+ * Rotation modes: "sequence" plays every entry for its duration in order and
+ * loops; "random" does the same but never repeats the current entry back to
+ * back; "schedule" switches at the entry's daily clock time.
+ */
+export type RotationMode = "sequence" | "random" | "schedule";
+
+/** One playlist item: a wallpaper reference plus how long it stays on. */
+export interface RotationEntry {
+  /** sequence/random: play duration in seconds (>= 10). */
+  seconds?: number;
+  /** schedule: daily local clock time, "HH:MM" (24h). */
+  time?: string;
+  /** Scene loop reference: cache hash (scenes/<hash>/loop.mp4). */
+  hash?: string;
+  /** Static image reference: absolute path inside the data dir. */
+  path?: string;
+}
+
+/** A named, self-contained playback plan: mode, transition effect, playlist. */
+export interface RotationPlan {
+  id: string;
+  name: string;
+  mode: RotationMode;
+  /** Switching effect used while this plan is active (default "fade"). */
+  transition?: WallpaperTransition;
+  /** Optional daily activation window "HH:MM"-"HH:MM" (overnight spans ok):
+   *  while "now" is inside, this plan plays regardless of activePlanId. */
+  window?: { start: string; end: string };
+  entries: RotationEntry[];
+}
+
+/**
+ * Wallpaper rotation (定时播放): several saved plans, one of them active.
+ * Configs written before plans existed carry a flat mode+entries pair and
+ * are normalized into a single "默认方案" on read.
+ */
+export interface RotationConfig {
+  enabled: boolean;
+  /** Which plan plays; falls back to plans[0] when unset or unknown. */
+  activePlanId?: string;
+  plans: RotationPlan[];
+}
+
+/**
+ * Zone-refined chat-area look (聊天界面): four independent masks layered
+ * between the wallpaper and the UI, each a 0-100 density.
+ */
+export interface ChatLookConfig {
+  /** Extra darkening behind the conversation column (聊天区暗度). */
+  chatDim: number;
+  /** Top-edge fading mask (遮罩上端浓度). */
+  maskTop: number;
+  /** Bottom-edge fading mask (遮罩下端浓度). */
+  maskBottom: number;
+  /** Whole-window white frost sheet (大容器偏白). */
+  frost: number;
+}
+
+/** Clamp a partial chat look to four ints 0-100 (missing values become 0). */
+export function normalizeChatLook(raw?: Partial<ChatLookConfig>): ChatLookConfig {
+  const pct = (v: unknown): number =>
+    typeof v === "number" && v >= 0 && v <= 100 ? Math.round(v) : 0;
+  return {
+    chatDim: pct(raw?.chatDim),
+    maskTop: pct(raw?.maskTop),
+    maskBottom: pct(raw?.maskBottom),
+    frost: pct(raw?.frost),
+  };
+}
 
 export interface BeautifyConfig {
   port: number;
@@ -28,6 +104,32 @@ export interface BeautifyConfig {
   sceneHash?: string;
   /** Serve API port used to derive sceneVideoUrl (default 9223). */
   apiPort?: number;
+  /** Wallpaper rotation playlist (定时播放). */
+  rotation?: RotationConfig;
+  /** Slow pan/zoom breathing on static image wallpapers (Ken Burns). */
+  kenBurns?: boolean;
+  /** Video wallpaper audio 0-100 (0 = muted; wallpapers default silent). */
+  videoVolume?: number;
+  /** Pinned Monet source color "#rrggbb" overriding extraction. */
+  themeColor?: string;
+  /** Zone-refined chat-area masks (聊天界面); absent = all zero. */
+  chatLook?: Partial<ChatLookConfig>;
+  /** Hide wallpaper+panel during ZCode's startup screen (default true). */
+  startupClean?: boolean;
+  /** Beautify ZCode's update-status window too (default false — stays stock). */
+  showOnUpdater?: boolean;
+  /** Import resolution: "auto" follows the wallpaper project size, else WxH. */
+  importRes?: { mode: string; width?: number; height?: number };
+  /** Day/night look schedule (护眼): two dim/blur presets switching by time. */
+  dayNight?: {
+    enabled: boolean;
+    start: string;
+    end: string;
+    dayDim: number;
+    nightDim: number;
+    dayBlur: number;
+    nightBlur: number;
+  };
 }
 
 export const DEFAULT_CONFIG: BeautifyConfig = {
@@ -46,13 +148,32 @@ export interface BuiltPayload {
   videoSrc?: string;
   /** How the wallpaper layer is framed; "contain" adds a blurred backdrop. */
   fit: "cover" | "contain";
+  /** Switching effect the bootstrap overlay should play. */
+  transition: WallpaperTransition;
   /** Normalized focus point for background-position. */
   focusX: number;
   focusY: number;
+  /** True when Ken Burns motion applies to the current image wallpaper. */
+  kenBurns: boolean;
+  /** Video wallpaper audio volume 0-100 (0 = muted). */
+  videoVolume: number;
+  /** Zone-refined chat-area masks (聊天界面), normalized 0-100. */
+  chatLook?: ChatLookConfig;
+  /** Defer mounting until the ZCode startup screen is gone (default true). */
+  startupClean?: boolean;
 }
 
-export function buildPayload(config: BeautifyConfig, assets?: WallpaperAssets): BuiltPayload {
+/** The switching effect comes from the active rotation plan (fallback fade). */
+function activePlanTransition(rotation: RotationConfig | undefined): WallpaperTransition {
+  const plans = rotation?.plans;
+  if (!plans?.length) return "fade";
+  const plan = plans.find((p) => p.id === rotation?.activePlanId) ?? plans[0];
+  return plan?.transition ?? "fade";
+}
+
+export function buildPayload(config: BeautifyConfig, assets?: WallpaperAssets, mediaToken = ""): BuiltPayload {
   const parts: string[] = [];
+  const tok = mediaToken ? (u: string) => `${u}?t=${mediaToken}` : (u: string) => u;
 
   // "smart" resolves to the analyzed suggestion at build time, so the injected
   // CSS only ever deals with cover or contain.
@@ -110,17 +231,39 @@ html, body { background: transparent !important; }
       parts.push(buildTransparencyOverrides({ dim: config.dim }));
     }
   }
-  const wallpaperDataUri =
-    config.sceneVideoUrl || !config.wallpaperVisible ? undefined : assets?.dataUri;
-  const videoSrc = config.wallpaperVisible ? config.sceneVideoUrl : undefined;
+  // Library images stream over the serve media endpoint instead of a base64
+  // data URI: a multi-MB payload means a huge CDP evaluate + a second decode
+  // in the renderer, while the browser caches by URL — switching is far
+  // faster. Wallpapers outside the data dir keep the inline fallback.
+  let wallpaperDataUri: string | undefined;
+  if (!config.sceneVideoUrl && config.wallpaperVisible) {
+    // Normalize separators/case so forward-slash paths match too.
+    const p = path.resolve(config.wallpaperPath ?? "").toLowerCase();
+    const dir = path.resolve(dataDir()).toLowerCase();
+    if (p.startsWith(dir + path.sep) && /\.(jpe?g|png|webp|bmp)$/i.test(p)) {
+      wallpaperDataUri = tok(`http://127.0.0.1:${config.apiPort ?? 9223}/media/lib/${encodeURIComponent(path.basename(config.wallpaperPath!))}`);
+    } else {
+      wallpaperDataUri = assets?.dataUri;
+    }
+  }
+  const videoSrc = config.wallpaperVisible && config.sceneVideoUrl ? tok(config.sceneVideoUrl) : undefined;
+  // Ken Burns animates the wallpaper layer's transform — only meaningful for
+  // a static image (a video plays its own motion) and with blur off (blur
+  // already occupies the transform).
+  const kenBurns = Boolean(config.kenBurns) && !videoSrc && config.blur === 0 && Boolean(wallpaperDataUri);
 
   return {
     css: parts.join("\n"),
     wallpaperDataUri,
     videoSrc,
     fit: config.wallpaperVisible ? resolved : "cover",
+    transition: activePlanTransition(config.rotation),
     focusX,
     focusY,
+    kenBurns,
+    videoVolume: Math.max(0, Math.min(100, Math.round(config.videoVolume ?? 0))),
+    chatLook: normalizeChatLook(config.chatLook),
+    startupClean: config.startupClean !== false,
   };
 }
 
@@ -166,12 +309,12 @@ html, body { background: transparent !important; }
   }
 
   if (input.mediaType === "video") {
-    return buildBootstrapScript({ css, videoSrc: input.path, fit: input.fit ?? "cover" });
+    return buildBootstrapScript({ css, videoSrc: input.path, fit: input.fit ?? "cover", transition: "fade" });
   }
   const src = /^(data:|https?:|file:)/i.test(input.path)
     ? input.path
     : `file:///${input.path.replace(/\\/g, "/").replace(/^\/+/, "")}`;
-  return buildBootstrapScript({ css, wallpaperDataUri: src, fit: input.fit ?? "cover" });
+  return buildBootstrapScript({ css, wallpaperDataUri: src, fit: input.fit ?? "cover", transition: "fade" });
 }
 
 /** Apply config to a running ZCode instance. Returns how many windows got it. */
@@ -182,6 +325,8 @@ export async function applyToZCode(config: BeautifyConfig, payload: BuiltPayload
   }
   let count = 0;
   for (const target of targets) {
+    // The update-status window is opt-in; skip it unless configured otherwise.
+    if (isUpdaterTarget(target) && config.showOnUpdater !== true) continue;
     try {
       await injectIntoTarget(target, payload);
       count++;

@@ -13,6 +13,18 @@ import { applyColorsOnly, applyWallpaper, applySceneWallpaper, reapplyStored, re
 import { detectWallpaperType } from "../core/wallpaperType.js";
 import { loadConfig } from "../core/launch.js";
 
+// ZCode launches MCP servers with ZCODE_BEAUTIFY_DATA_DIR pointed at a
+// plugin-scoped directory; keeping it would make every read/write in this
+// process (status, tools) use a different store than the serve daemon does.
+// Strip it FIRST, before anything resolves dataDir().
+delete process.env.ZCODE_BEAUTIFY_DATA_DIR;
+
+const absoluteExisting = (p: string): string => {
+  if (!path.isAbsolute(p)) throw new Error(`需要绝对路径: ${p}`);
+  if (!existsSync(p)) throw new Error(`路径不存在: ${p}`);
+  return p;
+};
+
 /**
  * ZCode launches this MCP server on every app start — the ideal hook to make
  * the settings panel "just exist": piggyback a detached `serve` process so it
@@ -27,21 +39,21 @@ function bootstrapServe(): void {
     // tsx from src/ there is nothing to point at, so skip quietly.
     const cliJs = path.join(path.dirname(serverFile), "..", "cli.js");
     if (path.basename(serverFile) !== "server.js" || !existsSync(cliJs)) return;
-    fetch("http://127.0.0.1:9223/api/health", { signal: AbortSignal.timeout(1500) })
-      .then((r) => r.json())
+    // The API port is a setting; a hardcoded 9223 here spawns duplicate serves
+    // whenever the configured port differs.
+    const apiPort = loadConfig().apiPort ?? 9223;
+    fetch(`http://127.0.0.1:${apiPort}/api/health`, { signal: AbortSignal.timeout(1500) })
+      .then((r) => {
+        if (!r.ok) throw new Error("unhealthy");
+        return r.json();
+      })
       .then((body) => {
         if ((body as { service?: string })?.service !== "zcode-beautify") throw new Error("foreign service");
       })
       .catch(() => {
         try {
-          // ZCode launches MCP servers with ZCODE_BEAUTIFY_DATA_DIR pointed at
-          // a plugin-scoped directory (<plugin>@<marketplace>); letting the
-          // serve inherit it splits the store from manually-started serves
-          // (empty-looking library). Strip it so every serve uses the default
-          // data dir.
           const childEnv = { ...process.env };
-          delete childEnv.ZCODE_BEAUTIFY_DATA_DIR;
-          spawn(process.execPath, [cliJs, "serve", "--detach"], {
+          spawn(process.execPath, [cliJs, "serve", "--detach", "--api-port", String(apiPort)], {
             detached: true,
             stdio: "ignore",
             windowsHide: true,
@@ -64,7 +76,7 @@ bootstrapServe();
 
 const server = new McpServer({
   name: "zcode-beautify",
-  version: "0.3.1",
+  version: "0.4.0",
 });
 
 /** Registry of the tools this server exposes (used by tests / docs). */
@@ -91,11 +103,12 @@ server.registerTool(
   },
   async ({ image_path, blur, dim }) => {
     try {
-      const kind = detectWallpaperType(image_path);
+      const abs = absoluteExisting(image_path);
+      const kind = detectWallpaperType(abs);
       const { windows } =
         kind === "scene" || kind === "video"
-          ? await applySceneWallpaper(image_path, { blur, dim })
-          : await applyWallpaper(image_path, { blur, dim });
+          ? await applySceneWallpaper(abs, { blur, dim })
+          : await applyWallpaper(abs, { blur, dim });
       return {
         content: [{
           type: "text",
@@ -127,8 +140,9 @@ server.registerTool(
   },
   async ({ path: scenePath, blur, dim }) => {
     try {
+      const abs = absoluteExisting(scenePath);
       const stages: string[] = [];
-      const { windows, served, scene } = await applySceneWallpaper(scenePath, {
+      const { windows, served, scene } = await applySceneWallpaper(abs, {
         blur,
         dim,
         onProgress: (stage) => {

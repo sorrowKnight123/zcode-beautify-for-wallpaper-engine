@@ -41,6 +41,8 @@ export interface SceneWindowHandle {
 }
 
 export class SceneWindowError extends Error {}
+/** Raised by the pipeline pre-check (not a user-facing failure). */
+export class SceneWindowBlackError extends Error {}
 
 const PS_WINDOW_HELPERS = `
 # ddagrab captures PHYSICAL pixels; without DPI awareness PowerShell returns
@@ -95,6 +97,107 @@ function Measure-Client([IntPtr]$h) {
 `;
 
 /**
+ * Kills any running Wallpaper Engine and starts a FRESH core instance.
+ *
+ * The long-running core degrades over repeated playInWindow cycles — windows
+ * come up black (forever, not late), and eventually stop appearing at all.
+ * Every probe run right after a core restart rendered fine, so imports now
+ * begin from a clean core every time. The desktop wallpaper is NOT affected
+ * (it is not played by WE); an open WE UI dies with the core — that is
+ * accepted: the UI is exactly what accelerates the degradation.
+ */
+export async function ensureFreshCore(wallpaperExePath?: string): Promise<void> {
+  const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
+  if (!exe) throw new SceneWindowError("Wallpaper Engine not found");
+
+  // Kill the old core and CONFIRM it is fully gone: wallpaper64 is
+  // single-instance, so a not-yet-dead old core turns the freshly started
+  // exe into a mere -control forwarder that exits — leaving the degraded
+  // core in charge and the next window black.
+  const countCores = async (): Promise<number> => {
+    const out = await exec(
+      "powershell",
+      ["-NoProfile", "-Command", "(Get-Process wallpaper64 -ErrorAction SilentlyContinue | Measure-Object).Count"],
+      { timeout: 10_000 },
+    ).catch(() => ({ stdout: "-1" }));
+    return Number(out.stdout.trim());
+  };
+  for (let i = 0; i < 12 && (await countCores()) > 0; i++) {
+    if (i === 0) {
+      await exec(
+        "powershell",
+        ["-NoProfile", "-Command", "Get-Process wallpaper64 -ErrorAction SilentlyContinue | Stop-Process -Force"],
+        { timeout: 15_000 },
+      ).catch(() => undefined);
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  await new Promise((r) => setTimeout(r, 1500));
+
+  // The core MUST be started in an independent environment. Spawning it
+  // directly from serve (a wscript-hidden, console-less chain) produces a
+  // core whose render windows come up BLACK — while the identical sequence
+  // from a normal shell renders fine (verified end-to-end). Start-Process
+  // breaks the inheritance and gives the core a clean environment of its own.
+  await exec(
+    "powershell",
+    ["-NoProfile", "-Command", `Start-Process -FilePath '${exe.replace(/'/g, "''")}'`],
+    { timeout: 15_000 },
+  ).catch(() => undefined);
+  // Flat warm-up: process-alive is NOT readiness (a young core accepts
+  // -control but its renderer still yields black frames for several more
+  // seconds on this hybrid-GPU machine).
+  await new Promise((r) => setTimeout(r, 15_000));
+}
+
+/**
+ * True when the given window's live pixels are (near-)uniform — the black
+ * render. Uses PrintWindow(PW_CLIENTONLY|PW_RENDERFULLCONTENT) exactly like
+ * the recorder (client-only, so the title bar never brightens the probe),
+ * which stays accurate even while the window sits BEHIND ZCode (a screen
+ * CopyFromScreen here would capture whatever covers the window instead).
+ * Returns null when the window cannot be captured (treated as "not black").
+ */
+export async function windowIsBlack(title: string): Promise<boolean | null> {
+  const script = `
+Add-Type -AssemblyName System.Drawing
+$p = Get-Process | Where-Object { $_.MainWindowTitle -eq '${title.replace(/'/g, "''")}' } | Select-Object -First 1
+if ($p) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class ZB2 {
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+}
+'@
+  $r = New-Object ZB2+RECT
+  [ZB2]::GetClientRect($p.MainWindowHandle, [ref]$r) | Out-Null
+  $w = $r.R - $r.L; $h = $r.B - $r.T
+  if ($w -gt 0 -and $h -gt 0) {
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    [ZB2]::PrintWindow($p.MainWindowHandle, $hdc, 3) | Out-Null
+    $g.ReleaseHdc($hdc); $g.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    Write-Output $ms.Length
+  } else { Write-Output -1 }
+} else { Write-Output -1 }`;
+  try {
+    const { stdout } = await exec("powershell", ["-NoProfile", "-Command", script], { timeout: 15_000 });
+    const bytes = Number(stdout.trim());
+    if (!Number.isFinite(bytes) || bytes < 0) return null;
+    return bytes < 30000; // a rendered frame is 150KB+; black is <30KB
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Opens `pkgPath` in a dedicated Wallpaper Engine window and returns a handle
  * to it. Resolves only after the window exists, is positioned, and its client
  * rect has been measured.
@@ -113,7 +216,7 @@ export async function openSceneWindow(
     "-playInWindow", opts.title,
     "-width", String(opts.width),
     "-height", String(opts.height),
-  ], { stdio: "ignore", detached: false, windowsHide: true });
+  ], { stdio: "ignore", detached: true, windowsHide: true });
   proc.unref();
 
   const hwnd = await waitForWindow(opts.title, 15_000);
@@ -121,7 +224,21 @@ export async function openSceneWindow(
     throw new SceneWindowError(`Window "${opts.title}" did not appear within 15s`);
   }
 
-  const client = await positionWindow(hwnd, opts);
+  // NO SetWindowPos repositioning (size/move): every manual probe rendered
+  // fine, while the pipeline that moved the window right after creation came
+  // up black on this hybrid-GPU machine. The recorder crops by the MEASURED
+  // client rect, so the window stays wherever WE placed it.
+  const client = await measureClientRect(hwnd, opts.title);
+  // Z-ORDER ONLY: sink the render window to the BOTTOM of the stack so it
+  // never covers the user's work — capture is PrintWindow-based and works
+  // fully occluded (HWND_BOTTOM after pointer = 1; flags 0x3 = NOMOVE|NOSIZE
+  // and no activation). The window is visible only for the instant between
+  // WE creating it and this call.
+  await exec("powershell", [
+    "-NoProfile", "-Command",
+    `Add-Type -Namespace N -Name Z -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
+[N.Z]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]1, 0, 0, 0, 0, 0x0003) | Out-Null`,
+  ], { timeout: 10_000 }).catch(() => undefined);
   return { title: opts.title, hwnd, client, proc };
 }
 

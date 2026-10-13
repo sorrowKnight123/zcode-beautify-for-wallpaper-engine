@@ -14,7 +14,7 @@ import path from "node:path";
 import { detectWallpaperType } from "./wallpaperType.js";
 import { execFileP } from "./exec.js";
 import { checkWallpaperEngine, checkFfmpeg } from "./dependencyCheck.js";
-import { openSceneWindow, closeSceneWindow } from "./weLauncher.js";
+import { openSceneWindow, closeSceneWindow, windowIsBlack, SceneWindowBlackError } from "./weLauncher.js";
 import { recordSceneWindow, analyzeBlackness } from "./recorder.js";
 import { makeSeamless, probeDuration } from "./loopProcessor.js";
 import { computeHash, getCachePath, hasCache, touchCache, enforceLimit } from "./cacheManager.js";
@@ -196,22 +196,86 @@ export async function importScene(
     return { loopPath, posterPath, hash, blackness, fromCache: false };
   }
 
-  onProgress("opening", `window "${opts.title}"`);
-  const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
+  // The render+capture pass, retryable: on hybrid-GPU machines the WE render
+  // window comes up black INTERMITTENTLY. The manual-probe procedure (open
+  // window, wait 8s, capture) always rendered fine, so the pipeline now
+  // mirrors it exactly: longer settle, then a PRE-CHECK frame via GDI before
+  // any recording — a black window is re-opened immediately instead of
+  // wasting a 15s capture on it.
+  // WE must receive the .pkg FILE, never the wallpaper directory (user-found
+  // root cause: a directory -file opens a black window on this machine; the
+  // probes that always rendered passed the pkg file). Resolve it once:
+  let pkgFile = pkgPath;
   try {
-    onProgress("render-ready", JSON.stringify(handle.client));
-    await new Promise((r) => setTimeout(r, 3000)); // let the scene settle
-
-    onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
-    const rawPath = path.join(path.dirname(loopPath), `raw-${Date.now()}.mp4`);
-    fs.mkdirSync(path.dirname(rawPath), { recursive: true });
+    if (fs.statSync(pkgPath).isDirectory()) {
+      let declared: string | undefined;
+      try {
+        declared = (JSON.parse(fs.readFileSync(path.join(pkgPath, "project.json"), "utf8")) as { file?: string }).file;
+      } catch { /* fall back to the first .pkg in the dir */ }
+      const name =
+        declared && /\.pkg$/i.test(declared) && fs.existsSync(path.join(pkgPath, declared))
+          ? declared
+          : fs.readdirSync(pkgPath).find((e) => /\.pkg$/i.test(e));
+      if (!name) throw new SceneImportError(`No scene.pkg inside: ${pkgPath}`);
+      pkgFile = path.join(pkgPath, name);
+    }
+  } catch (err) {
+    if (err instanceof SceneImportError) throw err;
+    /* non-directory path or unreadable — pass through as-is */
+  }
+  const renderOnce = async (): Promise<{ rawPath: string }> => {
+    onProgress("opening", `window "${opts.title}"`);
+    const handle = await openSceneWindow(pkgFile, { width: opts.width, height: opts.height, title: opts.title });
     try {
+      onProgress("render-ready", JSON.stringify(handle.client));
+      await new Promise((r) => setTimeout(r, 4000)); // let the scene settle
+      // WINDOW PRE-CHECK: capture the live window via GDI before committing
+      // to a 15s recording. A near-uniform frame (tiny PNG) means the render
+      // never attached — bail NOW and reopen, instead of wasting a full
+      // capture on a window that stays black.
+      const preBlack = await windowIsBlack(opts.title);
+      if (preBlack === true) {
+        throw new SceneWindowBlackError("窗口渲染未附着(预检帧全黑)");
+      }
+
+      onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
+      const rawPath = path.join(path.dirname(loopPath), `raw-${Date.now()}.mp4`);
+      fs.mkdirSync(path.dirname(rawPath), { recursive: true });
       await recordSceneWindow(handle, rawPath, { duration: opts.duration, fps: opts.fps, outWidth: opts.width, outHeight: opts.height }, ffmpegPath);
+      return { rawPath };
     } finally {
       onProgress("closing");
       await closeSceneWindow(handle).catch(() => undefined);
     }
+  };
+  const captureIsBlack = async (file: string): Promise<boolean> => {
+    const b = await analyzeBlackness(file, ffmpegPath);
+    return b.blackFraction > 0.95;
+  };
 
+  // Up to 2 passes on the SAME running WE core (the black root cause was the
+  // directory -file, now fixed — no core restart needed). A pre-check black
+  // window or a black recording just reopens the window once.
+  let rawPath = "";
+  let black = true;
+  for (let pass = 0; pass < 2 && black; pass++) {
+    const out = await renderOnce();
+    rawPath = out.rawPath;
+    black = await captureIsBlack(rawPath).catch(() => false);
+    if (black) {
+      onProgress(`black-retry-${pass + 1}`, "reopen window");
+      try { fs.rmSync(rawPath, { force: true }); } catch { /* locked */ }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  if (black) {
+    try { if (rawPath) fs.rmSync(rawPath, { force: true }); } catch { /* locked */ }
+    throw new SceneImportError(
+      "录制画面全黑(已自动重开窗口重试)——请稍候重试或重启 Wallpaper Engine",
+    );
+  }
+
+  try {
     onProgress("processing", `crossfade ${opts.fadeSec}s`);
     const tmpLoop = `${loopPath}.tmp.mp4`;
     await makeSeamless(rawPath, tmpLoop, opts.fadeSec, ffmpegPath);
@@ -224,14 +288,12 @@ export async function importScene(
     fs.renameSync(tmpLoop, loopPath);
     fs.rmSync(rawPath, { force: true });
 
-    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
     enforceLimit(opts.maxCacheBytes);
 
     onProgress("done", loopPath);
-    return { loopPath, posterPath, hash, blackness, fromCache: false };
+    return { loopPath, posterPath, hash, blackness: { blackFraction: black ? 1 : 0, meanLuma: 0, durationSec: opts.duration }, fromCache: false };
   } finally {
-    // If anything above threw, make sure the WE window never lingers.
-    await closeSceneWindow(handle).catch(() => undefined);
+    try { fs.rmSync(rawPath, { force: true }); } catch { /* locked */ }
   }
 }
 

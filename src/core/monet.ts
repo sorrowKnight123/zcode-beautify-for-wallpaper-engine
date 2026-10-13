@@ -36,7 +36,24 @@ const MAX_WIDTH = 2560;
 const JPEG_QUALITY = 82;
 
 export async function loadWallpaper(imagePath: string, maxDimension = MAX_WIDTH): Promise<WallpaperAssets> {
-  const image = await Jimp.read(imagePath);
+  // Raise the decoder memory caps: modern wallpapers (phone shots, 4K PNGs)
+  // blow past the defaults, and the failure mode was nasty — a 4s wait,
+  // then a throw that silently dropped the wallpaper entirely. The typed
+  // options only carry the cap for jpeg; pass it for every decoder (the
+  // png/webp decoders honor the same field) and fall back if one rejects it.
+  const decodeOpts = {
+    "image/jpeg": { maxMemoryUsageInMB: 1024 },
+    "image/png": { maxMemoryUsageInMB: 1024 },
+    "image/webp": { maxMemoryUsageInMB: 1024 },
+    "image/bmp": { maxMemoryUsageInMB: 1024 },
+    "image/tiff": { maxMemoryUsageInMB: 1024 },
+  };
+  let image;
+  try {
+    image = await Jimp.read(imagePath, decodeOpts);
+  } catch {
+    image = await Jimp.read(imagePath);
+  }
 
   // Downscale so the embedded data URI and the quantizer stay fast.
   const { width, height } = image.bitmap;
@@ -111,6 +128,37 @@ function extractSourceColor(bitmap: { width: number; height: number; data: Uint8
   const quantized = QuantizerCelebi.quantize(pixels, 64);
   const ranked = Score.score(quantized);
   return ranked[0] ?? argbFromRgb(103, 80, 164);
+}
+
+/** Up to 8 dominant wallpaper colors as #rrggbb (theme pinning swatches):
+ *  a coarse grid sample quantized by merging near-duplicates, most frequent
+ *  first. Runs on the tiny ffmpeg thumb, so it stays fast. */
+export async function extractPalette(imagePath: string): Promise<string[]> {
+  const image = await Jimp.read(imagePath);
+  const { width, height, data } = image.bitmap;
+  const buckets = new Map<string, { r: number; g: number; b: number; n: number }>();
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 24));
+  for (let y = 0; y < height; y += step) {
+    for (let x = 0; x < width; x += step) {
+      const i = (y * width + x) * 4;
+      if (data[i + 3] < 128) continue;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      // Skip near-black/near-white noise so swatches stay colorful.
+      const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+      if (luma < 24 || luma > 236) continue;
+      const key =  Math.floor(r / 48) + ':' + Math.floor(g / 48) + ':' + Math.floor(b / 48);
+      const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
+      cur.r += r; cur.g += g; cur.b += b; cur.n++;
+      buckets.set(key, cur);
+    }
+  }
+  return [...buckets.values()]
+    .sort((a, b) => b.n - a.n)
+    .slice(0, 8)
+    .map((c) => {
+      const h = (v: number) => Math.round(v / c.n).toString(16).padStart(2, '0');
+      return '#' + h(c.r) + h(c.g) + h(c.b);
+    });
 }
 
 export function argbToCss(argb: number, alpha = 1): string {

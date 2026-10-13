@@ -56,6 +56,7 @@ __export(cdp_exports, {
   buildBootstrapScript: () => buildBootstrapScript,
   buildResetScript: () => buildResetScript,
   injectIntoTarget: () => injectIntoTarget,
+  isUpdaterTarget: () => isUpdaterTarget,
   listTargets: () => listTargets,
   pickRendererTargets: () => pickRendererTargets
 });
@@ -74,6 +75,9 @@ function pickRendererTargets(targets) {
   const pages = targets.filter((t2) => t2.type === "page" && t2.webSocketDebuggerUrl);
   const main2 = pages.filter((t2) => t2.url.includes("out/renderer/index.html") || t2.title === "ZCode");
   return main2.length > 0 ? main2 : pages.filter((t2) => !t2.url.includes("devtools://"));
+}
+function isUpdaterTarget(t2) {
+  return typeof t2.url === "string" && t2.url.includes("windowKind=update-status");
 }
 async function injectIntoTarget(target, payload) {
   const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
@@ -95,11 +99,73 @@ function buildBootstrapScript(payload) {
   const videoSrc = payload.videoSrc ?? "";
   return `(function(){
   var MARKER = ${JSON.stringify(marker)};
+  var STARTUP_CLEAN = ${JSON.stringify(payload.startupClean !== false)};
+  // The startup screen phase (body carries zcode-startup-* but not yet
+  // -ready) shows the loading art \u2014 a wallpaper layer and the panel FAB on
+  // top of it look broken. With startupClean the whole bootstrap (and the
+  // panel) waits for the ready class; without it everything mounts at once.
+  var inStartupScreen = function() {
+    if (!document.body) return true;
+    var cls = document.body.className || '';
+    return /zcode-startup/.test(cls) && !/ready/.test(cls);
+  };
+  var runBootstrapBody = function() {
   if (!window.__zcodeBeautify) window.__zcodeBeautify = {};
   var VIDEO_SRC = ${JSON.stringify(videoSrc)};
-  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)} && window.__zcodeBeautify.videoSrc === VIDEO_SRC) return;
+  var WP_IMG = ${JSON.stringify(payload.wallpaperDataUri ?? "")};
+  var VOL = Math.max(0, Math.min(100, Math.round(${JSON.stringify(payload.videoVolume ?? 0)})));
+  var CHAT = ${JSON.stringify(JSON.stringify(payload.chatLook ?? { chatDim: 0, maskTop: 0, maskBottom: 0, frost: 0 }))};
+  // Volume-only fast path: changing just the audio must not rebuild the
+  // video (instant switch would retire + re-create the decoder). VOL must be
+  // declared ABOVE this block \u2014 it used to sit below the fast path, which
+  // therefore read undefined, unmuted the video and wrote NaN volume (the
+  // serve-side volume re-evaluate fallback was masking exactly this).
+  if (VIDEO_SRC && VOL !== (window.__zcodeBeautify.vol ?? 0)
+      && window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)}
+      && window.__zcodeBeautify.videoSrc === VIDEO_SRC
+      && window.__zcodeBeautify.kb === ${JSON.stringify(Boolean(payload.kenBurns))}) {
+    var liveVid = document.getElementById(MARKER + '-video');
+    if (liveVid) {
+      liveVid.muted = VOL === 0;
+      liveVid.volume = VOL / 100;
+      liveVid.play().catch(function() {});
+    }
+    window.__zcodeBeautify.vol = VOL;
+    if (window.__zcodeBeautify.chatKey !== CHAT) {
+      window.__zcodeBeautify.chatKey = CHAT;
+      applyChatLook();
+    }
+    return;
+  }
+
+  // Chat-look fast path: the zone masks are standalone CSS-var layers, so a
+  // slider drag must not replay the wallpaper transition. When ONLY the chat
+  // look changed (wallpaper state identical + style element alive), apply it
+  // and bail before any wallpaper work.
+  if (window.__zcodeBeautify.chatKey !== CHAT) {
+    var chatOnly = window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)}
+      && window.__zcodeBeautify.videoSrc === VIDEO_SRC
+      && window.__zcodeBeautify.wpImg === WP_IMG
+      && window.__zcodeBeautify.kb === ${JSON.stringify(Boolean(payload.kenBurns))}
+      && window.__zcodeBeautify.vol === VOL
+      && document.getElementById(MARKER + '-style');
+    window.__zcodeBeautify.chatKey = CHAT;
+    applyChatLook();
+    if (chatOnly) return;
+  }
+
+  // State alone is not proof the DOM work succeeded: an earlier run may have
+  // died halfway (e.g. aborted mid-transition) leaving state set but no style
+  // element \u2014 without the element check every later injection would silently
+  // no-op and the page would never heal. kb participates too: toggling Ken
+  // Burns alone changes no CSS, and without it the toggle would early-return
+  // before applyKb ever runs.
+  if (window.__zcodeBeautify.cssText === ${JSON.stringify(payload.css)} && window.__zcodeBeautify.videoSrc === VIDEO_SRC && window.__zcodeBeautify.wpImg === WP_IMG && window.__zcodeBeautify.kb === ${JSON.stringify(Boolean(payload.kenBurns))} && window.__zcodeBeautify.vol === VOL && document.getElementById(MARKER + '-style')) return;
   window.__zcodeBeautify.cssText = ${JSON.stringify(payload.css)};
   window.__zcodeBeautify.videoSrc = VIDEO_SRC;
+  window.__zcodeBeautify.wpImg = WP_IMG;
+  window.__zcodeBeautify.kb = ${JSON.stringify(Boolean(payload.kenBurns))};
+  window.__zcodeBeautify.vol = VOL;
 
   var style = document.getElementById(MARKER + '-style');
   if (!style) {
@@ -107,43 +173,242 @@ function buildBootstrapScript(payload) {
     style.id = MARKER + '-style';
     (document.head || document.documentElement).appendChild(style);
   }
-  style.textContent = ${JSON.stringify(payload.css)};
+  // Theme CSS (Monet palette) invalidates the WHOLE document's styles; applying
+  // it mid-animation costs a 50-80ms main-thread task that stutters the effect.
+  // When a transition plays, the swap is deferred to the promote step; instant
+  // switches apply it right away. Base wallpaper rules are identical between
+  // injections, so holding the old content for one transition is safe.
+  var CSS_TEXT = ${JSON.stringify(payload.css)};
+  var cssDeferred = false;
 
+  // --- wallpaper application with transition effect --------------------------
+  // The OLD content stays visible while a temporary overlay carrying the NEW
+  // wallpaper animates in on top; on completion the new content is promoted
+  // into the main layer and the overlay removed. TRANSITION picks the effect:
+  // fade (crossfade), slide (new wallpaper sweeps in from the right), zoom
+  // (scales down while fading in), blur (sharpens while fading in), or none
+  // (instant swap). The first injection (nothing on screen yet) and every
+  // change from a blank state apply instantly. The overlay is a plain child
+  // of the wallpaper layer, so the ::after dim mask keeps painting above it.
   var wp = document.getElementById(MARKER + '-wallpaper');
-  if (${JSON.stringify(Boolean(payload.wallpaperDataUri))} || VIDEO_SRC) {
-    if (!wp) {
-      wp = document.createElement('div');
-      wp.id = MARKER + '-wallpaper';
-      document.documentElement.appendChild(wp);
+  var HAS_NEW = ${JSON.stringify(Boolean(payload.wallpaperDataUri))} || VIDEO_SRC;
+  var TRANSITION = ${JSON.stringify(payload.transition ?? "fade")};
+  var KB_ON = ${JSON.stringify(Boolean(payload.kenBurns))} && !VIDEO_SRC;
+  /** Ken Burns breathing on the settled wallpaper layer (image only): the
+   *  running animation's transform outranks the stylesheet's static scale,
+   *  and the payload only arms it when blur is off, so the two never fight.
+   *  Re-assigning the same animation is a no-op \u2014 clear + reflow restarts it
+   *  so every switch begins the pan from its first keyframe. */
+  var applyKb = function(on) {
+    if (!wp) return;
+    if (!on) {
+      wp.style.animation = '';
+      return;
+    }
+    wp.style.animation = 'none';
+    void wp.offsetWidth;
+    wp.style.animation = MARKER + '-kb 26s ease-in-out infinite alternate';
+  };
+  if (HAS_NEW && !wp) {
+    wp = document.createElement('div');
+    wp.id = MARKER + '-wallpaper';
+    document.documentElement.appendChild(wp);
+  }
+  // A transition still in flight (rapid switches) is promoted immediately
+  // first so only one overlay ever exists.
+  if (window.__zcodeBeautify.finishFade) window.__zcodeBeautify.finishFade();
+
+  // Retiring a video pauses and hides it but leaves the element in the DOM:
+  // detaching a video's compositor surface mid-transition makes Windows flash
+  // a black rectangle on screen (invisible to CDP captures, very visible to
+  // the user). The retired element is swept at the START of the next switch,
+  // when the fresh transition masks any surface churn. Clearing src + load()
+  // also RELEASES the hardware decoder session right away \u2014 a paused <video>
+  // keeps its decoder (and its GPU budget) alive until unloaded.
+  var retireVideo = function(v) {
+    if (!v) return;
+    v.removeAttribute('id');
+    try { v.pause(); } catch (e) {}
+    try { v.removeAttribute('src'); v.load(); } catch (e) {}
+    v.style.opacity = '0';
+    v.style.pointerEvents = 'none';
+    v.dataset.zbRetired = '1';
+  };
+  if (wp) {
+    var strays = wp.querySelectorAll('video');
+    for (var si = 0; si < strays.length; si++) {
+      var sv = strays[si];
+      if (sv.id !== MARKER + '-video' || sv.dataset.zbRetired) sv.remove();
     }
   }
-  var vid = document.getElementById(MARKER + '-video');
-  if (VIDEO_SRC) {
-    wp.style.backgroundImage = 'none';
-    if (!vid) {
-      vid = document.createElement('video');
-      vid.id = MARKER + '-video';
-      vid.setAttribute('autoplay', '');
-      vid.setAttribute('loop', '');
-      vid.setAttribute('muted', '');
-      vid.setAttribute('playsinline', '');
-      vid.muted = true;
-      vid.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';
-      wp.appendChild(vid);
-    }
-    if (vid.getAttribute('src') !== VIDEO_SRC) {
-      vid.setAttribute('src', VIDEO_SRC);
-      vid.load();
-    }
-    vid.play().catch(function() {});
+
+  if (!HAS_NEW) {
+    if (wp) wp.remove();
   } else {
-    if (vid) vid.remove();
-    if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
-      wp.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
-    } else if (wp) {
-      wp.remove();
+    var oldVid = document.getElementById(MARKER + '-video');
+    var oldImg = wp.style.backgroundImage && wp.style.backgroundImage !== 'none';
+    var animate = Boolean((oldVid || oldImg) && TRANSITION !== 'none');
+
+    // The image transition runs on a temporary overlay div. Videos NEVER live
+    // in that overlay: promote would have to reparent the <video> into the
+    // wallpaper layer, and reparenting (or removing) a playing video rebuilds
+    // its compositor surface \u2014 the black flash this whole block exists to
+    // avoid. A transition video is born inside the wallpaper layer, parked at
+    // opacity 0, and the effect animation runs on the element itself.
+    // Keyframes live OUTSIDE the animate branch: applyKb at the tail needs
+    // -kb on instant switches too (first apply, transition "none").
+    if (!document.getElementById(MARKER + '-fade-style')) {
+      var fs = document.createElement('style');
+      fs.id = MARKER + '-fade-style';
+      fs.textContent = ''
+        + '@keyframes ' + MARKER + '-fx-fade { from { opacity: 0; } to { opacity: 1; } }'
+        + '@keyframes ' + MARKER + '-fx-slide { from { transform: translateX(100%); } to { transform: translateX(0); } }'
+        + '@keyframes ' + MARKER + '-fx-zoom { from { opacity: 0; transform: scale(1.15); } to { opacity: 1; transform: scale(1); } }'
+        + '@keyframes ' + MARKER + '-fx-blur { from { opacity: 0; filter: blur(24px); } to { opacity: 1; filter: blur(0px); } }'
+        + '@keyframes ' + MARKER + '-kb { from { transform: scale(1) translate(0%, 0%); } to { transform: scale(1.08) translate(-1.6%, -1.1%); } }';
+      (document.head || document.documentElement).appendChild(fs);
+    }
+    var holder = null;
+    var vidBase = 'position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';
+    var vidFx = '';
+    // blur(24px) is a per-frame GPU filter over the FULL screen \u2014 on a video
+    // target it costs far more than the crossfade look justifies. Filter-type
+    // effects downgrade to the compositor-cheap fade; transform/opacity ones
+    // (slide/zoom) stay.
+    var EFFECT = VIDEO_SRC && TRANSITION === 'blur' ? 'fade' : TRANSITION;
+    if (animate) {
+      cssDeferred = true; // theme swap moves to promote(); see CSS_TEXT above
+      if (EFFECT === 'slide') {
+        vidFx = 'animation:' + MARKER + '-fx-slide 650ms cubic-bezier(.22,.61,.36,1) forwards;';
+      } else if (EFFECT === 'zoom') {
+        vidFx = 'opacity:0;animation:' + MARKER + '-fx-zoom 650ms ease forwards;';
+      } else if (EFFECT === 'blur') {
+        vidFx = 'opacity:0;animation:' + MARKER + '-fx-blur 650ms ease forwards;';
+      } else {
+        vidFx = 'opacity:0;animation:' + MARKER + '-fx-fade 650ms ease forwards;';
+      }
+      if (!VIDEO_SRC) {
+        holder = document.createElement('div');
+        holder.id = MARKER + '-fade';
+        // Parked invisible at first; the animation css (below) is applied only
+        // once the new content has decoded, so decoder spin-up long tasks land
+        // while the screen is still static instead of stuttering the motion.
+        // CSS animations (compositor-driven for opacity/transform) instead of
+        // JS-started transitions: throttled/occluded renderers never fire rAF
+        // and delay timers past 1s \u2014 animations keep running.
+        var fxBase = 'position:absolute;inset:0;background-size:inherit;background-position:inherit;background-repeat:inherit;';
+        var fxAnim = vidFx;
+        holder.style.cssText = fxBase + 'opacity:0;';
+        wp.appendChild(holder);
+      }
+    }
+
+    var newVid = null;
+    if (VIDEO_SRC) {
+      var nv = document.createElement('video');
+      // NO autoplay attribute: the element must stay parked until the
+      // transition arms (autoplay would start playback on attach and defeat
+      // the single-decoder warm-up).
+      nv.setAttribute('loop', '');
+      nv.setAttribute('playsinline', '');
+      // Born in the wallpaper layer \u2014 its final home. NOT playing yet: the
+      // warm-up only needs the FIRST frame (preload decodes it), so the old
+      // wallpaper keeps the only active decoder until the animation starts.
+      // Two parallel 1080p decodes during warm-up was a real GPU spike.
+      nv.setAttribute('preload', 'auto');
+      nv.muted = VOL === 0;
+      nv.volume = VOL / 100;
+      nv.style.cssText = vidBase + (animate ? 'opacity:0;' : '');
+      nv.setAttribute('src', VIDEO_SRC);
+      nv.load();
+      wp.appendChild(nv);
+      newVid = nv;
+      if (!animate) {
+        retireVideo(document.getElementById(MARKER + '-video'));
+        nv.id = MARKER + '-video';
+        nv.play().catch(function() {});
+        applyKb(false);
+      }
+    } else if (${JSON.stringify(Boolean(payload.wallpaperDataUri))}) {
+      if (!holder) holder = wp; // instant image switch paints the main layer directly
+      holder.style.backgroundImage = 'url(' + ${JSON.stringify(payload.wallpaperDataUri ?? "")} + ')';
+    }
+
+    if (animate) {
+      var overlay = holder; // null for video switches: the video animates itself
+      var done = false;
+      var started = false;
+      var promote = function() {
+        if (done) return;
+        done = true;
+        window.__zcodeBeautify.finishFade = null;
+        style.textContent = CSS_TEXT; // deferred theme swap \u2014 motion is over
+        // The outgoing video is retired, not removed \u2014 see retireVideo.
+        retireVideo(document.getElementById(MARKER + '-video'));
+        if (VIDEO_SRC) {
+          wp.style.backgroundImage = 'none';
+          applyKb(false);
+          if (newVid) {
+            newVid.id = MARKER + '-video';
+            // Settle in place (opacity 1, animation styles dropped). No DOM
+            // move: reparenting would rebuild the video surface.
+            newVid.style.cssText = vidBase;
+            newVid.play().catch(function() {});
+          }
+        } else if (overlay && overlay.parentNode) {
+          wp.style.backgroundImage = overlay.style.backgroundImage;
+          overlay.remove();
+          applyKb(KB_ON);
+        }
+      };
+      window.__zcodeBeautify.finishFade = promote;
+      var startAnim = function() {
+        if (started || done) return;
+        started = true;
+        if (overlay) {
+          // cssText is replaced wholesale to arm the animation \u2014 the parked
+          // background image (set before parking) must survive that swap, or
+          // the effect animates an empty layer and promote clears the wallpaper
+          // (every other image click failed exactly this way).
+          var parkedBg = overlay.style.backgroundImage;
+          overlay.style.cssText = fxBase + fxAnim;
+          overlay.style.backgroundImage = parkedBg;
+          overlay.addEventListener('animationend', promote);
+        } else if (newVid) {
+          newVid.style.cssText = vidBase + vidFx;
+          // Playback starts WITH the animation \u2014 the parked element held no
+          // decoder session until this exact moment.
+          newVid.play().catch(function() {});
+          newVid.addEventListener('animationend', promote);
+        }
+        setTimeout(promote, 780);
+      };
+      // Warm the new content first: a parked (paused) video needs
+      // readyState >= 2 \u2014 the first frame decoded and renderable \u2014 before the
+      // animation exposes it (requestVideoFrameCallback is playback-driven
+      // and never fires while parked). Images wait for decode(). A timeout
+      // keeps the switch landing even if the event never fires.
+      if (newVid) {
+        if (newVid.readyState >= 2) startAnim();
+        else {
+          newVid.addEventListener('loadeddata', startAnim);
+          setTimeout(startAnim, 900);
+        }
+      } else {
+        var im = new Image();
+        var imSrc = overlay.style.backgroundImage.replace(/^url\\(["']?/, '').replace(/["']?\\)$/, '');
+        var warm = function() { if (im.decode) im.decode().then(startAnim, startAnim); else startAnim(); };
+        im.onload = warm;
+        im.onerror = startAnim;
+        im.src = imSrc;
+        setTimeout(startAnim, 600);
+      }
     }
   }
+
+  if (!cssDeferred) style.textContent = CSS_TEXT;
+  // Instant switches (and option-only pushes) settle Ken Burns right away.
+  if (HAS_NEW) applyKb(KB_ON);
 
   var FIT = ${JSON.stringify(payload.fit ?? "cover")};
   var bp = document.getElementById(MARKER + '-backdrop');
@@ -157,6 +422,79 @@ function buildBootstrapScript(payload) {
     bp.dataset.on = '1';
   } else if (bp) {
     bp.dataset.on = '0';
+  }
+
+  // --- chat-area zone look (\u804A\u5929\u754C\u9762) ----------------------------------------
+  // Four independent masks layered OVER the wallpaper but UNDER the UI (same
+  // stacking model as the dim ::after): a white frost sheet, a top/bottom
+  // edge gradient, and an extra darkening behind the conversation column \u2014
+  // set as the scroller's own background so messages stay readable above it.
+  // All are static composited layers; no per-frame cost.
+  window.__zcodeBeautify.chatKey = CHAT;
+  applyChatLook();
+
+  function applyChatLook() {
+    var C;
+    try { C = JSON.parse(CHAT); } catch (e) { return; }
+    var anyOn = C.chatDim > 0 || C.maskTop > 0 || C.maskBottom > 0 || C.frost > 0;
+    var st = document.getElementById(MARKER + '-chatlook-style');
+    var fr = document.getElementById(MARKER + '-frost');
+    var zm = document.getElementById(MARKER + '-zonemask');
+    if (!anyOn) {
+      if (st) st.remove();
+      if (fr) fr.remove();
+      if (zm) zm.remove();
+      if (window.__zcodeBeautify.chatObs) {
+        try { window.__zcodeBeautify.chatObs.disconnect(); } catch (e) {}
+        window.__zcodeBeautify.chatObs = null;
+      }
+      return;
+    }
+    if (!st) {
+      st = document.createElement('style');
+      st.id = MARKER + '-chatlook-style';
+      (document.head || document.documentElement).appendChild(st);
+    }
+    st.textContent = ':root{--zb-chat-dim:' + (C.chatDim / 100) + ';--zb-mask-top:' + (C.maskTop / 100)
+      + ';--zb-mask-bot:' + (C.maskBottom / 100) + ';--zb-frost:' + (C.frost / 100) + '}'
+      + '#' + MARKER + '-frost{position:fixed;inset:0;z-index:-2147483645;pointer-events:none;background:rgb(255 255 255 / var(--zb-frost))}'
+      + '#' + MARKER + '-zonemask{position:fixed;inset:0;z-index:-2147483644;pointer-events:none;'
+      + 'background:linear-gradient(to bottom,rgb(0 0 0 / var(--zb-mask-top)),rgb(0 0 0 / 0) 30%,rgb(0 0 0 / 0) 70%,rgb(0 0 0 / var(--zb-mask-bot)))}'
+      // The conversation scroller carries distinctive Tailwind arbitrary
+      // classes; .zb-chat-col is the version-proof fallback (markChatCol).
+      + 'div[class*="scrollbar-gutter:stable"][class*="overflow-y-auto"],.zb-chat-col'
+      + '{background-color:rgb(0 0 0 / var(--zb-chat-dim)) !important}';
+    if (!fr) { fr = document.createElement('div'); fr.id = MARKER + '-frost'; }
+    if (!zm) { zm = document.createElement('div'); zm.id = MARKER + '-zonemask'; }
+    document.documentElement.appendChild(fr);
+    document.documentElement.appendChild(zm);
+    // Route changes (chat <-> settings) recreate the column, so keep tagging
+    // it while the darkening is on. rAF-coalesced: streaming mutates a lot.
+    if (C.chatDim > 0 && !window.__zcodeBeautify.chatObs) {
+      markChatCol();
+      var chatPend = false;
+      var obs = new MutationObserver(function() {
+        if (chatPend) return;
+        chatPend = true;
+        requestAnimationFrame(function() { chatPend = false; markChatCol(); });
+      });
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+      window.__zcodeBeautify.chatObs = obs;
+    }
+  }
+  // The composer's first TALL scroll ancestor is the conversation column.
+  // (Not the composer itself \u2014 it is a small overflow-y-auto editor.)
+  function markChatCol() {
+    var el = document.querySelector('[contenteditable="true"]');
+    el = el && el.parentElement;
+    while (el && el !== document.body) {
+      var oy = getComputedStyle(el).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && el.getBoundingClientRect().height > 300) {
+        if (!el.classList.contains('zb-chat-col')) el.classList.add('zb-chat-col');
+        return;
+      }
+      el = el.parentElement;
+    }
   }
 
   // Keep the loop alive. Chromium's media suspension can freeze a nominally
@@ -188,7 +526,7 @@ function buildBootstrapScript(payload) {
       if (!v) return;
       var S = window.__zcodeBeautify;
       if (document.hidden) { S.lastClock = -1; return; }
-      if (v.ended || (v.paused && v.autoplay)) {
+      if (v.ended || v.paused) {
         S.stallCount = 0;
         v.play().catch(function() {});
       } else if (!v.paused && v.readyState >= 2 && S.lastClock === v.currentTime) {
@@ -211,14 +549,52 @@ function buildBootstrapScript(payload) {
     localStorage.setItem(MARKER + ':css', ${JSON.stringify(payload.css)});
     localStorage.setItem(MARKER + ':wallpaper', ${JSON.stringify(payload.wallpaperDataUri ?? "")});
   } catch (e) {}
+  };
+  var runBootstrap = function() {
+    if (!STARTUP_CLEAN || !inStartupScreen()) { runBootstrapBody(); return; }
+    if (window.__zcodeBeautify.startupMO) return; // a waiter is already armed
+    var mo = new MutationObserver(function() {
+      if (!inStartupScreen()) {
+        mo.disconnect();
+        window.__zcodeBeautify.startupMO = null;
+        runBootstrapBody();
+      }
+    });
+    window.__zcodeBeautify.startupMO = mo;
+    mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+  };
+  // The addScriptToEvaluateOnNewDocument registration replays at document
+  // creation, where documentElement is still null \u2014 appending the style or
+  // wallpaper there throws and kills the run before anything mounts. Wait
+  // for the parser to produce a root element (a few ms at most).
+  if (document.documentElement) runBootstrap();
+  else {
+    var zbWaitMount = function() {
+      if (document.documentElement) runBootstrap();
+      else setTimeout(zbWaitMount, 10);
+    };
+    zbWaitMount();
+  }
 })();`;
 }
 function buildResetScript(marker = "zcode-beautify") {
   return `(function(){
   document.getElementById(${JSON.stringify(marker)} + '-style')?.remove();
+  document.getElementById(${JSON.stringify(marker)} + '-fade-style')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-wallpaper')?.remove();
   document.getElementById(${JSON.stringify(marker)} + '-backdrop')?.remove();
-  if (window.__zcodeBeautify) { window.__zcodeBeautify.cssText = null; window.__zcodeBeautify.videoSrc = null; }
+  document.getElementById(${JSON.stringify(marker)} + '-chatlook-style')?.remove();
+  document.getElementById(${JSON.stringify(marker)} + '-frost')?.remove();
+  document.getElementById(${JSON.stringify(marker)} + '-zonemask')?.remove();
+  if (window.__zcodeBeautify) {
+    window.__zcodeBeautify.cssText = null; window.__zcodeBeautify.videoSrc = null;
+    window.__zcodeBeautify.wpImg = null; window.__zcodeBeautify.finishFade = null;
+    window.__zcodeBeautify.chatKey = null;
+    if (window.__zcodeBeautify.chatObs) {
+      try { window.__zcodeBeautify.chatObs.disconnect(); } catch (e) {}
+      window.__zcodeBeautify.chatObs = null;
+    }
+  }
 })();`;
 }
 var CdpError, CdpConnection;
@@ -6100,7 +6476,7 @@ var require_gifframe = __commonJS({
 var require_gifutil = __commonJS({
   "node_modules/gifwrap/src/gifutil.js"(exports) {
     "use strict";
-    var fs13 = __require("fs");
+    var fs14 = __require("fs");
     var ImageQ = require_image_q();
     var BitmapImage2 = require_bitmapimage();
     var { GifFrame: GifFrame2 } = require_gifframe();
@@ -6215,14 +6591,14 @@ var require_gifutil = __commonJS({
       jimpImage.bitmap.data = bitmapImageToShare.bitmap.data;
       return jimpImage;
     };
-    exports.write = function(path12, frames, spec, encoder) {
+    exports.write = function(path14, frames, spec, encoder) {
       encoder = encoder || defaultCodec;
-      const matches = path12.match(/\.[a-zA-Z]+$/);
+      const matches = path14.match(/\.[a-zA-Z]+$/);
       if (matches !== null && INVALID_SUFFIXES.includes(matches[0].toLowerCase())) {
-        throw new Error(`GIF '${path12}' has an unexpected suffix`);
+        throw new Error(`GIF '${path14}' has an unexpected suffix`);
       }
       return encoder.encodeGif(frames, spec).then((gif2) => {
-        return _writeBinary(path12, gif2.buffer).then(() => {
+        return _writeBinary(path14, gif2.buffer).then(() => {
           return gif2;
         });
       });
@@ -6294,9 +6670,9 @@ var require_gifutil = __commonJS({
         }
       }
     }
-    function _readBinary(path12) {
+    function _readBinary(path14) {
       return new Promise((resolve, reject) => {
-        fs13.readFile(path12, (err, buffer) => {
+        fs14.readFile(path14, (err, buffer) => {
           if (err) {
             return reject(err);
           }
@@ -6304,9 +6680,9 @@ var require_gifutil = __commonJS({
         });
       });
     }
-    function _writeBinary(path12, buffer) {
+    function _writeBinary(path14, buffer) {
       return new Promise((resolve, reject) => {
-        fs13.writeFile(path12, buffer, (err) => {
+        fs14.writeFile(path14, buffer, (err) => {
           if (err) {
             return reject(err);
           }
@@ -8317,9 +8693,9 @@ var require_decoder = __commonJS({
         return a2 < 0 ? 0 : a2 > 255 ? 255 : a2;
       }
       constructor.prototype = {
-        load: function load(path12) {
+        load: function load(path14) {
           var xhr = new XMLHttpRequest();
-          xhr.open("GET", path12, true);
+          xhr.open("GET", path14, true);
           xhr.responseType = "arraybuffer";
           xhr.onload = (function() {
             var data = new Uint8Array(xhr.response || xhr.mozResponseArrayBuffer);
@@ -19222,8 +19598,8 @@ var init_parseUtil = __esm({
     init_errors();
     init_en();
     makeIssue = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -19531,11 +19907,11 @@ var init_types2 = __esm({
     init_parseUtil();
     init_util();
     ParseInputLazyPath = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -23348,8 +23724,8 @@ var init_parseUtil2 = __esm({
     init_errors2();
     init_en2();
     makeIssue2 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -23657,11 +24033,11 @@ var init_types3 = __esm({
     init_parseUtil2();
     init_util2();
     ParseInputLazyPath2 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -28259,8 +28635,8 @@ var init_parseUtil3 = __esm({
     init_errors3();
     init_en3();
     makeIssue3 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -28568,11 +28944,11 @@ var init_types4 = __esm({
     init_parseUtil3();
     init_util3();
     ParseInputLazyPath3 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -32413,8 +32789,8 @@ var init_parseUtil4 = __esm({
     init_errors4();
     init_en4();
     makeIssue4 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -32722,11 +33098,11 @@ var init_types5 = __esm({
     init_parseUtil4();
     init_util4();
     ParseInputLazyPath4 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -36849,11 +37225,11 @@ var require_Mime = __commonJS({
         }
       }
     };
-    Mime.prototype.getType = function(path12) {
-      path12 = String(path12);
-      let last = path12.replace(/^.*[/\\]/, "").toLowerCase();
+    Mime.prototype.getType = function(path14) {
+      path14 = String(path14);
+      let last = path14.replace(/^.*[/\\]/, "").toLowerCase();
       let ext = last.replace(/^.*\./, "").toLowerCase();
-      let hasPath = last.length < path12.length;
+      let hasPath = last.length < path14.length;
       let hasDot = ext.length < last.length - 1;
       return (hasDot || !hasPath) && this._types[ext] || null;
     };
@@ -43391,8 +43767,8 @@ function isTokenizerStreamBoundsError(error) {
   }
   return /strtok3[/\\]lib[/\\]stream[/\\]/.test(error.stack);
 }
-async function fileTypeFromFile(path12, options) {
-  return new FileTypeParser2(options).fromFile(path12, options);
+async function fileTypeFromFile(path14, options) {
+  return new FileTypeParser2(options).fromFile(path14, options);
 }
 async function fileTypeFromStream(stream, options) {
   return new FileTypeParser2(options).fromStream(stream);
@@ -43423,9 +43799,9 @@ var init_file_type = __esm({
           }
         }
       }
-      async fromFile(path12) {
+      async fromFile(path14) {
         this.options.signal?.throwIfAborted();
-        const fileHandle = await fs2.open(path12, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
+        const fileHandle = await fs2.open(path14, fileSystemConstants.O_RDONLY | fileSystemConstants.O_NONBLOCK);
         const fileStat = await fileHandle.stat();
         if (!fileStat.isFile()) {
           await fileHandle.close();
@@ -43434,7 +43810,7 @@ var init_file_type = __esm({
         const tokenizer = new FileTokenizer(fileHandle, {
           ...this.getTokenizerOptions(),
           fileInfo: {
-            path: path12,
+            path: path14,
             size: fileStat.size
           }
         });
@@ -43769,9 +44145,9 @@ function createJimp({ plugins: pluginsArg, formats: formatsArg } = {}) {
      * await image.write("test/output.png");
      * ```
      */
-    async write(path12, options) {
-      const mimeType = import_lite.default.getType(path12);
-      await writeFile(path12, await this.getBuffer(mimeType, options));
+    async write(path14, options) {
+      const mimeType = import_lite.default.getType(path14);
+      await writeFile(path14, await this.getBuffer(mimeType, options));
     }
     /**
      * Clone the image into a new Jimp instance.
@@ -44420,8 +44796,8 @@ var init_parseUtil5 = __esm({
     init_errors5();
     init_en5();
     makeIssue5 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -44729,11 +45105,11 @@ var init_types6 = __esm({
     init_parseUtil5();
     init_util6();
     ParseInputLazyPath5 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -49178,8 +49554,8 @@ var init_parseUtil6 = __esm({
     init_errors6();
     init_en6();
     makeIssue6 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -49487,11 +49863,11 @@ var init_types7 = __esm({
     init_parseUtil6();
     init_util7();
     ParseInputLazyPath6 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -53345,8 +53721,8 @@ var init_parseUtil7 = __esm({
     init_errors7();
     init_en7();
     makeIssue7 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -53654,11 +54030,11 @@ var init_types8 = __esm({
     init_parseUtil7();
     init_util8();
     ParseInputLazyPath7 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -57639,8 +58015,8 @@ var init_parseUtil8 = __esm({
     init_errors8();
     init_en8();
     makeIssue8 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -57948,11 +58324,11 @@ var init_types9 = __esm({
     init_parseUtil8();
     init_util9();
     ParseInputLazyPath8 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -61801,8 +62177,8 @@ var init_parseUtil9 = __esm({
     init_errors9();
     init_en9();
     makeIssue9 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -62110,11 +62486,11 @@ var init_types10 = __esm({
     init_parseUtil9();
     init_util10();
     ParseInputLazyPath9 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -66000,8 +66376,8 @@ var init_parseUtil10 = __esm({
     init_errors10();
     init_en10();
     makeIssue10 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -66309,11 +66685,11 @@ var init_types11 = __esm({
     init_parseUtil10();
     init_util11();
     ParseInputLazyPath10 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -70151,8 +70527,8 @@ var init_parseUtil11 = __esm({
     init_errors11();
     init_en11();
     makeIssue11 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -70460,11 +70836,11 @@ var init_types12 = __esm({
     init_parseUtil11();
     init_util12();
     ParseInputLazyPath11 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -74537,8 +74913,8 @@ var init_parseUtil12 = __esm({
     init_errors12();
     init_en12();
     makeIssue12 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -74846,11 +75222,11 @@ var init_types13 = __esm({
     init_parseUtil12();
     init_util13();
     ParseInputLazyPath12 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -78707,8 +79083,8 @@ var init_parseUtil13 = __esm({
     init_errors13();
     init_en13();
     makeIssue13 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -79016,11 +79392,11 @@ var init_types14 = __esm({
     init_parseUtil13();
     init_util14();
     ParseInputLazyPath13 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -83034,8 +83410,8 @@ var init_parseUtil14 = __esm({
     init_errors14();
     init_en14();
     makeIssue14 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -83343,11 +83719,11 @@ var init_types16 = __esm({
     init_parseUtil14();
     init_util15();
     ParseInputLazyPath14 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -87311,8 +87687,8 @@ var init_parseUtil15 = __esm({
     init_errors15();
     init_en15();
     makeIssue15 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -87620,11 +87996,11 @@ var init_types17 = __esm({
     init_parseUtil15();
     init_util16();
     ParseInputLazyPath15 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -94361,8 +94737,8 @@ var init_parseUtil16 = __esm({
     init_errors16();
     init_en16();
     makeIssue16 = (params) => {
-      const { data, path: path12, errorMaps, issueData } = params;
-      const fullPath = [...path12, ...issueData.path || []];
+      const { data, path: path14, errorMaps, issueData } = params;
+      const fullPath = [...path14, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -94670,11 +95046,11 @@ var init_types18 = __esm({
     init_parseUtil16();
     init_util17();
     ParseInputLazyPath16 = class {
-      constructor(parent, value, path12, key) {
+      constructor(parent, value, path14, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path12;
+        this._path = path14;
         this._key = key;
       }
       get path() {
@@ -109648,7 +110024,19 @@ var init_material_color_utilities = __esm({
 
 // dist/core/monet.js
 async function loadWallpaper(imagePath, maxDimension = MAX_WIDTH) {
-  const image2 = await Jimp.read(imagePath);
+  const decodeOpts = {
+    "image/jpeg": { maxMemoryUsageInMB: 1024 },
+    "image/png": { maxMemoryUsageInMB: 1024 },
+    "image/webp": { maxMemoryUsageInMB: 1024 },
+    "image/bmp": { maxMemoryUsageInMB: 1024 },
+    "image/tiff": { maxMemoryUsageInMB: 1024 }
+  };
+  let image2;
+  try {
+    image2 = await Jimp.read(imagePath, decodeOpts);
+  } catch {
+    image2 = await Jimp.read(imagePath);
+  }
   const { width, height } = image2.bitmap;
   if (Math.max(width, height) > maxDimension) {
     const scale = maxDimension / Math.max(width, height);
@@ -109713,6 +110101,34 @@ function extractSourceColor(bitmap) {
   const quantized = QuantizerCelebi.quantize(pixels, 64);
   const ranked = Score.score(quantized);
   return ranked[0] ?? argbFromRgb(103, 80, 164);
+}
+async function extractPalette(imagePath) {
+  const image2 = await Jimp.read(imagePath);
+  const { width, height, data } = image2.bitmap;
+  const buckets = /* @__PURE__ */ new Map();
+  const step = Math.max(1, Math.floor(Math.min(width, height) / 24));
+  for (let y2 = 0; y2 < height; y2 += step) {
+    for (let x2 = 0; x2 < width; x2 += step) {
+      const i2 = (y2 * width + x2) * 4;
+      if (data[i2 + 3] < 128)
+        continue;
+      const r2 = data[i2], g = data[i2 + 1], b = data[i2 + 2];
+      const luma = 0.299 * r2 + 0.587 * g + 0.114 * b;
+      if (luma < 24 || luma > 236)
+        continue;
+      const key = Math.floor(r2 / 48) + ":" + Math.floor(g / 48) + ":" + Math.floor(b / 48);
+      const cur = buckets.get(key) || { r: 0, g: 0, b: 0, n: 0 };
+      cur.r += r2;
+      cur.g += g;
+      cur.b += b;
+      cur.n++;
+      buckets.set(key, cur);
+    }
+  }
+  return [...buckets.values()].sort((a2, b) => b.n - a2.n).slice(0, 8).map((c3) => {
+    const h = (v) => Math.round(v / c3.n).toString(16).padStart(2, "0");
+    return "#" + h(c3.r) + h(c3.g) + h(c3.b);
+  });
 }
 function argbToCss(argb, alpha = 1) {
   const r2 = (argb & 16711680) >> 16;
@@ -109830,9 +110246,193 @@ var init_tokens = __esm({
   }
 });
 
+// dist/core/launch.js
+var launch_exports = {};
+__export(launch_exports, {
+  configFile: () => configFile,
+  dataDir: () => dataDir,
+  findZcodeExecutable: () => findZcodeExecutable,
+  isZcodeProcessRunning: () => isZcodeProcessRunning,
+  launchZcode: () => launchZcode,
+  loadConfig: () => loadConfig,
+  saveConfig: () => saveConfig
+});
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
+import fs3 from "node:fs";
+import os from "node:os";
+import path from "node:path";
+function dataDir() {
+  return process.env.ZCODE_BEAUTIFY_DATA_DIR ?? path.join(os.homedir(), ".zcode", "cli", "plugins", "data", "zcode-beautify");
+}
+function configFile() {
+  return path.join(dataDir(), "config.json");
+}
+function loadConfig() {
+  try {
+    return JSON.parse(fs3.readFileSync(configFile(), "utf8"));
+  } catch (err) {
+    if (err.code !== "ENOENT") {
+      try {
+        fs3.copyFileSync(configFile(), configFile() + `.corrupt-${Date.now().toString(36)}`);
+      } catch {
+      }
+    }
+    return {};
+  }
+}
+function withConfigLock(fn) {
+  const lock = configFile() + ".lock";
+  fs3.mkdirSync(dataDir(), { recursive: true });
+  const deadline = Date.now() + 1500;
+  let fd = null;
+  for (; ; ) {
+    try {
+      fd = fs3.openSync(lock, "wx");
+      break;
+    } catch {
+      try {
+        const age = Date.now() - fs3.statSync(lock).mtimeMs;
+        if (age > 5e3) {
+          fs3.rmSync(lock, { force: true });
+          continue;
+        }
+      } catch {
+      }
+      if (Date.now() > deadline)
+        return fn();
+      const waitMs = Date.now();
+      while (Date.now() - waitMs < 20) {
+      }
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    try {
+      fs3.closeSync(fd);
+    } catch {
+    }
+    try {
+      fs3.rmSync(lock, { force: true });
+    } catch {
+    }
+  }
+}
+function saveConfig(config) {
+  fs3.mkdirSync(dataDir(), { recursive: true });
+  withConfigLock(() => {
+    const file = configFile();
+    const tmp = file + ".tmp";
+    fs3.writeFileSync(tmp, JSON.stringify(config, null, 2));
+    fs3.renameSync(tmp, file);
+  });
+}
+function findZcodeExecutable() {
+  return ZCODE_EXE_CANDIDATES.map((p2) => p2).find((p2) => {
+    try {
+      return fs3.statSync(p2).isFile();
+    } catch {
+      return false;
+    }
+  });
+}
+async function isZcodeProcessRunning() {
+  try {
+    if (process.platform === "win32") {
+      const { stdout: stdout2 } = await execFileAsync("tasklist", ["/NH", "/FI", "IMAGENAME eq ZCode.exe"]);
+      return stdout2.toLowerCase().includes("zcode.exe");
+    }
+    const name = process.platform === "darwin" ? "ZCode" : "zcode";
+    const { stdout } = await execFileAsync("pgrep", ["-x", name]);
+    return stdout.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+async function launchZcode(port) {
+  try {
+    await listTargets(port);
+    return { started: false, reason: "already-running-with-cdp" };
+  } catch {
+  }
+  const exe = findZcodeExecutable();
+  if (!exe)
+    throw new Error("ZCode executable not found; set ZCODE_WINDOWS_APP_INSTALL_DIR or install ZCode to the default path.");
+  if (await isZcodeProcessRunning()) {
+    return { started: false, reason: "running-without-cdp" };
+  }
+  const child = spawn(exe, [
+    `--remote-debugging-port=${port}`,
+    "--disable-features=CalculateNativeWinOcclusion",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding"
+  ], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  let up = false;
+  for (let i2 = 0; i2 < 40; i2++) {
+    await new Promise((r2) => setTimeout(r2, 500));
+    try {
+      await listTargets(port);
+      up = true;
+      break;
+    } catch {
+    }
+  }
+  if (!up) {
+    try {
+      child.kill();
+    } catch {
+    }
+    throw new Error("ZCode was started but no CDP endpoint appeared. Another instance may already be running without the debug port \u2014 quit ZCode completely and run `zcode-beautify launch` again.");
+  }
+  await new Promise((r2) => setTimeout(r2, 2e3));
+  try {
+    await listTargets(port);
+  } catch {
+    throw new Error("CDP came up but closed again immediately \u2014 a running ZCode instance took over via the single-instance lock. Quit ZCode completely and run `zcode-beautify launch` again.");
+  }
+  return { started: true };
+}
+var ZCODE_EXE_CANDIDATES, execFileAsync;
+var init_launch = __esm({
+  "dist/core/launch.js"() {
+    "use strict";
+    init_cdp();
+    ZCODE_EXE_CANDIDATES = process.platform === "win32" ? [
+      process.env.ZCODE_WINDOWS_APP_INSTALL_DIR ? path.join(process.env.ZCODE_WINDOWS_APP_INSTALL_DIR, "ZCode.exe") : void 0,
+      "C:\\Program Files\\ZCode\\ZCode.exe",
+      path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode", "ZCode.exe")
+    ].filter(Boolean) : process.platform === "darwin" ? ["/Applications/ZCode.app/Contents/MacOS/ZCode"] : ["/usr/bin/zcode", "/opt/ZCode/zcode"];
+    execFileAsync = promisify(execFile);
+  }
+});
+
 // dist/core/inject.js
-function buildPayload(config, assets) {
+import path2 from "node:path";
+function normalizeChatLook(raw) {
+  const pct = (v) => typeof v === "number" && v >= 0 && v <= 100 ? Math.round(v) : 0;
+  return {
+    chatDim: pct(raw?.chatDim),
+    maskTop: pct(raw?.maskTop),
+    maskBottom: pct(raw?.maskBottom),
+    frost: pct(raw?.frost)
+  };
+}
+function activePlanTransition(rotation) {
+  const plans = rotation?.plans;
+  if (!plans?.length)
+    return "fade";
+  const plan = plans.find((p2) => p2.id === rotation?.activePlanId) ?? plans[0];
+  return plan?.transition ?? "fade";
+}
+function buildPayload(config, assets, mediaToken2 = "") {
   const parts = [];
+  const tok = mediaToken2 ? (u2) => `${u2}?t=${mediaToken2}` : (u2) => u2;
   const resolved = config.fit === "smart" ? assets?.focus.fit ?? "cover" : config.fit === "contain" ? "contain" : "cover";
   const focusX = config.fit === "smart" ? assets?.focus.x ?? 0.5 : 0.5;
   const focusY = config.fit === "smart" ? assets?.focus.y ?? 0.5 : 0.5;
@@ -109881,15 +110481,30 @@ html, body { background: transparent !important; }
       parts.push(buildTransparencyOverrides({ dim: config.dim }));
     }
   }
-  const wallpaperDataUri = config.sceneVideoUrl || !config.wallpaperVisible ? void 0 : assets?.dataUri;
-  const videoSrc = config.wallpaperVisible ? config.sceneVideoUrl : void 0;
+  let wallpaperDataUri;
+  if (!config.sceneVideoUrl && config.wallpaperVisible) {
+    const p2 = path2.resolve(config.wallpaperPath ?? "").toLowerCase();
+    const dir = path2.resolve(dataDir()).toLowerCase();
+    if (p2.startsWith(dir + path2.sep) && /\.(jpe?g|png|webp|bmp)$/i.test(p2)) {
+      wallpaperDataUri = tok(`http://127.0.0.1:${config.apiPort ?? 9223}/media/lib/${encodeURIComponent(path2.basename(config.wallpaperPath))}`);
+    } else {
+      wallpaperDataUri = assets?.dataUri;
+    }
+  }
+  const videoSrc = config.wallpaperVisible && config.sceneVideoUrl ? tok(config.sceneVideoUrl) : void 0;
+  const kenBurns = Boolean(config.kenBurns) && !videoSrc && config.blur === 0 && Boolean(wallpaperDataUri);
   return {
     css: parts.join("\n"),
     wallpaperDataUri,
     videoSrc,
     fit: config.wallpaperVisible ? resolved : "cover",
+    transition: activePlanTransition(config.rotation),
     focusX,
-    focusY
+    focusY,
+    kenBurns,
+    videoVolume: Math.max(0, Math.min(100, Math.round(config.videoVolume ?? 0))),
+    chatLook: normalizeChatLook(config.chatLook),
+    startupClean: config.startupClean !== false
   };
 }
 async function applyToZCode(config, payload) {
@@ -109899,6 +110514,8 @@ async function applyToZCode(config, payload) {
   }
   let count = 0;
   for (const target of targets) {
+    if (isUpdaterTarget(target) && config.showOnUpdater !== true)
+      continue;
     try {
       await injectIntoTarget(target, payload);
       count++;
@@ -109930,6 +110547,7 @@ var init_inject = __esm({
     init_cdp();
     init_monet();
     init_tokens();
+    init_launch();
     DEFAULT_CONFIG = {
       port: 9222,
       blur: 0,
@@ -109941,119 +110559,11 @@ var init_inject = __esm({
   }
 });
 
-// dist/core/launch.js
-var launch_exports = {};
-__export(launch_exports, {
-  configFile: () => configFile,
-  dataDir: () => dataDir,
-  findZcodeExecutable: () => findZcodeExecutable,
-  isZcodeProcessRunning: () => isZcodeProcessRunning,
-  launchZcode: () => launchZcode,
-  loadConfig: () => loadConfig,
-  saveConfig: () => saveConfig
-});
-import { execFile, spawn } from "node:child_process";
-import { promisify } from "node:util";
-import fs3 from "node:fs";
-import os from "node:os";
-import path from "node:path";
-function dataDir() {
-  return process.env.ZCODE_BEAUTIFY_DATA_DIR ?? path.join(os.homedir(), ".zcode", "cli", "plugins", "data", "zcode-beautify");
-}
-function configFile() {
-  return path.join(dataDir(), "config.json");
-}
-function loadConfig() {
-  try {
-    return JSON.parse(fs3.readFileSync(configFile(), "utf8"));
-  } catch {
-    return {};
-  }
-}
-function saveConfig(config) {
-  fs3.mkdirSync(dataDir(), { recursive: true });
-  fs3.writeFileSync(configFile(), JSON.stringify(config, null, 2));
-}
-function findZcodeExecutable() {
-  return ZCODE_EXE_CANDIDATES.map((p2) => p2).find((p2) => {
-    try {
-      return fs3.statSync(p2).isFile();
-    } catch {
-      return false;
-    }
-  });
-}
-async function isZcodeProcessRunning() {
-  try {
-    if (process.platform === "win32") {
-      const { stdout: stdout2 } = await execFileAsync("tasklist", ["/NH", "/FI", "IMAGENAME eq ZCode.exe"]);
-      return stdout2.toLowerCase().includes("zcode.exe");
-    }
-    const name = process.platform === "darwin" ? "ZCode" : "zcode";
-    const { stdout } = await execFileAsync("pgrep", ["-x", name]);
-    return stdout.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-async function launchZcode(port) {
-  try {
-    await listTargets(port);
-    return { started: false, reason: "already-running-with-cdp" };
-  } catch {
-  }
-  const exe = findZcodeExecutable();
-  if (!exe)
-    throw new Error("ZCode executable not found; set ZCODE_WINDOWS_APP_INSTALL_DIR or install ZCode to the default path.");
-  if (await isZcodeProcessRunning()) {
-    return { started: false, reason: "running-without-cdp" };
-  }
-  const child = spawn(exe, [`--remote-debugging-port=${port}`], {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true
-  });
-  child.unref();
-  let up = false;
-  for (let i2 = 0; i2 < 40; i2++) {
-    await new Promise((r2) => setTimeout(r2, 500));
-    try {
-      await listTargets(port);
-      up = true;
-      break;
-    } catch {
-    }
-  }
-  if (!up) {
-    throw new Error("ZCode was started but no CDP endpoint appeared. Another instance may already be running without the debug port \u2014 quit ZCode completely and run `zcode-beautify launch` again.");
-  }
-  await new Promise((r2) => setTimeout(r2, 2e3));
-  try {
-    await listTargets(port);
-  } catch {
-    throw new Error("CDP came up but closed again immediately \u2014 a running ZCode instance took over via the single-instance lock. Quit ZCode completely and run `zcode-beautify launch` again.");
-  }
-  return { started: true };
-}
-var ZCODE_EXE_CANDIDATES, execFileAsync;
-var init_launch = __esm({
-  "dist/core/launch.js"() {
-    "use strict";
-    init_cdp();
-    ZCODE_EXE_CANDIDATES = process.platform === "win32" ? [
-      process.env.ZCODE_WINDOWS_APP_INSTALL_DIR ? path.join(process.env.ZCODE_WINDOWS_APP_INSTALL_DIR, "ZCode.exe") : void 0,
-      "C:\\Program Files\\ZCode\\ZCode.exe",
-      path.join(os.homedir(), "AppData", "Local", "Programs", "ZCode", "ZCode.exe")
-    ].filter(Boolean) : process.platform === "darwin" ? ["/Applications/ZCode.app/Contents/MacOS/ZCode"] : ["/usr/bin/zcode", "/opt/ZCode/zcode"];
-    execFileAsync = promisify(execFile);
-  }
-});
-
 // dist/core/wallpaperType.js
 import fs4 from "node:fs";
-import path2 from "node:path";
+import path3 from "node:path";
 function detectWallpaperType(input) {
-  const ext = path2.extname(input).toLowerCase();
+  const ext = path3.extname(input).toLowerCase();
   if (IMAGE_EXTENSIONS.has(ext))
     return "image";
   if (VIDEO_EXTENSIONS.has(ext))
@@ -110071,12 +110581,12 @@ function detectWallpaperType(input) {
   return detectDirectoryType(input);
 }
 function detectDirectoryType(dir) {
-  const project = readProjectJson(path2.join(dir, "project.json"));
+  const project = readProjectJson(path3.join(dir, "project.json"));
   const declared = typeof project?.type === "string" ? project.type.toLowerCase() : "";
   if (declared === "scene" || declared === "video" || declared === "web") {
     return declared;
   }
-  const entryExt = path2.extname(typeof project?.file === "string" ? project.file : "").toLowerCase();
+  const entryExt = path3.extname(typeof project?.file === "string" ? project.file : "").toLowerCase();
   if (SCENE_ENTRY_EXTENSIONS.has(entryExt))
     return "scene";
   if (VIDEO_EXTENSIONS.has(entryExt))
@@ -110102,13 +110612,13 @@ function detectFromDirectoryContents(dir) {
   let nested = [];
   if (entries.some((e2) => e2.toLowerCase() === "files")) {
     try {
-      nested = fs4.readdirSync(path2.join(dir, "files")).map((e2) => path2.join("files", e2));
+      nested = fs4.readdirSync(path3.join(dir, "files")).map((e2) => path3.join("files", e2));
     } catch {
     }
   }
   for (const name of [...entries, ...nested]) {
     const lower = name.toLowerCase();
-    const ext = path2.extname(lower);
+    const ext = path3.extname(lower);
     if (lower === "scene.pkg" || lower === "scene.json")
       return "scene";
     if (ext === ".html" || ext === ".htm")
@@ -110142,7 +110652,8 @@ var init_exec = __esm({
 
 // dist/core/dependencyCheck.js
 import fs5 from "node:fs";
-import path3 from "node:path";
+import { execFileSync } from "node:child_process";
+import path4 from "node:path";
 async function checkWallpaperEngine() {
   if (process.platform !== "win32") {
     return { ok: false, detail: "Wallpaper Engine is Windows-only" };
@@ -110154,7 +110665,7 @@ async function checkWallpaperEngine() {
   if (registry)
     return { ok: true, path: registry, detail: "detected via HKLM\\SOFTWARE\\Wallpaper Engine" };
   for (const candidate of steamLibraryCandidates()) {
-    const exe = path3.join(candidate, WE_EXE_RELATIVE);
+    const exe = path4.join(candidate, WE_EXE_RELATIVE);
     if (isFile(exe))
       return { ok: true, path: exe, detail: `detected via Steam library ${candidate}` };
   }
@@ -110231,9 +110742,26 @@ async function findWallpaperInRegistry() {
       const match = /\sInstallPath\s+REG_SZ\s+(.+)/.exec(stdout);
       const dir = match?.[1]?.trim();
       if (dir) {
-        const exe = path3.join(dir, "wallpaper64.exe");
+        const exe = path4.join(dir, "wallpaper64.exe");
         if (isFile(exe))
           return exe;
+      }
+    } catch {
+    }
+  }
+  return void 0;
+}
+function registrySteamPath() {
+  if (registrySteamPathProbed)
+    return registrySteamPathCache;
+  registrySteamPathProbed = true;
+  for (const key of ["HKCU\\Software\\Valve\\Steam", "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam", "HKLM\\SOFTWARE\\Valve\\Steam"]) {
+    try {
+      const out = execFileSync("reg", ["query", key, "/v", "SteamPath"], { timeout: 4e3, encoding: "utf8" });
+      const m = /SteamPath\s+REG_SZ\s+(\S+)/.exec(out);
+      if (m?.[1]) {
+        registrySteamPathCache = m[1];
+        return registrySteamPathCache;
       }
     } catch {
     }
@@ -110243,18 +110771,19 @@ async function findWallpaperInRegistry() {
 function steamLibraryCandidates() {
   const candidates = /* @__PURE__ */ new Set();
   const vdfRoots = [
+    registrySteamPath(),
     "C:\\Program Files (x86)\\Steam",
     "C:\\Program Files\\Steam",
-    ...driveRoots().flatMap((d) => [path3.join(d, "Steam"), path3.join(d, "SteamLibrary")])
-  ];
+    ...driveRoots().flatMap((d) => [path4.join(d, "Steam"), path4.join(d, "SteamLibrary")])
+  ].filter((p2) => Boolean(p2));
   for (const root of vdfRoots) {
-    const vdf = path3.join(root, "steamapps", "libraryfolders.vdf");
+    const vdf = path4.join(root, "steamapps", "libraryfolders.vdf");
     for (const lib of parseVdfPaths(readFileSafe(vdf)))
       candidates.add(lib);
   }
   for (const drive of driveRoots()) {
     for (const name of ["SteamLibrary", "Steam", "Games\\Steam", "Program Files (x86)\\Steam"]) {
-      candidates.add(path3.join(drive, name));
+      candidates.add(path4.join(drive, name));
     }
   }
   return [...candidates];
@@ -110267,6 +110796,8 @@ function parseVdfPaths(vdf) {
   return paths;
 }
 function driveRoots() {
+  if (driveRootsCache)
+    return driveRootsCache;
   const roots = [];
   for (let i2 = 67; i2 <= 90; i2++) {
     const drive = `${String.fromCharCode(i2)}:\\`;
@@ -110276,6 +110807,7 @@ function driveRoots() {
     } catch {
     }
   }
+  driveRootsCache = roots;
   return roots;
 }
 async function whereExecutable(name) {
@@ -110315,19 +110847,59 @@ function readFileSafe(p2) {
     return "";
   }
 }
-var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR;
+var exec, WE_EXE_RELATIVE, MIN_FFMPEG_MAJOR, registrySteamPathCache, registrySteamPathProbed, driveRootsCache;
 var init_dependencyCheck = __esm({
   "dist/core/dependencyCheck.js"() {
     "use strict";
     init_exec();
     exec = execFileP;
-    WE_EXE_RELATIVE = path3.join("wallpaper_engine", "wallpaper64.exe");
+    WE_EXE_RELATIVE = path4.join("steamapps", "common", "wallpaper_engine", "wallpaper64.exe");
     MIN_FFMPEG_MAJOR = 5;
+    registrySteamPathProbed = false;
   }
 });
 
 // dist/core/weLauncher.js
 import { spawn as spawn2 } from "node:child_process";
+async function windowIsBlack(title) {
+  const script = `
+Add-Type -AssemblyName System.Drawing
+$p = Get-Process | Where-Object { $_.MainWindowTitle -eq '${title.replace(/'/g, "''")}' } | Select-Object -First 1
+if ($p) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class ZB2 {
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+}
+'@
+  $r = New-Object ZB2+RECT
+  [ZB2]::GetClientRect($p.MainWindowHandle, [ref]$r) | Out-Null
+  $w = $r.R - $r.L; $h = $r.B - $r.T
+  if ($w -gt 0 -and $h -gt 0) {
+    $bmp = New-Object System.Drawing.Bitmap($w, $h)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $g.GetHdc()
+    [ZB2]::PrintWindow($p.MainWindowHandle, $hdc, 3) | Out-Null
+    $g.ReleaseHdc($hdc); $g.Dispose()
+    $ms = New-Object System.IO.MemoryStream
+    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+    Write-Output $ms.Length
+  } else { Write-Output -1 }
+} else { Write-Output -1 }`;
+  try {
+    const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
+    const bytes = Number(stdout.trim());
+    if (!Number.isFinite(bytes) || bytes < 0)
+      return null;
+    return bytes < 3e4;
+  } catch {
+    return null;
+  }
+}
 async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
   const exe = wallpaperExePath ?? (await checkWallpaperEngine()).path;
   if (!exe)
@@ -110343,13 +110915,19 @@ async function openSceneWindow(pkgPath, opts, wallpaperExePath) {
     String(opts.width),
     "-height",
     String(opts.height)
-  ], { stdio: "ignore", detached: false, windowsHide: true });
+  ], { stdio: "ignore", detached: true, windowsHide: true });
   proc.unref();
   const hwnd = await waitForWindow(opts.title, 15e3);
   if (hwnd === null) {
     throw new SceneWindowError(`Window "${opts.title}" did not appear within 15s`);
   }
-  const client = await positionWindow(hwnd, opts);
+  const client = await measureClientRect(hwnd, opts.title);
+  await exec2("powershell", [
+    "-NoProfile",
+    "-Command",
+    `Add-Type -Namespace N -Name Z -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
+[N.Z]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]1, 0, 0, 0, 0, 0x0003) | Out-Null`
+  ], { timeout: 1e4 }).catch(() => void 0);
   return { title: opts.title, hwnd, client, proc };
 }
 async function closeSceneWindow(handle, wallpaperExePath) {
@@ -110395,23 +110973,6 @@ if ($null -ne $h) { Write-Output $h }`;
     return null;
   }
 }
-async function positionWindow(hwnd, opts) {
-  const script = `${PS_WINDOW_HELPERS}
-$h = [IntPtr]${hwnd}
-$x = ${opts.x ?? -1}; $y = ${opts.y ?? -1}
-$w = ${opts.width}; $hh = ${opts.height}
-if ($x -eq -1 -or $y -eq -1) {
-  Add-Type -AssemblyName System.Windows.Forms
-  $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-  $x = [int](($b.Width - $w) / 2); $y = [int](($b.Height - $hh) / 2)
-}
-[Native.Win]::SetWindowPos($h, [IntPtr]::Zero, $x, $y, $w, $hh, 0x0004) | Out-Null  # SWP_NOZORDER
-Start-Sleep -Milliseconds 200
-$c = Measure-Client $h
-Write-Output ("{0},{1},{2},{3}" -f $c[0], $c[1], $c[2], $c[3])`;
-  const { stdout } = await exec2("powershell", ["-NoProfile", "-Command", script], { timeout: 15e3 });
-  return parseClientRect(stdout, opts.title);
-}
 async function measureClientRect(hwnd, title) {
   const script = `${PS_WINDOW_HELPERS}
 $c = Measure-Client ([IntPtr]${hwnd})
@@ -110429,7 +110990,7 @@ function parseClientRect(stdout, title) {
 function sleep(ms) {
   return new Promise((r2) => setTimeout(r2, ms));
 }
-var exec2, SceneWindowError, PS_WINDOW_HELPERS;
+var exec2, SceneWindowError, SceneWindowBlackError, PS_WINDOW_HELPERS;
 var init_weLauncher = __esm({
   "dist/core/weLauncher.js"() {
     "use strict";
@@ -110437,6 +110998,8 @@ var init_weLauncher = __esm({
     init_exec();
     exec2 = execFileP;
     SceneWindowError = class extends Error {
+    };
+    SceneWindowBlackError = class extends Error {
     };
     PS_WINDOW_HELPERS = `
 # ddagrab captures PHYSICAL pixels; without DPI awareness PowerShell returns
@@ -110493,50 +111056,102 @@ function Measure-Client([IntPtr]$h) {
 });
 
 // dist/core/recorder.js
-import { mkdirSync } from "node:fs";
-import path4 from "node:path";
-async function recordSceneWindow(handle, out, opts, ffmpegPath) {
-  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
-  if (!ffmpeg)
-    throw new RecordError("ffmpeg not found \u2014 cannot record scene window");
-  mkdirSync(path4.dirname(path4.resolve(out)), { recursive: true });
-  const client = await measureClientRect(handle.hwnd, handle.title);
-  const { x: x2, y: y2, width, height } = client;
+import { mkdirSync, rmSync } from "node:fs";
+import path5 from "node:path";
+async function recordWindowBackground(handle, out, opts, ffmpeg) {
+  const seqDir = path5.join(path5.dirname(path5.resolve(out)), `seq-${process.pid}-${Date.now().toString(36)}`);
+  mkdirSync(seqDir, { recursive: true });
+  const frameMs = Math.max(20, Math.round(1e3 / opts.fps));
+  const script = `
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class PW {
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+}
+'@
+$target = [IntPtr]${handle.hwnd}
+$r = New-Object PW+RECT
+[PW]::GetClientRect($target, [ref]$r) | Out-Null
+$w = $r.R - $r.L; $h = $r.B - $r.T
+if ($w -le 0 -or $h -le 0) { Write-Output "0"; exit 1 }
+$dir = '${seqDir.replace(/\\/g, "\\\\")}'
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+$n = 0
+while ($sw.ElapsedMilliseconds -lt ${opts.duration * 1e3}) {
+  $targetMs = [math]::Floor(($sw.ElapsedMilliseconds + $frameMs) / $frameMs) * $frameMs
+  # frame-pace to the requested cadence
+  while ($sw.ElapsedMilliseconds -lt $targetMs) { Start-Sleep -Milliseconds 1 }
+  $bmp = New-Object System.Drawing.Bitmap($w, $h)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $hdc = $g.GetHdc()
+  [PW]::PrintWindow($target, $hdc, 3) | Out-Null   # PW_CLIENTONLY|PW_RENDERFULLCONTENT
+  $g.ReleaseHdc($hdc); $g.Dispose()
+  $bmp.Save((Join-Path $dir ('f_{0:d6}.png' -f $n)), [System.Drawing.Imaging.ImageFormat]::Png)
+  $bmp.Dispose()
+  $n++
+}
+$sw.Stop()
+Write-Output $n`;
+  let frames = 0;
+  try {
+    const { stdout } = await exec3("powershell", ["-NoProfile", "-Command", script], {
+      timeout: (opts.duration + 40) * 1e3,
+      maxBuffer: 4 * 1024 * 1024
+    });
+    frames = Number(stdout.trim().split(/\r?\n/).pop() ?? "0");
+  } catch (err) {
+    throw new RecordError(`PrintWindow capture failed: ${err.message}`);
+  } finally {
+  }
+  if (frames < 10)
+    throw new RecordError(`PrintWindow captured too few frames (${frames})`);
   const outW = opts.outWidth ?? 1920;
   const outH = opts.outHeight ?? 1080;
-  const args = [
-    "-y",
-    "-hide_banner",
-    "-loglevel",
-    "warning",
-    "-f",
-    "lavfi",
-    "-i",
-    `ddagrab=output_idx=0:framerate=${opts.fps}:draw_mouse=0`,
-    "-t",
-    String(opts.duration),
-    "-vf",
-    `hwdownload,format=bgra,crop=${width}:${height}:${x2}:${y2},scale=${outW}:${outH}`,
-    "-c:v",
-    "libx264",
-    "-preset",
-    "ultrafast",
-    "-pix_fmt",
-    "yuv420p",
-    "-an",
-    out
-  ];
-  await setTopmost(handle.hwnd, true);
   try {
-    await exec3(ffmpeg, args, { timeout: (opts.duration + 30) * 1e3, maxBuffer: 16 * 1024 * 1024 });
+    await exec3(ffmpeg, [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-framerate",
+      String(opts.fps),
+      "-i",
+      path5.join(seqDir, "f_%06d.png"),
+      "-vf",
+      `scale=${outW}:${outH}`,
+      "-c:v",
+      "libx264",
+      "-preset",
+      "ultrafast",
+      "-pix_fmt",
+      "yuv420p",
+      "-an",
+      out
+    ], { timeout: 12e4, maxBuffer: 16 * 1024 * 1024 });
   } catch (err) {
-    throw new RecordError(`ffmpeg ddagrab capture failed: ${err.message}`);
+    throw new RecordError(`frame-sequence encode failed: ${err.message}`);
   } finally {
-    await setTopmost(handle.hwnd, false).catch(() => void 0);
+    rmSync(seqDir, { recursive: true, force: true });
   }
 }
-async function analyzeBlackness(file, ffmpegPath) {
-  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+async function recordSceneWindow(handle, out, opts, ffmpegPath2) {
+  const ffmpeg = ffmpegPath2 ?? (await checkFfmpeg()).path;
+  if (!ffmpeg)
+    throw new RecordError("ffmpeg not found \u2014 cannot record scene window");
+  mkdirSync(path5.dirname(path5.resolve(out)), { recursive: true });
+  await recordWindowBackground(handle, out, {
+    duration: opts.duration,
+    fps: opts.fps,
+    outWidth: opts.outWidth ?? 1920,
+    outHeight: opts.outHeight ?? 1080
+  }, ffmpeg);
+}
+async function analyzeBlackness(file, ffmpegPath2) {
+  const ffmpeg = ffmpegPath2 ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
     throw new RecordError("ffmpeg not found \u2014 cannot analyze footage");
   let stderr = "";
@@ -110583,22 +111198,12 @@ async function meanLumaOf(file, ffmpeg) {
     return -1;
   }
 }
-async function setTopmost(hwnd, topmost) {
-  const after = topmost ? -1 : -2;
-  await exec3("powershell", [
-    "-NoProfile",
-    "-Command",
-    `Add-Type -Namespace N -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr a, int x, int y, int cx, int cy, uint f);'
-[N.W]::SetWindowPos([IntPtr]${hwnd}, [IntPtr]${after}, 0, 0, 0, 0, 0x0003)`
-  ], { timeout: 1e4 });
-}
 var exec3, RecordError;
 var init_recorder = __esm({
   "dist/core/recorder.js"() {
     "use strict";
     init_dependencyCheck();
     init_exec();
-    init_weLauncher();
     exec3 = execFileP;
     RecordError = class extends Error {
     };
@@ -110607,9 +111212,9 @@ var init_recorder = __esm({
 
 // dist/core/loopProcessor.js
 import { mkdirSync as mkdirSync2 } from "node:fs";
-import path5 from "node:path";
-async function makeSeamless(input, output, fadeSec, ffmpegPath, options = {}) {
-  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+import path6 from "node:path";
+async function makeSeamless(input, output, fadeSec, ffmpegPath2, options = {}) {
+  const ffmpeg = ffmpegPath2 ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
     throw new LoopError("ffmpeg not found \u2014 cannot process loop");
   const fullDuration = await probeDuration(input, ffmpeg);
@@ -110635,7 +111240,7 @@ async function makeSeamless(input, output, fadeSec, ffmpegPath, options = {}) {
     `[xfade][main]concat=n=2:v=1:a=0[joined]`,
     `[joined]${scale}format=yuv420p[out]`
   ].join(";");
-  mkdirSync2(path5.dirname(path5.resolve(output)), { recursive: true });
+  mkdirSync2(path6.dirname(path6.resolve(output)), { recursive: true });
   await exec4(ffmpeg, [
     "-y",
     "-hide_banner",
@@ -110667,13 +111272,13 @@ async function makeSeamless(input, output, fadeSec, ffmpegPath, options = {}) {
   const outputDuration = await probeDuration(output, ffmpeg);
   return { inputDuration: duration, outputDuration };
 }
-async function probeDuration(file, ffmpegPath) {
-  const ffprobe = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
+async function probeDuration(file, ffmpegPath2) {
+  const ffprobe = ffmpegPath2.replace(/ffmpeg(\.exe)?$/i, "ffprobe$1");
   try {
     const { stdout } = await exec4(ffprobe, ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", file], { timeout: 3e4 });
     return Number(stdout.trim());
   } catch {
-    const { stderr } = await exec4(ffmpegPath, ["-hide_banner", "-i", file, "-f", "null", "-"], { timeout: 3e4, maxBuffer: 4 * 1024 * 1024 });
+    const { stderr } = await exec4(ffmpegPath2, ["-hide_banner", "-i", file, "-f", "null", "-"], { timeout: 3e4, maxBuffer: 4 * 1024 * 1024 });
     const m = /Duration: (\d+):(\d+):([\d.]+)/.exec(stderr);
     return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : Number.NaN;
   }
@@ -110693,12 +111298,12 @@ var init_loopProcessor = __esm({
 // dist/core/cacheManager.js
 import crypto from "node:crypto";
 import fs6 from "node:fs";
-import path6 from "node:path";
+import path7 from "node:path";
 function scenesCacheRoot() {
-  return path6.join(dataDir(), "scenes");
+  return path7.join(dataDir(), "scenes");
 }
 function getCachePath(hash) {
-  return path6.join(scenesCacheRoot(), hash, "loop.mp4");
+  return path7.join(scenesCacheRoot(), hash, "loop.mp4");
 }
 function hasCache(hash) {
   try {
@@ -110730,7 +111335,7 @@ function enforceLimit(maxBytes) {
     return 0;
   }
   const sized = entries.filter((e2) => e2.isDirectory()).map((e2) => {
-    const dir = path6.join(root, e2.name);
+    const dir = path7.join(root, e2.name);
     try {
       return { dir, size: dirSize(dir), lru: lastUseMs(dir) };
     } catch {
@@ -110782,7 +111387,7 @@ function fingerprint(p2) {
         return;
       }
       for (const item of items) {
-        const childAbs = path6.join(abs, item.name);
+        const childAbs = path7.join(abs, item.name);
         const childRel = rel ? `${rel}/${item.name}` : item.name;
         if (item.isDirectory()) {
           walk(childAbs, childRel);
@@ -110826,7 +111431,7 @@ function dirSize(dir) {
       return;
     }
     for (const item of items) {
-      const child = path6.join(dir2, item.name);
+      const child = path7.join(dir2, item.name);
       if (item.isDirectory())
         walkSize(child);
       else if (item.isFile()) {
@@ -110852,12 +111457,12 @@ function lastUseMs(dir) {
   }
   for (const item of items) {
     try {
-      const st = fs6.statSync(path6.join(dir, item.name));
+      const st = fs6.statSync(path7.join(dir, item.name));
       consider(st);
       if (item.isDirectory()) {
-        for (const inner of fs6.readdirSync(path6.join(dir, item.name), { withFileTypes: true })) {
+        for (const inner of fs6.readdirSync(path7.join(dir, item.name), { withFileTypes: true })) {
           try {
-            consider(fs6.statSync(path6.join(dir, item.name, inner.name)));
+            consider(fs6.statSync(path7.join(dir, item.name, inner.name)));
           } catch {
           }
         }
@@ -110885,10 +111490,10 @@ __export(scenePipeline_exports, {
   resolveSceneInput: () => resolveSceneInput
 });
 import fs7 from "node:fs";
-import path7 from "node:path";
+import path8 from "node:path";
 function findVideoInDir(dir) {
   for (const subdir of ["", "files"]) {
-    const base = path7.join(dir, subdir);
+    const base = path8.join(dir, subdir);
     let entries;
     try {
       entries = fs7.readdirSync(base);
@@ -110897,7 +111502,7 @@ function findVideoInDir(dir) {
     }
     const hit = entries.find((e2) => /\.(mp4|webm)$/i.test(e2));
     if (hit)
-      return path7.join(base, hit);
+      return path8.join(base, hit);
   }
   return void 0;
 }
@@ -110912,18 +111517,18 @@ function resolveSceneInput(input) {
     return input;
   if (input.toLowerCase().endsWith(".pkg"))
     return input;
-  let dir = path7.dirname(path7.resolve(input));
+  let dir = path8.dirname(path8.resolve(input));
   for (let hop = 0; hop < 4; hop++) {
-    if (fs7.existsSync(path7.join(dir, "project.json")))
+    if (fs7.existsSync(path8.join(dir, "project.json")))
       return dir;
-    const parent = path7.dirname(dir);
+    const parent = path8.dirname(dir);
     if (parent === dir)
       break;
     dir = parent;
   }
   return input;
 }
-async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath) {
+async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffmpegPath2) {
   const opts = { ...DEFAULT_SCENE_OPTIONS, ...options };
   onProgress("detect", pkgPath);
   let type = detectWallpaperType(pkgPath);
@@ -110961,7 +111566,7 @@ async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffm
     fadeSec: opts.fadeSec
   });
   const loopPath = getCachePath(hash);
-  const posterPath = path7.join(path7.dirname(loopPath), "poster.jpg");
+  const posterPath = path8.join(path8.dirname(loopPath), "poster.jpg");
   if (hasCache(hash)) {
     onProgress("cache-hit", hash);
     touchCache(hash);
@@ -110970,63 +111575,116 @@ async function importScene(pkgPath, onProgress = () => void 0, options = {}, ffm
   }
   if (isVideo) {
     onProgress("analyzing", pkgPath);
-    const sourceDuration = await probeDuration(pkgPath, ffmpegPath ?? (await checkFfmpeg()).path);
+    const sourceDuration = await probeDuration(pkgPath, ffmpegPath2 ?? (await checkFfmpeg()).path);
     const trim = sourceDuration > opts.maxSeconds ? { startAt: (sourceDuration - opts.maxSeconds) / 2, seconds: opts.maxSeconds } : void 0;
     if (trim)
       onProgress("truncating", `${sourceDuration.toFixed(1)}s -> ${opts.maxSeconds}s`);
     onProgress("processing", `crossfade ${opts.fadeSec}s`);
     const tmpLoop = `${loopPath}.tmp.mp4`;
-    await makeSeamless(pkgPath, tmpLoop, opts.fadeSec, ffmpegPath, {
+    await makeSeamless(pkgPath, tmpLoop, opts.fadeSec, ffmpegPath2, {
       startAt: trim?.startAt,
       seconds: trim?.seconds,
       maxWidth: 1920
     });
     onProgress("poster");
-    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    await extractPoster(tmpLoop, posterPath, ffmpegPath2);
     onProgress("saving", hash);
-    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.mkdirSync(path8.dirname(loopPath), { recursive: true });
     fs7.renameSync(tmpLoop, loopPath);
-    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
+    const blackness = await analyzeBlackness(loopPath, ffmpegPath2);
     enforceLimit(opts.maxCacheBytes);
     onProgress("done", loopPath);
     return { loopPath, posterPath, hash, blackness, fromCache: false };
   }
-  onProgress("opening", `window "${opts.title}"`);
-  const handle = await openSceneWindow(pkgPath, { width: opts.width, height: opts.height, title: opts.title });
+  let pkgFile = pkgPath;
   try {
-    onProgress("render-ready", JSON.stringify(handle.client));
-    await new Promise((r2) => setTimeout(r2, 3e3));
-    onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
-    const rawPath = path7.join(path7.dirname(loopPath), `raw-${Date.now()}.mp4`);
-    fs7.mkdirSync(path7.dirname(rawPath), { recursive: true });
+    if (fs7.statSync(pkgPath).isDirectory()) {
+      let declared;
+      try {
+        declared = JSON.parse(fs7.readFileSync(path8.join(pkgPath, "project.json"), "utf8")).file;
+      } catch {
+      }
+      const name = declared && /\.pkg$/i.test(declared) && fs7.existsSync(path8.join(pkgPath, declared)) ? declared : fs7.readdirSync(pkgPath).find((e2) => /\.pkg$/i.test(e2));
+      if (!name)
+        throw new SceneImportError(`No scene.pkg inside: ${pkgPath}`);
+      pkgFile = path8.join(pkgPath, name);
+    }
+  } catch (err) {
+    if (err instanceof SceneImportError)
+      throw err;
+  }
+  const renderOnce = async () => {
+    onProgress("opening", `window "${opts.title}"`);
+    const handle = await openSceneWindow(pkgFile, { width: opts.width, height: opts.height, title: opts.title });
     try {
-      await recordSceneWindow(handle, rawPath, { duration: opts.duration, fps: opts.fps, outWidth: opts.width, outHeight: opts.height }, ffmpegPath);
+      onProgress("render-ready", JSON.stringify(handle.client));
+      await new Promise((r2) => setTimeout(r2, 4e3));
+      const preBlack = await windowIsBlack(opts.title);
+      if (preBlack === true) {
+        throw new SceneWindowBlackError("\u7A97\u53E3\u6E32\u67D3\u672A\u9644\u7740(\u9884\u68C0\u5E27\u5168\u9ED1)");
+      }
+      onProgress("recording", `${opts.duration}s @ ${opts.fps}fps`);
+      const rawPath2 = path8.join(path8.dirname(loopPath), `raw-${Date.now()}.mp4`);
+      fs7.mkdirSync(path8.dirname(rawPath2), { recursive: true });
+      await recordSceneWindow(handle, rawPath2, { duration: opts.duration, fps: opts.fps, outWidth: opts.width, outHeight: opts.height }, ffmpegPath2);
+      return { rawPath: rawPath2 };
     } finally {
       onProgress("closing");
       await closeSceneWindow(handle).catch(() => void 0);
     }
+  };
+  const captureIsBlack = async (file) => {
+    const b = await analyzeBlackness(file, ffmpegPath2);
+    return b.blackFraction > 0.95;
+  };
+  let rawPath = "";
+  let black = true;
+  for (let pass = 0; pass < 2 && black; pass++) {
+    const out = await renderOnce();
+    rawPath = out.rawPath;
+    black = await captureIsBlack(rawPath).catch(() => false);
+    if (black) {
+      onProgress(`black-retry-${pass + 1}`, "reopen window");
+      try {
+        fs7.rmSync(rawPath, { force: true });
+      } catch {
+      }
+      await new Promise((r2) => setTimeout(r2, 3e3));
+    }
+  }
+  if (black) {
+    try {
+      if (rawPath)
+        fs7.rmSync(rawPath, { force: true });
+    } catch {
+    }
+    throw new SceneImportError("\u5F55\u5236\u753B\u9762\u5168\u9ED1(\u5DF2\u81EA\u52A8\u91CD\u5F00\u7A97\u53E3\u91CD\u8BD5)\u2014\u2014\u8BF7\u7A0D\u5019\u91CD\u8BD5\u6216\u91CD\u542F Wallpaper Engine");
+  }
+  try {
     onProgress("processing", `crossfade ${opts.fadeSec}s`);
     const tmpLoop = `${loopPath}.tmp.mp4`;
-    await makeSeamless(rawPath, tmpLoop, opts.fadeSec, ffmpegPath);
+    await makeSeamless(rawPath, tmpLoop, opts.fadeSec, ffmpegPath2);
     onProgress("poster");
-    await extractPoster(tmpLoop, posterPath, ffmpegPath);
+    await extractPoster(tmpLoop, posterPath, ffmpegPath2);
     onProgress("saving", hash);
-    fs7.mkdirSync(path7.dirname(loopPath), { recursive: true });
+    fs7.mkdirSync(path8.dirname(loopPath), { recursive: true });
     fs7.renameSync(tmpLoop, loopPath);
     fs7.rmSync(rawPath, { force: true });
-    const blackness = await analyzeBlackness(loopPath, ffmpegPath);
     enforceLimit(opts.maxCacheBytes);
     onProgress("done", loopPath);
-    return { loopPath, posterPath, hash, blackness, fromCache: false };
+    return { loopPath, posterPath, hash, blackness: { blackFraction: black ? 1 : 0, meanLuma: 0, durationSec: opts.duration }, fromCache: false };
   } finally {
-    await closeSceneWindow(handle).catch(() => void 0);
+    try {
+      fs7.rmSync(rawPath, { force: true });
+    } catch {
+    }
   }
 }
-async function extractPoster(loopFile, posterPath, ffmpegPath) {
-  const ffmpeg = ffmpegPath ?? (await checkFfmpeg()).path;
+async function extractPoster(loopFile, posterPath, ffmpegPath2) {
+  const ffmpeg = ffmpegPath2 ?? (await checkFfmpeg()).path;
   if (!ffmpeg)
     throw new SceneImportError("ffmpeg not found");
-  fs7.mkdirSync(path7.dirname(path7.resolve(posterPath)), { recursive: true });
+  fs7.mkdirSync(path8.dirname(path8.resolve(posterPath)), { recursive: true });
   await execFileP(ffmpeg, [
     "-y",
     "-loglevel",
@@ -111091,13 +111749,13 @@ __export(session_exports, {
   resetAppearance: () => resetAppearance
 });
 import fs8 from "node:fs";
-import path8 from "node:path";
+import path9 from "node:path";
 async function reapplyStored() {
   const config = mergedConfig();
   return applyToZCode(config, await buildPayloadFromConfig(config));
 }
 async function applyWallpaper(imagePath, opts) {
-  const abs = path8.resolve(imagePath);
+  const abs = path9.resolve(imagePath);
   if (!fs8.existsSync(abs))
     throw new Error(`Image not found: ${abs}`);
   const kind = detectWallpaperType(abs);
@@ -111108,14 +111766,21 @@ async function applyWallpaper(imagePath, opts) {
   const stored = loadConfig();
   const config = { ...baseConfig(opts, stored), mediaType: "image", sceneHash: void 0 };
   fs8.mkdirSync(dataDir(), { recursive: true });
-  const dest = path8.join(dataDir(), "wallpaper" + path8.extname(abs).toLowerCase());
+  const dest = path9.join(dataDir(), "wallpaper" + path9.extname(abs).toLowerCase());
   if (dest !== abs)
     fs8.copyFileSync(abs, dest);
   const assets = await loadWallpaper(dest);
-  const payload = buildPayload(config, assets);
+  const payload = buildPayload(config, assets, serveMediaToken());
   saveConfig({ ...config, wallpaperPath: dest });
   const windows = await applyToZCode(config, payload);
   return { windows, config };
+}
+function serveMediaToken() {
+  try {
+    return fs8.readFileSync(path9.join(dataDir(), "serve.token"), "utf8").trim();
+  } catch {
+    return "";
+  }
 }
 async function applyColorsOnly(opts) {
   const stored = loadConfig();
@@ -111136,7 +111801,7 @@ function baseConfig(opts, stored) {
   };
 }
 async function applySceneWallpaper(scenePath, opts = {}) {
-  const abs = path8.resolve(scenePath);
+  const abs = path9.resolve(scenePath);
   const { importScene: importScene2 } = await Promise.resolve().then(() => (init_scenePipeline(), scenePipeline_exports));
   const scene = await importScene2(abs, opts.onProgress ?? (() => void 0));
   const stored = loadConfig();
@@ -111156,7 +111821,7 @@ async function applySceneWallpaper(scenePath, opts = {}) {
   if (!served) {
     console.warn("scene loop stored, but serve is not running \u2014 applying the poster frame as a static wallpaper.\nRun `zcode-beautify serve --detach` and `refresh_theme` to enable motion.");
     const assets = await loadWallpaper(scene.posterPath);
-    const payload = buildPayload({ ...next, sceneVideoUrl: void 0 }, assets);
+    const payload = buildPayload({ ...next, sceneVideoUrl: void 0 }, assets, serveMediaToken());
     const windows2 = await applyToZCode({ ...next, sceneVideoUrl: void 0 }, payload);
     return { windows: windows2, config: next, scene, served: false };
   }
@@ -111180,7 +111845,7 @@ async function resetAppearance(port) {
 async function buildPayloadFromConfig(config) {
   let assets;
   if (config.mediaType === "video" && config.wallpaperPath && fs8.existsSync(config.wallpaperPath)) {
-    const posterPath = path8.join(path8.dirname(config.wallpaperPath), "poster.jpg");
+    const posterPath = path9.join(path9.dirname(config.wallpaperPath), "poster.jpg");
     if (fs8.existsSync(posterPath)) {
       assets = await loadWallpaper(posterPath);
     }
@@ -111188,12 +111853,12 @@ async function buildPayloadFromConfig(config) {
     if (!config.sceneVideoUrl && config.sceneHash) {
       config = { ...config, sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${config.sceneHash}.mp4` };
     }
-    return buildPayload(config, assets);
+    return buildPayload(config, assets, serveMediaToken());
   }
   if (config.wallpaperPath && fs8.existsSync(config.wallpaperPath)) {
     assets = await loadWallpaper(config.wallpaperPath);
   }
-  return buildPayload(config, assets);
+  return buildPayload(config, assets, serveMediaToken());
 }
 function mergedConfig() {
   return { ...DEFAULT_CONFIG, ...loadConfig(), port: loadConfig().port ?? DEFAULT_CONFIG.port };
@@ -111215,17 +111880,17 @@ __export(shortcuts_exports, {
   ensureShortcutsHaveCdpFlag: () => ensureShortcutsHaveCdpFlag
 });
 import fs9 from "node:fs";
-import path9 from "node:path";
+import path10 from "node:path";
 function shortcutDirs() {
   const home = process.env.USERPROFILE ?? "";
   const appData = process.env.APPDATA ?? "";
   return [
     // Desktop may be OneDrive-redirected; cover both physical locations.
-    path9.join(home, "Desktop"),
-    ...process.env.OneDrive ? [path9.join(process.env.OneDrive, "Desktop")] : [],
-    path9.join(appData, "Microsoft", "Windows", "Start Menu", "Programs"),
-    path9.join("C:", "ProgramData", "Microsoft", "Windows", "Start Menu", "Programs"),
-    path9.join(appData, "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar")
+    path10.join(home, "Desktop"),
+    ...process.env.OneDrive ? [path10.join(process.env.OneDrive, "Desktop")] : [],
+    path10.join(appData, "Microsoft", "Windows", "Start Menu", "Programs"),
+    path10.join("C:", "ProgramData", "Microsoft", "Windows", "Start Menu", "Programs"),
+    path10.join(appData, "Microsoft", "Internet Explorer", "Quick Launch", "User Pinned", "TaskBar")
   ];
 }
 async function ensureShortcutsHaveCdpFlag(port) {
@@ -111235,7 +111900,7 @@ async function ensureShortcutsHaveCdpFlag(port) {
   const result = { updated: [], skipped: [], failed: [] };
   const links = [];
   const collect = (dir) => {
-    links.push(...fs9.readdirSync(dir).filter((f2) => /^zcode/i.test(f2) && f2.endsWith(".lnk")).map((f2) => path9.join(dir, f2)));
+    links.push(...fs9.readdirSync(dir).filter((f2) => /^zcode/i.test(f2) && f2.endsWith(".lnk")).map((f2) => path10.join(dir, f2)));
   };
   for (const dir of shortcutDirs()) {
     try {
@@ -111244,7 +111909,7 @@ async function ensureShortcutsHaveCdpFlag(port) {
         if (!sub.isDirectory())
           continue;
         try {
-          collect(path9.join(dir, sub.name));
+          collect(path10.join(dir, sub.name));
         } catch {
         }
       }
@@ -111288,17 +111953,55 @@ var init_shortcuts = __esm({
 });
 
 // dist/panel/panelScript.js
-function buildPanelScript(apiPort) {
+function buildPanelScript(apiPort, apiToken = "", startupClean = true) {
   const api = `http://127.0.0.1:${apiPort}`;
   return `(function(){
   var API = ${JSON.stringify(api)};
+  var TOKEN = ${JSON.stringify(apiToken)};
+  var STARTUP_CLEAN = ${JSON.stringify(startupClean !== false)};
+  /** Authenticated fetch: every API call carries the per-start token.
+   * Non-2xx responses REJECT \u2014 a 401 body like {"error":...} otherwise
+   * parses as valid data (undefined fields) and quietly poisons every
+   * consumer (the \u8F6E\u64AD\u72B6\u6001 "\u672A\u542F\u7528" ghost came exactly from there). */
+  function apiFetch(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({ 'X-Beautify-Token': TOKEN }, opts.headers || {});
+    return fetch(API + path, opts).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + path);
+      return r;
+    });
+  }
+  /** Media URLs (<img>/<video> cannot send headers) authenticate via ?t=. */
+  function mt(url) { return TOKEN ? url + (url.indexOf('?') >= 0 ? '&' : '?') + 't=' + TOKEN : url; }
   var ROOT_ID = ${JSON.stringify(PANEL_ROOT_ID)};
+  var runPanel = function() {
   // Always rebuild: an older panel left in the DOM would otherwise shadow the
   // current script version forever (the old build skipped installation).
   var stale = document.getElementById(ROOT_ID);
   if (stale) stale.remove();
   var staleStyle = document.getElementById('zcode-beautify-panel-style');
   if (staleStyle) staleStyle.remove();
+  // A popup the previous panel version left open survives its panel root;
+  // it belongs to a dead closure now \u2014 sweep it so it cannot shadow the
+  // next openWePop.
+  var stalePops = document.querySelectorAll('body > .zb-we-pop');
+  for (var spi = 0; spi < stalePops.length; spi++) stalePops[spi].remove();
+  // Kill the PREVIOUS panel generation's intervals: every serve restart
+  // re-evaluates this script, and old closures kept polling forever with
+  // their dead tokens \u2014 each 401 body parsed as data and fought the new
+  // panel (the \u8F6E\u64AD\u72B6\u6001 line flipped to \u672A\u542F\u7528 once a second). All panel
+  // intervals register through zbEvery so this sweep reaches them.
+  if (window.__zbTimers) {
+    for (var zti = 0; zti < window.__zbTimers.length; zti++) {
+      try { clearInterval(window.__zbTimers[zti]); } catch (e) {}
+    }
+  }
+  window.__zbTimers = [];
+  var zbEvery = function (fn, ms) {
+    var id = setInterval(fn, ms);
+    window.__zbTimers.push(id);
+    return id;
+  };
 
   var css = [
     '#zcode-beautify-panel-root, #zcode-beautify-panel-root * { box-sizing: border-box; font-family: system-ui, sans-serif; }',
@@ -111309,23 +112012,64 @@ function buildPanelScript(apiPort) {
       ' box-shadow: 0 2px 12px rgba(0,0,0,.35); user-select: none; font-size: 15px; line-height: 1; }',
     '#zb-fab:hover { background: rgba(52,52,60,.85); }',
     '#zb-panel { position: fixed; right: 18px; bottom: 60px; width: 264px; padding: 0 0 10px;',
+      // A panel taller than the window used to overflow past the screen edge;
+      // it now caps at the viewport and scrolls inside (slim scrollbar).
+      ' max-height: calc(100vh - 68px); overflow-y: auto; overscroll-behavior: contain;',
       ' background: rgba(24,24,30,.88); border: 1px solid rgba(255,255,255,.12); border-radius: 12px;',
       ' backdrop-filter: blur(16px); box-shadow: 0 8px 32px rgba(0,0,0,.45); user-select: none; }',
+    '#zb-panel::-webkit-scrollbar { width: 5px; }',
+    '#zb-panel::-webkit-scrollbar-thumb { background: rgba(255,255,255,.18); border-radius: 3px; }',
     '#zb-panel[hidden] { display: none; }',
     '#zb-head { padding: 9px 12px; font-weight: 600; cursor: move; border-bottom: 1px solid rgba(255,255,255,.1);',
       ' display: flex; justify-content: space-between; align-items: center; }',
     '#zb-body { padding: 10px 12px 0; }',
-    '.zb-row { margin-bottom: 10px; }',
-    '.zb-row label { display: flex; justify-content: space-between; margin-bottom: 4px; opacity: .85; }',
+    '#zb-tabs { display: flex; gap: 6px; margin-bottom: 10px; }',
+    '.zb-card { background: rgba(255,255,255,.045); border: 1px solid rgba(255,255,255,.09);',
+      ' border-radius: 10px; padding: 8px 10px; margin-bottom: 10px; }',
+    '.zb-card-title { font-size: 11px; opacity: .6; margin-bottom: 5px; }',
+    '.zb-card .zb-row:last-child, .zb-card .zb-actions:last-child { margin-bottom: 0; }',
+    // Collapsible cards (\u58C1\u7EB8\u5E93): clicking the title folds the body. The
+    // grid-rows 1fr\u21920fr trick animates to any content height smoothly.
+    '.zb-collapsible .zb-card-title { display: flex; justify-content: space-between; align-items: center;',
+      ' cursor: pointer; user-select: none; margin-bottom: 0; padding-bottom: 7px; }',
+    '.zb-collapse-wrap { display: grid; grid-template-rows: 1fr; transition: grid-template-rows .18s ease; }',
+    '.zb-collapse-wrap > .zb-collapse-inner { overflow: hidden; min-height: 0; }',
+    '.zb-collapsed .zb-collapse-wrap { grid-template-rows: 0fr; }',
+    '.zb-collapsed .zb-card-title { padding-bottom: 0; }',
+    '.zb-fold { width: 22px; height: 18px; border-radius: 5px; background: rgba(255,255,255,.09);',
+      ' border: 1px solid rgba(255,255,255,.18); display: flex; align-items: center; justify-content: center;',
+      ' font-size: 10px; line-height: 1; color: inherit; flex: none;',
+      ' transition: transform .15s ease, background .15s ease, border-color .15s ease; }',
+    '.zb-collapsible .zb-card-title:hover .zb-fold { background: rgba(122,162,247,.35); border-color: rgba(122,162,247,.6); }',
+    // Collapsed = arrow rotated right AND the chip lights up blue \u2014 the
+    // direction alone was too subtle to tell collapsed cards apart.
+    '.zb-collapsed .zb-fold { transform: rotate(-90deg); background: rgba(122,162,247,.5);',
+      ' border-color: rgba(122,162,247,.9); color: #d6e2ff; }',
+    '.zb-tab { flex: 1; text-align: center; padding: 5px 0; border-radius: 8px; cursor: pointer;',
+      ' background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.1); color: inherit; font-size: 11px; }',
+    '.zb-tab:hover { background: rgba(255,255,255,.12); }',
+    '.zb-tab[data-active="1"] { background: rgba(122,162,247,.3); border-color: rgba(122,162,247,.6); }',
+    '#zb-tab-main.zb-pane-in, #zb-tab-sched.zb-pane-in, #zb-tab-settings.zb-pane-in { animation: zb-pane-in 150ms ease; }',
+    '@keyframes zb-pane-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }',
+    '.zb-row { margin-bottom: 6px; }',
+    '.zb-row label { display: flex; justify-content: space-between; margin-bottom: 2px; opacity: .85; }',
     '#zb-panel input[type=range] { width: 100%; accent-color: #7aa2f7; height: 18px; margin: 0; cursor: pointer; }',
     '.zb-toggles { display: flex; justify-content: center; gap: 16px; }',
-    '.zb-toggles label { display: flex; align-items: center; gap: 5px; margin: 0; cursor: pointer; }',
-    '.zb-actions { display: flex; justify-content: center; gap: 10px; }',
-    '.zb-btn { display: inline-block; padding: 6px 20px; text-align: center; border-radius: 999px; cursor: pointer;',
-      ' background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.14); color: inherit; font-size: 12px; }',
+    '.zb-toggles label { display: flex; align-items: center; gap: 5px; margin: 0; cursor: pointer; white-space: nowrap; }',
+    '.zb-actions { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }',
+    '.zb-cfg-row .zb-btn { flex: 1 1 0; min-width: 0; padding-left: 2px; padding-right: 2px; }',
+    '.zb-btn { display: inline-block; padding: 6px 10px; text-align: center; border-radius: 999px; cursor: pointer;',
+      ' background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.14); color: inherit; font-size: 12px;',
+      ' white-space: nowrap; flex: 0 1 auto; }',
     '.zb-btn:hover { background: rgba(255,255,255,.16); }',
     '#zb-status { min-height: 14px; padding: 2px 12px 0; opacity: .6; font-size: 11px; }',
-    '#zb-scene-path { width: 100%; padding: 5px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,.14);',
+    // Import row: picker + paste field + action on ONE line (the old stacked
+    // button/input/button block ate three rows for two functions).
+    '.zb-import-row { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }',
+    '.zb-import-row .zb-btn { padding: 4px 9px; font-size: 11px; flex: none; }',
+    '.zb-import-row .zb-icon-btn { padding: 4px 7px; line-height: 1; }',
+    '.zb-import-row .zb-grow { flex: 1; min-width: 0; }',
+    '#zb-scene-path { flex: 1; min-width: 0; padding: 4px 8px; border-radius: 8px; border: 1px solid rgba(255,255,255,.14);',
       ' background: rgba(0,0,0,.3); color: inherit; font-size: 11px; outline: none; }',
     '#zb-scene-path:focus { border-color: rgba(122,162,247,.6); }',
     '#zb-progress { position: relative; height: 14px; border-radius: 7px; overflow: hidden;',
@@ -111334,15 +112078,142 @@ function buildPanelScript(apiPort) {
     '#zb-progress span { position: relative; }',
     '#zb-guide { padding: 8px 10px; background: rgba(120,53,15,.55); border-radius: 8px; font-size: 11px;',
       ' line-height: 1.5; white-space: pre-wrap; user-select: text; max-height: 180px; overflow: auto; }',
-    '.zb-lib { max-height: 120px; overflow: auto; font-size: 11px; }',
+    '.zb-lib { font-size: 11px; }',
     '.zb-lib .zb-lib-head { opacity: .55; margin: 4px 0 2px; }',
+    '.zb-lib-list { max-height: 110px; overflow: auto; }',
+    // Hover peek: a bigger wallpaper preview that opens to the LEFT of the
+    // panel when the cursor rests on any thumbnail-bearing item.
+    '#zb-hover-preview { position: fixed; z-index: 2147483647; width: 320px; border-radius: 8px;',
+    '  border: 1px solid rgba(255,255,255,.18); box-shadow: 0 8px 28px rgba(0,0,0,.55); background: #000;',
+    '  overflow: hidden; pointer-events: none; }',
+    '#zb-hover-preview img { display: block; width: 100%; max-height: 240px; object-fit: cover; }',
+    '#zb-hover-preview video { display: block; width: 100%; max-height: 240px; object-fit: contain; background: #000; }',
+    '#zb-hover-preview .zb-hv-off { display: none; }',
+    '#zb-hover-preview[hidden] { display: none; }',
+    '.zb-sched-head { display: flex; justify-content: space-between; align-items: center; opacity: .85; margin-bottom: 4px; }',
+    '.zb-sched-head label { display: flex; align-items: center; gap: 5px; margin: 0; cursor: pointer; }',
+    '.zb-sched-plan { display: flex; align-items: center; gap: 4px; margin-bottom: 6px; }',
+    '.zb-sched-plan select { flex: 1; min-width: 0; padding: 3px 5px; border-radius: 6px;',
+      ' border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: inherit; font-size: 11px;',
+      ' outline: none; color-scheme: dark; }',
+    '.zb-sched-plan .zb-act { font-size: 12px; }',
+    '.zb-sched-mode { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; opacity: .85; font-size: 11px; }',
+    '.zb-sched-mode select { flex: 1; min-width: 0; padding: 3px 5px; border-radius: 6px;',
+      ' border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: inherit; font-size: 11px;',
+      ' outline: none; color-scheme: dark; }',
+    '#zb-sched-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px; max-height: 200px; overflow-y: auto; overflow-anchor: none; padding-right: 2px; }',
+    '.zb-sched-row { display: flex; align-items: center; gap: 4px; }',
+    '.zb-sched-row input[type=number], .zb-sched-row input[type=time], .zb-sched-row select { padding: 3px 5px; border-radius: 6px;',
+      ' border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: inherit; font-size: 11px;',
+      ' outline: none; color-scheme: dark; }',
+    '.zb-sched-row input[type=number] { width: 52px; flex: none; }',
+    '.zb-sched-row input[type=time] { width: 66px; flex: none; }',
+    '.zb-sched-row select { flex: 1; min-width: 0; }',
+    '.zb-sched-dur { flex: none; opacity: .7; font-size: 11px; }',
+    '.zb-wp-picker { position: relative; flex: 1; min-width: 0; }',
+    '.zb-wp-btn { display: flex; align-items: center; gap: 5px; width: 100%; padding: 2px 5px; border-radius: 6px;',
+      ' border: 1px solid rgba(255,255,255,.14); background: rgba(0,0,0,.3); color: inherit; font-size: 11px; cursor: pointer; }',
+    '.zb-wp-btn img { width: 42px; height: 24px; object-fit: cover; border-radius: 3px; flex: none; background: #000; }',
+    '.zb-wp-btn span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }',
+    // The popup is position:fixed on <body>: an absolutely positioned popup
+    // inside the scrolling playlist gets clipped by the list's overflow window
+    // (and the browser scrolls the list to reveal it, cutting off row 1).
+    // z-index ties with the panel root (2147483647 is the ceiling) \u2014 the popup
+    // is appended later, so DOM order paints it ABOVE the panel card.
+    '.zb-wp-pop { position: fixed; z-index: 2147483647; color: #e8e8ea;',
+      ' background: rgba(16,16,22,.98); border: 1px solid rgba(255,255,255,.16); border-radius: 8px; padding: 3px; }',
+    // Each group scrolls independently (its own scrollbar), capped at five
+    // visible rows \u2014 measured .zb-wp-item height is 32px: 5x32 = 160px.
+    '.zb-wp-group-list { max-height: 160px; overflow-y: auto; overscroll-behavior: contain; }',
+    '.zb-wp-group { padding: 4px 6px 2px; font-size: 10px; opacity: .55; }',
+    '.zb-wp-item { display: flex; align-items: center; gap: 6px; padding: 3px 5px; border-radius: 6px; cursor: pointer; font-size: 11px; }',
+    '.zb-wp-item:hover { background: rgba(255,255,255,.12); }',
+    '.zb-wp-item[data-cur="1"] { background: rgba(122,162,247,.28); }',
+    '.zb-wp-item img { width: 46px; height: 26px; object-fit: cover; border-radius: 3px; flex: none; background: #000; }',
+    '.zb-wp-item span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
+    // WE library browser popup: same fixed-on-body scheme as the wallpaper
+    // picker (panel is narrow, so it opens as its own window to the LEFT).
+    // Grid of cards: bigger previews, click-to-multi-select, bottom bar.
+    '.zb-we-pop { position: fixed; z-index: 2147483647; color: #e8e8ea;',
+      ' background: rgba(16,16,22,.98); border: 1px solid rgba(255,255,255,.16); border-radius: 10px; padding: 10px; width: 560px; }',
+    '.zb-we-head { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 0 2px 8px; }',
+    '.zb-we-head .zb-we-total { opacity: .55; font-size: 11px; flex: none; }',
+    '.zb-we-search { flex: 1; min-width: 0; background: rgba(0,0,0,.35); border: 1px solid rgba(255,255,255,.18);',
+      ' border-radius: 5px; color: inherit; font-size: 12px; padding: 4px 8px; outline: none; }',
+    '.zb-we-act { cursor: pointer; background: none; border: none; color: inherit; opacity: .6; font-size: 13px; padding: 0 4px; flex: none; }',
+    '.zb-we-act:hover { opacity: 1; }',
+    // View-mode segmented control: group by wallpaper type, or by the user's
+    // own WE browser folders.
+    '.zb-we-mode { display: flex; flex: none; border: 1px solid rgba(255,255,255,.2); border-radius: 5px; overflow: hidden; }',
+    '.zb-we-mode button { background: none; border: none; color: inherit; font-size: 11px; padding: 3px 9px; cursor: pointer; opacity: .55; }',
+    '.zb-we-mode button:hover { opacity: .9; }',
+    '.zb-we-mode button[data-on="1"] { background: rgba(122,162,247,.4); opacity: 1; }',
+    // Folder-mode file-browser look: folder cards in the root view and a
+    // back row above a folder's wallpaper grid.
+    '.zb-we-fcard { border: 1px solid rgba(255,255,255,.14); border-radius: 8px; overflow: hidden; cursor: pointer;',
+      ' background: rgba(255,255,255,.04); padding: 14px 8px 10px; text-align: center; }',
+    '.zb-we-fcard:hover { border-color: rgba(122,162,247,.7); background: rgba(255,255,255,.08); }',
+    '.zb-we-fcard .zb-we-fico { font-size: 36px; line-height: 1; filter: saturate(1.3); }',
+    '.zb-we-fcard .zb-we-fname { font-size: 12px; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }',
+    '.zb-we-fcard .zb-we-fcount { font-size: 10px; opacity: .5; margin-top: 2px; }',
+    '.zb-we-fcard[hidden] { display: none; }',
+    '.zb-we-back { display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box; padding: 5px 8px;',
+      ' margin-bottom: 4px; border-radius: 6px; cursor: pointer; font-size: 11px; background: rgba(255,255,255,.06);',
+      ' border: 1px solid rgba(255,255,255,.12); color: inherit; }',
+    '.zb-we-back:hover { background: rgba(255,255,255,.12); }',
+    // Natural-aspect preview: width fixed, height follows the image. The
+    // position is recomputed on load (an unsized <img> measures 0px tall,
+    // so the initial clamp cannot know the real height) and again clamped
+    // to the viewport \u2014 hovering the last row must stay fully on screen.
+    '.zb-we-hover { position: fixed; z-index: 2147483647; width: 320px; max-height: 78vh;',
+      ' border-radius: 8px; overflow: hidden;',
+      ' border: 1px solid rgba(255,255,255,.18); box-shadow: 0 8px 28px rgba(0,0,0,.55); background: #000;',
+      ' pointer-events: none; }',
+    '.zb-we-hover img, .zb-we-hover video { display: block; width: 100%; max-height: 78vh; object-fit: contain; }',
+    '.zb-we-list { max-height: 430px; overflow-y: auto; overscroll-behavior: contain; margin-right: -4px; padding-right: 4px; }',
+    '.zb-we-group { padding: 6px 4px 4px; font-size: 11px; opacity: .6; }',
+    '.zb-we-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }',
+    '.zb-we-card { position: relative; border: 1px solid rgba(255,255,255,.14); border-radius: 8px; overflow: hidden;',
+      ' cursor: pointer; background: rgba(255,255,255,.04); }',
+    '.zb-we-card:hover { border-color: rgba(122,162,247,.7); background: rgba(255,255,255,.08); }',
+    '.zb-we-card[data-sel="1"] { border-color: #7aa2f7; background: rgba(122,162,247,.16); }',
+    '.zb-we-card[data-off="1"] { opacity: .45; cursor: default; }',
+    '.zb-we-card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #000; }',
+    '.zb-we-ph { width: 100%; aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center;',
+      ' font-size: 12px; opacity: .5; background: rgba(255,255,255,.06); }',
+    '.zb-we-name { font-size: 12px; line-height: 1.35; padding: 5px 6px 6px; display: -webkit-box;',
+      ' -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }',
+    '.zb-we-tick { position: absolute; top: 6px; right: 6px; width: 18px; height: 18px; border-radius: 50%;',
+      ' background: #7aa2f7; color: #0d0d14; font-size: 12px; font-weight: 700; line-height: 18px; text-align: center; display: none; }',
+    '.zb-we-card[data-sel="1"] .zb-we-tick { display: block; }',
+    '.zb-we-done { position: absolute; top: 6px; left: 6px; font-size: 10px; padding: 1px 6px; border-radius: 4px;',
+      ' background: rgba(74,222,128,.9); color: #0d0d14; }',
+    '.zb-we-tag { position: absolute; bottom: 6px; right: 6px; font-size: 10px; padding: 1px 5px; border-radius: 4px;',
+      ' background: rgba(0,0,0,.55); border: 1px solid rgba(255,255,255,.25); }',
+    '.zb-we-foot { display: flex; align-items: center; gap: 8px; padding-top: 8px; font-size: 12px; }',
+    '.zb-we-selinfo { flex: 1; opacity: .75; }',
+    '.zb-we-foot .zb-btn { font-size: 12px; padding: 4px 12px; }',
+    '.zb-we-foot .zb-btn[disabled] { opacity: .45; cursor: default; }',
+    '.zb-we-card[hidden] { display: none; }',
+    '.zb-we-empty { padding: 18px 10px; font-size: 12px; opacity: .7; line-height: 1.7; text-align: center; }',
     '.zb-item { display: flex; align-items: center; gap: 4px; padding: 3px 6px; border-radius: 6px; }',
     '.zb-item:hover { background: rgba(255,255,255,.1); }',
     '.zb-item[data-current="1"] { background: rgba(122,162,247,.25); }',
+    '.zb-item .zb-item-img { width: 44px; height: 25px; object-fit: cover; border-radius: 3px; flex: none; background: #000; }',
     '.zb-item .zb-label { flex: 1; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
     '.zb-item .zb-label-input { flex: 1; min-width: 0; padding: 1px 4px; border-radius: 4px; border: 1px solid rgba(122,162,247,.6);',
       ' background: rgba(0,0,0,.35); color: inherit; font-size: 11px; outline: none; }',
     '.zb-item .zb-act { cursor: pointer; opacity: .5; padding: 0 3px; font-size: 11px; background: none; border: none; color: inherit; }',
+    // Display card sections: one card hosts \u753B\u9762/\u754C\u9762/\u804A\u5929\u754C\u9762/\u663C\u591C\u62A4\u773C
+    // groups \u2014 a hairline-separated mini header each, sliders paired in a
+    // two-column grid so the merged card stays compact.
+    '.zb-sec { display: flex; align-items: center; justify-content: space-between; gap: 8px;',
+      ' padding: 5px 2px 2px; margin-top: 4px; border-top: 1px solid rgba(255,255,255,.08);',
+      ' font-size: 10px; opacity: .55; letter-spacing: 2px; }',
+    '.zb-collapse-inner > .zb-sec:first-child { border-top: none; margin-top: 0; padding-top: 2px; }',
+    '.zb-sec .zb-sec-on { display: flex; align-items: center; gap: 4px; font-size: 10px;',
+      ' letter-spacing: normal; opacity: 1; cursor: pointer; white-space: nowrap; }',
+    '.zb-g2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }',
     '.zb-item .zb-act:hover { opacity: 1; }',
     '.zb-item .zb-act[data-armed="1"] { opacity: 1; color: #f87171; }',
     '#zb-offline { display: flex; flex-direction: column; gap: 6px; align-items: center;',
@@ -111376,39 +112247,162 @@ function buildPanelScript(apiPort) {
     '    <button class="zb-btn" id="zb-retry">\u91CD\u8BD5\u8FDE\u63A5</button>' +
     '  </div>' +
     '  <div id="zb-body">' +
-    '    <div class="zb-row"><label title="\u80CC\u666F\u6A21\u7CCA\u7A0B\u5EA6(\u50CF\u7D20)"><span>\u80CC\u666F\u6A21\u7CCA</span><span><span id="zb-blur-val">0</span>px</span></label>' +
-    '      <input type="range" id="zb-blur" min="0" max="30" step="1" value="0"></div>' +
-    '    <div class="zb-row"><label title="\u80CC\u666F\u538B\u6697\u7A0B\u5EA6(\u767E\u5206\u6BD4,\u8D8A\u9AD8\u8D8A\u6697)"><span>\u80CC\u666F\u538B\u6697</span><span><span id="zb-dim-val">0</span>%</span></label>' +
-    '      <input type="range" id="zb-dim" min="0" max="80" step="1" value="0"></div>' +
-    '    <div class="zb-row zb-toggles">' +
-    '      <label title="\u6839\u636E\u58C1\u7EB8\u81EA\u52A8\u751F\u6210 UI \u914D\u8272;\u5173\u95ED\u5219\u4FDD\u7559 ZCode \u539F\u751F\u989C\u8272"><input type="checkbox" id="zb-monet">UI \u83AB\u5948\u53D6\u8272</label>' +
-    '      <label title="\u663E\u793A\u6216\u9690\u85CF\u80CC\u666F\u58C1\u7EB8"><input type="checkbox" id="zb-vis">\u663E\u793A\u58C1\u7EB8</label>' +
+    '    <div id="zb-tabs">' +
+    '      <button class="zb-tab" data-tab="main">\u58C1\u7EB8</button>' +
+    '      <button class="zb-tab" data-tab="sched">\u5B9A\u65F6\u64AD\u653E</button>' +
+    '      <button class="zb-tab" data-tab="settings">\u8BBE\u7F6E</button>' +
     '    </div>' +
-    '    <div class="zb-row zb-actions">' +
-    '      <button class="zb-btn" id="zb-fit" title="\u80CC\u666F\u586B\u5145\u65B9\u5F0F:\u586B\u6EE1\u88C1\u526A\u94FA\u6EE1\u7A97\u53E3 / \u5B8C\u6574\u663E\u793A\u4E0D\u88C1\u526A(\u6A21\u7CCA\u57AB\u5E95)/ \u667A\u80FD\u9002\u914D\u81EA\u52A8\u5206\u6790\u753B\u9762\u4E3B\u4F53">\u80CC\u666F\u586B\u5145: \u2026</button>' +
+    '    <div id="zb-tab-main">' +
+    '    <div class="zb-card zb-collapsible" id="zb-card-history"><div class="zb-card-title" style="display:flex;justify-content:space-between;align-items:center"><span>\u6700\u8FD1\u4F7F\u7528 <button class="zb-act" id="zb-stats" title="\u58C1\u7EB8\u7D2F\u8BA1\u5C55\u793A\u65F6\u957F\u6392\u884C">\u{1F4CA}</button></span> <span class="zb-fold">\u25BE</span></div>' +
+    '      <div class="zb-collapse-wrap"><div class="zb-collapse-inner">' +
+    '      <div class="zb-lib-list" id="zb-history" style="max-height:192px"></div>' +
+    '      </div></div>' +
     '    </div>' +
-    '    <div class="zb-row zb-actions">' +
-    '      <label class="zb-btn" for="zb-file" title="\u9009\u62E9\u4E00\u5F20\u56FE\u7247\u4F5C\u4E3A\u80CC\u666F\u58C1\u7EB8,UI \u914D\u8272\u968F\u4E4B\u66F4\u65B0">\u66F4\u6362\u56FE\u7247\u2026</label>' +
-    '      <input type="file" id="zb-file" accept="image/*" hidden>' +
-    '    </div>' +
-    '    <div class="zb-row"><label style="opacity:.85"><span>\u52A8\u6001\u58C1\u7EB8 (\u573A\u666F / \u89C6\u9891)</span></label>' +
-    '      <div class="zb-actions" style="margin:2px 0 6px">' +
-    '        <button class="zb-btn" id="zb-pick" title="\u6253\u5F00\u6587\u4EF6\u9009\u62E9\u5668:\u9009 .pkg(\u573A\u666F)\u6216 .mp4(\u89C6\u9891),\u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6(\u4F1A\u81EA\u52A8\u5B9A\u4F4D),\u9009\u5B8C\u81EA\u52A8\u5F00\u59CB\u5BFC\u5165">\u9009\u62E9\u5E76\u5BFC\u5165\u2026</button>' +
-    '      </div>' +
-    '      <input type="text" id="zb-scene-path" placeholder="\u6216\u7C98\u8D34 .pkg / .mp4 / \u58C1\u7EB8\u76EE\u5F55\u5B8C\u6574\u8DEF\u5F84\u2026" spellcheck="false">' +
-    '      <div class="zb-actions" style="margin-top:6px">' +
-    '        <button class="zb-btn" id="zb-import" title="\u6E32\u67D3\u5E76\u5F55\u5236\u573A\u666F\u58C1\u7EB8,\u751F\u6210\u65E0\u7F1D\u5FAA\u73AF\u52A8\u6001\u80CC\u666F">\u5BFC\u5165\u7C98\u8D34\u7684\u8DEF\u5F84</button>' +
+    '    <div class="zb-card zb-collapsible" id="zb-card-scenes"><div class="zb-card-title">\u58C1\u7EB8\u5E93 \xB7 \u52A8\u6001 <span class="zb-fold">\u25BE</span></div>' +
+    '      <div class="zb-collapse-wrap"><div class="zb-collapse-inner">' +
+    '      <div class="zb-import-row">' +
+    '        <button class="zb-btn zb-icon-btn" id="zb-pick" title="\u6253\u5F00\u6587\u4EF6\u9009\u62E9\u5668(\u53EF\u591A\u9009):\u9009 .pkg(\u573A\u666F)\u6216 .mp4(\u89C6\u9891),\u9009\u5B8C\u81EA\u52A8\u6392\u961F\u5BFC\u5165">\u{1F4C1}</button>' +
+    '        <button class="zb-btn zb-icon-btn" id="zb-we-lib" title="\u6D4F\u89C8\u672C\u673A Wallpaper Engine \u58C1\u7EB8\u5E93(\u521B\u610F\u5DE5\u574A/\u81EA\u5EFA\u9879\u76EE),\u70B9\u51FB\u5373\u53EF\u5BFC\u5165">\u{1F9E9}</button>' +
+    '        <input type="text" id="zb-scene-path" placeholder="\u7C98\u8D34 .pkg/.mp4/\u76EE\u5F55\u8DEF\u5F84,\u56DE\u8F66\u5BFC\u5165" spellcheck="false">' +
+    '        <button class="zb-btn" id="zb-import" title="\u6E32\u67D3\u5E76\u5F55\u5236\u573A\u666F\u58C1\u7EB8,\u751F\u6210\u65E0\u7F1D\u5FAA\u73AF\u52A8\u6001\u80CC\u666F">\u5BFC\u5165</button>' +
     '      </div>' +
     '      <div id="zb-progress" hidden><div id="zb-progress-bar"></div><span>\u2026</span></div>' +
     '      <div id="zb-guide" hidden></div>' +
     '      <div class="zb-actions" style="margin-top:6px"><button class="zb-btn" id="zb-guide-retry" hidden>\u5DF2\u5B89\u88C5,\u91CD\u8BD5</button></div>' +
+    '      <div class="zb-lib-list" id="zb-lib-scenes"></div>' +
+    '      <div class="zb-lib-head" id="zb-storage" style="display:flex;align-items:center;gap:6px;margin-top:4px">' +
+    '        <span id="zb-storage-text" style="flex:1">\u2026</span>' +
+    '        <button class="zb-act" id="zb-open-scenes" title="\u5728\u8D44\u6E90\u7BA1\u7406\u5668\u4E2D\u6253\u5F00\u52A8\u6001\u58C1\u7EB8\u7F13\u5B58\u76EE\u5F55">\u{1F4C2}</button>' +
+    '        <button class="zb-act" id="zb-compress" title="\u7701\u7535\u538B\u7F29:\u628A\u52A8\u6001\u58C1\u7EB8\u5FAA\u73AF\u91CD\u7F16\u7801\u4E3A 720p/24fps,\u663E\u8457\u964D\u4F4E GPU \u89E3\u7801\u5360\u7528\u4E0E\u4F53\u79EF(\u4F7F\u7528\u4E2D\u7684\u8DF3\u8FC7,\u53EF\u91CD\u65B0\u5BFC\u5165\u6062\u590D\u539F\u753B\u8D28)">\u26A1 \u538B\u7F29</button>' +
+    '        <button class="zb-act" id="zb-purge" title="\u5220\u9664\u5168\u90E8\u5DF2\u7F13\u5B58\u7684\u52A8\u6001\u58C1\u7EB8\u5FAA\u73AF(\u6B63\u5728\u4F7F\u7528\u7684\u9664\u5916)">\u{1F5D1} \u6E05\u7406</button>' +
+    '      </div>' +
+    '      </div></div>' +
     '    </div>' +
-    '    <div class="zb-row zb-lib" id="zb-lib"></div>' +
-    '    <div class="zb-row zb-actions">' +
-    '      <button class="zb-btn" id="zb-reset" title="\u79FB\u9664\u58C1\u7EB8\u4E0E\u914D\u8272,\u8FD8\u539F ZCode \u9ED8\u8BA4\u5916\u89C2(\u58C1\u7EB8\u4F1A\u88AB\u8BB0\u4F4F,\u53EF\u518D\u6B21\u6062\u590D)">\u8FD8\u539F\u9ED8\u8BA4\u5916\u89C2</button>' +
+    '    <div class="zb-card zb-collapsible" id="zb-card-images"><div class="zb-card-title">\u58C1\u7EB8\u5E93 \xB7 \u56FE\u7247 <span class="zb-fold">\u25BE</span></div>' +
+    '      <div class="zb-collapse-wrap"><div class="zb-collapse-inner">' +
+    '      <div class="zb-import-row">' +
+    '        <label class="zb-btn zb-grow" for="zb-file" title="\u9009\u62E9\u4E00\u5F20\u56FE\u7247\u4F5C\u4E3A\u80CC\u666F\u58C1\u7EB8,UI \u914D\u8272\u968F\u4E4B\u66F4\u65B0">\u{1F5BC} \u66F4\u6362\u56FE\u7247\u2026</label>' +
+    '        <button class="zb-act" id="zb-img-sort" title="\u5207\u6362\u6392\u5E8F:\u6309\u65F6\u95F4(\u65B0\u2192\u65E7)/\u6309\u540D\u79F0">\u21C5 \u65F6\u95F4</button>' +
+    '        <button class="zb-act" id="zb-img-batch" title="\u6279\u91CF\u5220\u9664:\u52FE\u9009\u591A\u4E2A\u6761\u76EE\u540E\u4E00\u6B21\u5220\u9664">\u2630 \u6279\u91CF</button>' +
+    '        <button class="zb-act" id="zb-open-images" title="\u5728\u8D44\u6E90\u7BA1\u7406\u5668\u4E2D\u6253\u5F00\u56FE\u7247\u58C1\u7EB8\u76EE\u5F55">\u{1F4C2}</button>' +
+    '        <input type="file" id="zb-file" accept="image/*" hidden>' +
+    '      </div>' +
+    '      <div class="zb-lib-list" id="zb-lib-images"></div>' +
+    '      </div></div>' +
+    '    </div>' +
+    '    </div>' +
+    '    <div id="zb-tab-settings" hidden>' +
+    '    <div class="zb-card zb-collapsible" id="zb-card-display"><div class="zb-card-title">\u663E\u793A\u8C03\u8282 <span class="zb-fold">\u25BE</span></div>' +
+    '      <div class="zb-collapse-wrap"><div class="zb-collapse-inner">' +
+    '    <div class="zb-sec">\u753B\u9762</div>' +
+    '    <div class="zb-g2">' +
+    '    <div class="zb-row"><label title="\u80CC\u666F\u6A21\u7CCA\u7A0B\u5EA6(\u50CF\u7D20)"><span>\u80CC\u666F\u6A21\u7CCA</span><span><span id="zb-blur-val">0</span>px</span></label>' +
+    '      <input type="range" id="zb-blur" min="0" max="30" step="1" value="0"></div>' +
+    '    <div class="zb-row"><label title="\u80CC\u666F\u538B\u6697\u7A0B\u5EA6(\u767E\u5206\u6BD4,\u8D8A\u9AD8\u8D8A\u6697)"><span>\u80CC\u666F\u538B\u6697</span><span><span id="zb-dim-val">0</span>%</span></label>' +
+    '      <input type="range" id="zb-dim" min="0" max="80" step="1" value="0"></div>' +
+    '    </div>' +
+    '    <div class="zb-sched-mode"><span>\u586B\u5145</span><select id="zb-fit" title="\u80CC\u666F\u586B\u5145\u65B9\u5F0F:\u586B\u6EE1\u88C1\u526A\u94FA\u6EE1\u7A97\u53E3 / \u5B8C\u6574\u663E\u793A\u4E0D\u88C1\u526A(\u6A21\u7CCA\u57AB\u5E95)/ \u667A\u80FD\u9002\u914D\u81EA\u52A8\u5206\u6790\u753B\u9762\u4E3B\u4F53" style="flex:1">' +
+    '      <option value="cover">\u586B\u6EE1\u88C1\u526A</option>' +
+    '      <option value="contain">\u5B8C\u6574\u663E\u793A</option>' +
+    '      <option value="smart">\u667A\u80FD\u9002\u914D</option>' +
+    '    </select></div>' +
+    '    <div class="zb-sec">\u754C\u9762</div>' +
+    '    <div class="zb-row zb-toggles">' +
+    '      <label title="\u6839\u636E\u58C1\u7EB8\u81EA\u52A8\u751F\u6210 UI \u914D\u8272;\u5173\u95ED\u5219\u4FDD\u7559 ZCode \u539F\u751F\u989C\u8272"><input type="checkbox" id="zb-monet">UI \u83AB\u5948\u53D6\u8272</label>' +
+    '      <button class="zb-act" id="zb-pin" title="\u4ECE\u58C1\u7EB8\u4E3B\u8272\u9501\u5B9A\u4E3B\u9898\u8272(\u53D6\u8272\u504F\u8272\u65F6\u624B\u5DE5\u9489\u4E00\u4E2A)">\u{1F3A8} \u9501\u8272</button>' +
+    '    </div>' +
+    '    <div class="zb-row zb-toggles">' +
+    '      <label title="\u663E\u793A\u6216\u9690\u85CF\u80CC\u666F\u58C1\u7EB8"><input type="checkbox" id="zb-vis">\u663E\u793A\u58C1\u7EB8</label>' +
+    '      <label title="\u56FE\u7247\u58C1\u7EB8\u7F13\u6162\u7F29\u653E\u5E73\u79FB(\u547C\u5438\u611F);\u6A21\u7CCA\u5F00\u542F\u65F6\u81EA\u52A8\u505C\u7528"><input type="checkbox" id="zb-kb">\u56FE\u7247\u7F13\u52A8</label>' +
+    '    </div>' +
+    '    <div class="zb-row"><label title="\u89C6\u9891\u58C1\u7EB8\u7684\u97F3\u91CF(0=\u9759\u97F3,\u4EC5\u5BF9\u4FDD\u7559\u4E86\u58F0\u97F3\u7684\u5BFC\u5165\u751F\u6548)"><span>\u89C6\u9891\u97F3\u91CF</span><span><span id="zb-vol-val">0</span>%</span></label>' +
+    '      <input type="range" id="zb-vol" min="0" max="100" step="1" value="0"></div>' +
+    '    <div class="zb-sec">\u804A\u5929\u754C\u9762</div>' +
+    '    <div class="zb-g2">' +
+    '    <div class="zb-row"><label title="\u5BF9\u8BDD\u5217\u80CC\u540E\u7684\u989D\u5916\u538B\u6697,\u6D88\u606F\u6587\u5B57\u6D6E\u5728\u5176\u4E0A\u4E0D\u53D7\u5F71\u54CD"><span>\u804A\u5929\u533A\u6697\u5EA6</span><span id="zb-chat-dim-val">0.00</span></label>' +
+    '      <input type="range" id="zb-chat-dim" min="0" max="100" step="1" value="0"></div>' +
+    '    <div class="zb-row"><label title="\u7A97\u53E3\u9876\u90E8\u5411\u4E0B\u6E10\u9690\u906E\u7F69\u7684\u6D53\u5EA6"><span>\u906E\u7F69\u4E0A\u7AEF</span><span id="zb-chat-top-val">0.00</span></label>' +
+    '      <input type="range" id="zb-chat-top" min="0" max="100" step="1" value="0"></div>' +
+    '    <div class="zb-row"><label title="\u7A97\u53E3\u5E95\u90E8\u5411\u4E0A\u6E10\u9690\u906E\u7F69\u7684\u6D53\u5EA6(\u8F93\u5165\u6846\u9644\u8FD1)"><span>\u906E\u7F69\u4E0B\u7AEF</span><span id="zb-chat-bot-val">0.00</span></label>' +
+    '      <input type="range" id="zb-chat-bot" min="0" max="100" step="1" value="0"></div>' +
+    '    <div class="zb-row"><label title="\u6574\u7A97\u767D\u8272\u8584\u7EB1\u6D53\u5EA6,\u6697\u8272\u58C1\u7EB8\u4E0B\u63D0\u5347\u6587\u5B57\u53EF\u8BFB\u6027"><span>\u5927\u5BB9\u5668\u504F\u767D</span><span id="zb-chat-frost-val">0.00</span></label>' +
+    '      <input type="range" id="zb-chat-frost" min="0" max="100" step="1" value="0"></div>' +
+    '    </div>' +
+    '    <div class="zb-sec">\u663C\u591C\u62A4\u773C <label title="\u6309\u65F6\u95F4\u6BB5\u81EA\u52A8\u5207\u6362\u4E24\u5957\u663E\u793A\u53C2\u6570" class="zb-sec-on"><input type="checkbox" id="zb-dn-on">\u6309\u65F6\u6BB5\u81EA\u52A8\u8C03\u6697</label></div>' +
+    '      <div class="zb-sched-mode"><span>\u767D\u5929</span><input type="time" id="zb-dn-start" style="flex:1">' +
+    '        <span style="opacity:.5">\u81F3</span><input type="time" id="zb-dn-end" style="flex:1"></div>' +
+    '      <div class="zb-sched-mode"><span>\u767D\u5929\u538B\u6697</span><input type="number" id="zb-dn-daydim" min="0" max="80" style="width:48px">%' +
+    '        <span>\u6A21\u7CCA</span><input type="number" id="zb-dn-dayblur" min="0" max="30" style="width:44px">px</div>' +
+    '      <div class="zb-sched-mode"><span>\u591C\u95F4\u538B\u6697</span><input type="number" id="zb-dn-nightdim" min="0" max="80" style="width:48px">%' +
+    '        <span>\u6A21\u7CCA</span><input type="number" id="zb-dn-nightblur" min="0" max="30" style="width:44px">px</div>' +
+    '      </div></div>' +
+    '    </div>' +
+    '    <div class="zb-card" id="zb-card-config"><div class="zb-card-title">\u914D\u7F6E</div>' +
+    '      <div class="zb-actions zb-cfg-row">' +
+    '        <button class="zb-btn" id="zb-reset" title="\u79FB\u9664\u58C1\u7EB8\u4E0E\u914D\u8272,\u8FD8\u539F ZCode \u9ED8\u8BA4\u5916\u89C2(\u58C1\u7EB8\u4F1A\u88AB\u8BB0\u4F4F,\u53EF\u518D\u6B21\u6062\u590D)">\u8FD8\u539F\u5916\u89C2</button>' +
+    '        <button class="zb-btn" id="zb-cfg-export" title="\u5BFC\u51FA\u5F53\u524D\u58C1\u7EB8/\u5916\u89C2/\u64AD\u653E\u65B9\u6848\u4E3A JSON \u6587\u4EF6">\u2B07 \u5BFC\u51FA</button>' +
+    '        <button class="zb-btn" id="zb-cfg-import" title="\u4ECE\u5BFC\u51FA\u7684 JSON \u6587\u4EF6\u6062\u590D\u914D\u7F6E">\u2B06 \u5BFC\u5165</button>' +
+    '        <input type="file" id="zb-cfg-file" accept="application/json,.json" hidden>' +
+    '      </div>' +
+    '      <div class="zb-sched-mode" style="margin:6px 0 0"><label title="ZCode \u542F\u52A8\u5C4F(\u52A0\u8F7D\u9875)\u671F\u95F4\u4E0D\u663E\u793A\u58C1\u7EB8\u4E0E\u7F8E\u5316\u9762\u677F,\u4E3B\u754C\u9762\u5C31\u7EEA\u540E\u518D\u51FA\u73B0"><input type="checkbox" id="zb-startup-clean">\u542F\u52A8\u5C4F\u65F6\u9690\u85CF\u58C1\u7EB8\u4E0E\u9762\u677F</label></div>' +
+    '      <div class="zb-sched-mode" style="margin-top:4px"><label title="ZCode \u4E0B\u8F7D/\u5B89\u88C5\u66F4\u65B0\u7684\u8FDB\u5EA6\u7A97\u53E3\u9ED8\u8BA4\u4E0D\u663E\u793A\u58C1\u7EB8;\u52FE\u9009\u540E\u66F4\u65B0\u7A97\u53E3\u663E\u793A\u58C1\u7EB8(\u4EC5\u58C1\u7EB8,\u4E0D\u663E\u793A\u7F8E\u5316\u9762\u677F)"><input type="checkbox" id="zb-updater-wp">ZCode \u66F4\u65B0\u754C\u9762\u663E\u793A\u58C1\u7EB8</label></div>' +
+    '      <div class="zb-sched-mode" style="margin-top:4px"><label title="\u60AC\u505C WE \u5E93\u4E2D\u7684\u89C6\u9891\u58C1\u7EB8\u65F6\u76F4\u63A5\u64AD\u653E\u5176\u771F\u5B9E\u753B\u9762(\u800C\u975E\u5C01\u9762\u56FE);\u573A\u666F\u58C1\u7EB8\u4ECD\u663E\u793A\u5C01\u9762"><input type="checkbox" id="zb-we-live">WE \u9884\u89C8\u64AD\u653E\u771F\u5B9E\u89C6\u9891</label></div>' +
+'      <div class="zb-sched-mode" style="margin-top:4px"><span title="\u58C1\u7EB8\u5E93\xB7\u52A8\u6001\u5217\u8868\u4E00\u6B21\u6700\u591A\u53EF\u89C1\u7684\u884C\u6570(\u5176\u4F59\u6EDA\u52A8\u67E5\u770B)">\u52A8\u6001\u5E93</span>' +
+    '        <input type="number" id="zb-rows-scenes" min="3" max="20" step="1" style="width:44px" title="\u52A8\u6001\u58C1\u7EB8\u5217\u8868\u6700\u591A\u663E\u793A\u884C\u6570">' +
+    '        <span title="\u58C1\u7EB8\u5E93\xB7\u56FE\u7247\u5217\u8868\u4E00\u6B21\u6700\u591A\u53EF\u89C1\u7684\u884C\u6570(\u5176\u4F59\u6EDA\u52A8\u67E5\u770B)">\u56FE\u7247\u5E93</span>' +
+    '        <input type="number" id="zb-rows-images" min="3" max="20" step="1" style="width:44px" title="\u56FE\u7247\u58C1\u7EB8\u5217\u8868\u6700\u591A\u663E\u793A\u884C\u6570">\u884C</div>' +
+'      <div class="zb-sched-mode" style="margin-top:4px"><span title="\u573A\u666F\u58C1\u7EB8\u5F55\u5236\u8F93\u51FA\u7684\u5206\u8FA8\u7387;\u9ED8\u8BA4=\u58C1\u7EB8\u9879\u76EE\u81EA\u5E26\u5C3A\u5BF8">\u5F55\u5236\u5206\u8FA8\u7387</span>' +
+    '        <select id="zb-import-res" style="flex:1"><option value="auto">\u9ED8\u8BA4(\u8DDF\u968F\u58C1\u7EB8)</option><option value="1920x1080">1920\xD71080</option><option value="1280x720">1280\xD7720(\u7701\u7535)</option><option value="custom">\u81EA\u5B9A\u4E49\u2026</option></select>' +
+    '        <input type="number" id="zb-res-w" min="256" max="3840" step="2" style="width:52px" hidden>' +
+    '        <input type="number" id="zb-res-h" min="144" max="2160" step="2" style="width:52px" hidden></div>' +
+    '    </div>' +
+    '    </div>' +
+    '    <div id="zb-tab-sched" hidden>' +
+    '    <div class="zb-card"><div class="zb-card-title" style="display:flex;justify-content:space-between;align-items:center">\u8F6E\u64AD\u72B6\u6001 <span id="zb-rot-state" style="opacity:.7;font-weight:400">\u2026</span></div>' +
+    '    </div>' +
+    '    <div class="zb-card"><div class="zb-card-title">\u65B9\u6848</div>' +
+    '      <div class="zb-sched-head" style="margin-bottom:6px"><span>\u5F53\u524D</span>' +
+    '        <label title="\u542F\u7528\u540E\u6309\u6240\u9009\u6A21\u5F0F\u81EA\u52A8\u5207\u6362\u58C1\u7EB8"><input type="checkbox" id="zb-sched-on">\u542F\u7528</label></div>' +
+    '      <div class="zb-sched-plan"><select id="zb-plan" title="\u64AD\u653E\u65B9\u6848"></select>' +
+    '        <button class="zb-act" id="zb-plan-add" title="\u65B0\u5EFA\u64AD\u653E\u65B9\u6848">\u2795</button>' +
+    '        <button class="zb-act" id="zb-plan-ren" title="\u91CD\u547D\u540D\u5F53\u524D\u65B9\u6848">\u270E</button>' +
+    '        <button class="zb-act" id="zb-plan-del" title="\u5220\u9664\u5F53\u524D\u65B9\u6848">\u{1F5D1}</button>' +
+    '      </div>' +
+    '    </div>' +
+    '    <div class="zb-card"><div class="zb-card-title">\u64AD\u653E\u8BBE\u7F6E</div>' +
+    '      <div class="zb-sched-mode"><span>\u6A21\u5F0F</span><select id="zb-sched-mode">' +
+    '        <option value="sequence">\u987A\u5E8F\u8F6E\u64AD</option>' +
+    '        <option value="random">\u968F\u673A\u8F6E\u64AD</option>' +
+    '        <option value="schedule">\u5B9A\u65F6\u5207\u6362</option>' +
+    '      </select></div>' +
+    '      <div class="zb-sched-mode"><span>\u7279\u6548</span><select id="zb-fx" title="\u672C\u65B9\u6848\u64AD\u653E\u65F6\u7684\u58C1\u7EB8\u5207\u6362\u7279\u6548">' +
+    '        <option value="fade">\u4EA4\u53C9\u6DE1\u5165</option>' +
+    '        <option value="slide">\u53F3\u4FA7\u6ED1\u5165</option>' +
+    '        <option value="zoom">\u7F29\u653E\u6D6E\u73B0</option>' +
+    '        <option value="blur">\u6A21\u7CCA\u6E10\u6E05</option>' +
+    '        <option value="none">\u76F4\u63A5\u5207\u6362</option>' +
+    '      </select></div>' +
+    '      <div class="zb-sched-mode" title="\u65B9\u6848\u751F\u6548\u65F6\u6BB5:\u7559\u7A7A = \u5168\u5929\u751F\u6548;\u8DE8\u591C(\u5982 20:00-06:00)\u652F\u6301"><span>\u65F6\u6BB5</span>' +
+    '        <input type="time" id="zb-win-start" style="flex:1" step="60">' +
+    '        <span style="opacity:.5">\u81F3</span>' +
+    '        <input type="time" id="zb-win-end" style="flex:1" step="60">' +
+    '        <button class="zb-act" id="zb-win-clear" title="\u6E05\u9664\u65F6\u6BB5(\u5168\u5929\u751F\u6548)">\u2715</button>' +
+    '      </div>' +
+    '    </div>' +
+    '    <div class="zb-card"><div class="zb-card-title">\u64AD\u653E\u5217\u8868</div>' +
+    '      <div id="zb-sched-list"></div>' +
+    '      <div class="zb-actions">' +
+    '        <button class="zb-btn" id="zb-sched-add" title="\u6DFB\u52A0\u4E00\u6761:\u9009\u62E9\u58C1\u7EB8\u5E76\u8BBE\u5B9A\u65F6\u957F\u6216\u65F6\u95F4\u70B9">\u2795 \u6DFB\u52A0</button>' +
+    '        <button class="zb-btn" id="zb-sched-save" title="\u4FDD\u5B58\u5168\u90E8\u65B9\u6848(\u4E0D\u6539\u53D8\u542F\u7528\u72B6\u6001)">\u{1F4BE} \u4FDD\u5B58</button>' +
+    '        <button class="zb-btn" id="zb-sched-play" title="\u4FDD\u5B58\u5E76\u7ACB\u5373\u542F\u7528\u5F53\u524D\u65B9\u6848\u5F00\u59CB\u64AD\u653E">\u25B6 \u64AD\u653E</button>' +
+    '        <button class="zb-btn" id="zb-sched-next" title="\u8DF3\u8FC7\u5F53\u524D\u65F6\u957F,\u7ACB\u5373\u5207\u6362\u5230\u4E0B\u4E00\u5F20\u58C1\u7EB8">\u23ED \u7ACB\u5373\u5207\u6362</button>' +
+    '      </div>' +
+    '      <div class="zb-lib-head" id="zb-sched-hint" style="margin:4px 0 0"></div>' +
+    '    </div>' +
     '    </div>' +
     '  </div>' +
     '</div>' +
+    '<div id="zb-hover-preview" hidden><video muted autoplay loop playsinline></video><img alt=""></div>' +
     '<div id="zb-status"></div>';
   document.body.appendChild(root);
 
@@ -111420,11 +112414,109 @@ function buildPanelScript(apiPort) {
     setTimeout(function () { if (el.textContent === msg) el.textContent = ''; }, 2200);
   }
   function post(path, body, cb) {
-    fetch(API + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    apiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(function (r) { return r.json(); })
       .then(function (d) { if (cb) cb(d); })
-      .catch(function () { status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable'); });
+      .catch(function () {
+        status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable');
+        // Callers count completions inside cb (batch delete); an unreachable
+        // request must still drain the counter or the UI sticks mid-action.
+        if (cb) cb(undefined);
+      });
   }
+
+  // --- hover peek: resting the cursor on a wallpaper thumbnail (library rows,
+  // picker popup items, picker buttons) opens a bigger preview to the LEFT of
+  // the panel. The 260ms delay keeps a cursor merely sweeping past quiet.
+  var ZB_HOVER_SEL = '.zb-item .zb-item-img, .zb-wp-item img, .zb-wp-btn img';
+  var zbHoverTimer = null;
+  var zbHvPending = 0;
+  function hideHoverPreview() {
+    zbHvPending++;
+    if (zbHoverTimer) { clearTimeout(zbHoverTimer); zbHoverTimer = null; }
+    var box = $('zb-hover-preview');
+    if (box) {
+      box.hidden = true;
+      var v = box.querySelector('video');
+      if (v) { v.pause(); }
+    }
+  }
+  function zbHvReveal(box, thumb) {
+    box.hidden = false;
+    var r = thumb.getBoundingClientRect();
+    box.style.left = 'auto';
+    box.style.right = '296px'; // panel column (264+18) plus breathing room
+    var top = r.top + r.height / 2 - box.offsetHeight / 2;
+    if (top < 8) top = 8;
+    if (top + box.offsetHeight > window.innerHeight - 8) top = window.innerHeight - box.offsetHeight - 8;
+    box.style.top = Math.round(top) + 'px';
+  }
+  function showHoverPreview(thumb) {
+    var box = $('zb-hover-preview');
+    if (!box) return;
+    // Scene wallpapers get a LIVE preview: the loop video streams from serve,
+    // so hovering plays the actual wallpaper instead of an enlarged poster.
+    // Everything else (image library, playlists without a row key) keeps the
+    // enlarged image. Swapping src while visible showed the PREVIOUS item
+    // until the new one decoded (the flicker) \u2014 content is swapped while
+    // hidden and the box revealed only when the new medium is ready; a
+    // same-src re-hover reveals immediately.
+    var item = thumb.closest('.zb-item');
+    var key = item ? (item.getAttribute('data-key') || '') : '';
+    var isScene = /^[a-f0-9]{32}$/.test(key);
+    var vid = box.querySelector('video');
+    var img = box.querySelector('img');
+    zbHvPending++;
+    var myTicket = zbHvPending;
+    var reveal = function () {
+      if (myTicket !== zbHvPending) return; // a newer hover superseded us
+      vid.classList.toggle('zb-hv-off', !isScene);
+      img.classList.toggle('zb-hv-off', isScene);
+      if (isScene) vid.play().catch(function () {});
+      zbHvReveal(box, thumb);
+    };
+    if (isScene) {
+      var src = mt(API + '/media/scene/' + key + '.mp4');
+      var vReady = function () { vid.removeEventListener('loadeddata', vReady); reveal(); };
+      if (vid.getAttribute('src') === src && vid.readyState >= 2) { reveal(); return; }
+      box.hidden = true; // old content must not flash while the new loads
+      vid.pause();
+      vid.src = src;
+      vid.addEventListener('loadeddata', vReady);
+      setTimeout(function () { if (myTicket === zbHvPending && box.hidden) reveal(); }, 1200);
+    } else {
+      var iSrc = thumb.getAttribute('src') || thumb.src;
+      if (img.getAttribute('src') === iSrc && img.complete && img.naturalWidth > 0) { reveal(); return; }
+      box.hidden = true;
+      vid.pause();
+      vid.removeAttribute('src');
+      img.onload = function () { img.onload = null; reveal(); };
+      img.onerror = function () { img.onerror = null; reveal(); };
+      img.src = iSrc;
+      setTimeout(function () { if (myTicket === zbHvPending && box.hidden) reveal(); }, 1200);
+    }
+  }
+  var zbHvOver = function (e) {
+    if (zbHvGen !== window.__zbHvGen) { document.removeEventListener('mouseover', zbHvOver); return; }
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var thumb = t.closest(ZB_HOVER_SEL);
+    if (!thumb || thumb.tagName !== 'IMG') return;
+    if (zbHoverTimer) clearTimeout(zbHoverTimer);
+    zbHoverTimer = setTimeout(function () { zbHoverTimer = null; showHoverPreview(thumb); }, 260);
+  };
+  document.addEventListener('mouseover', zbHvOver);
+  var zbHvOut = function (e) {
+    if (zbHvGen !== window.__zbHvGen) { document.removeEventListener('mouseout', zbHvOut); return; }
+    var t = e.target;
+    if (!t || !t.closest) return;
+    var thumb = t.closest(ZB_HOVER_SEL);
+    if (!thumb) return;
+    if (e.relatedTarget && thumb.contains(e.relatedTarget)) return;
+    hideHoverPreview();
+  };
+  document.addEventListener('mouseout', zbHvOut);
+  window.addEventListener('scroll', hideHoverPreview, true);
 
   // Local live preview; the server re-injects the authoritative CSS right after.
   function preview() {
@@ -111443,7 +112535,11 @@ function buildPanelScript(apiPort) {
         blur: Number($('zb-blur').value),
         dim: Number($('zb-dim').value),
         monet: $('zb-monet').checked,
-        wallpaperVisible: $('zb-vis').checked
+        wallpaperVisible: $('zb-vis').checked,
+        kenBurns: $('zb-kb').checked,
+        startupClean: (document.getElementById('zb-startup-clean') || {}).checked !== false,
+        showOnUpdater: (document.getElementById('zb-updater-wp') || {}).checked === true,
+        videoVolume: Number($('zb-vol').value)
       }, function (d) { status(d && d.windows > 0 ? '\u5DF2\u5E94\u7528 applied' : '\u5DF2\u4FDD\u5B58(ZCode \u672A\u8FDE\u63A5)'); });
     }, 300);
   }
@@ -111455,7 +112551,7 @@ function buildPanelScript(apiPort) {
   function panelOpen() { return !$('zb-panel').hidden; }
   /** Re-check the service: while the panel is open, and always while offline. */
   function beat(on) {
-    if (on && !beatTimer) beatTimer = setInterval(refresh, 4000);
+    if (on && !beatTimer) beatTimer = zbEvery(refresh, 4000);
     if (!on && beatTimer) { clearInterval(beatTimer); beatTimer = null; }
   }
 
@@ -111467,11 +112563,11 @@ function buildPanelScript(apiPort) {
     if (on) {
       $('zb-blur').value = 0; $('zb-blur-val').textContent = '0';
       $('zb-dim').value = 0; $('zb-dim-val').textContent = '0';
+      setChatSliders(0, 0, 0, 0);
       $('zb-monet').checked = false;
       $('zb-vis').checked = false;
-      $('zb-fit').textContent = '\u80CC\u666F\u586B\u5145: \u672A\u77E5';
-      $('zb-fit').removeAttribute('data-fit');
-      $('zb-reset').textContent = '\u8FD8\u539F\u9ED8\u8BA4\u5916\u89C2';
+      $('zb-fit').value = 'cover';
+      $('zb-reset').textContent = '\u8FD8\u539F\u5916\u89C2';
       $('zb-reset').setAttribute('data-mode', 'reset');
       beat(true);
     } else {
@@ -111479,27 +112575,58 @@ function buildPanelScript(apiPort) {
     }
   }
 
+  // Last /api/config seen by refresh(); the add-button uses it to preselect
+  // the currently applied wallpaper in a new rotation row.
+  var lastConfig = null;
+  function currentWallpaperKey() {
+    if (lastConfig) {
+      if (lastConfig.mediaType === 'video' && lastConfig.sceneHash) return 'h:' + lastConfig.sceneHash;
+      if (lastConfig.wallpaperPath) return 'p:' + lastConfig.wallpaperPath;
+      return '';
+    }
+    try { return localStorage.getItem('zcode-beautify:current-key') || ''; } catch (e) { return ''; }
+  }
+
   function refresh() {
-    fetch(API + '/api/config')
+    apiFetch('/api/config')
       .then(function (r) { return r.json(); })
       .then(function (c) {
         setOffline(false);
+        lastConfig = c;
         $('zb-blur').value = c.blur; $('zb-blur-val').textContent = c.blur;
         $('zb-dim').value = c.dim; $('zb-dim-val').textContent = c.dim;
         $('zb-monet').checked = !!c.monet;
         $('zb-vis').checked = !!c.wallpaperVisible;
+        $('zb-kb').checked = !!c.kenBurns;
+        $('zb-vol').value = c.videoVolume ?? 0;
+        $('zb-vol-val').textContent = String(c.videoVolume ?? 0);
+        $('zb-pin').textContent = c.themeColor ? '\u{1F3A8} \u5DF2\u9501' : '\u{1F3A8} \u9501\u8272';
+        $('zb-pin').style.color = c.themeColor ? (c.themeColor) : '';
+        var dn = c.dayNight;
+        $('zb-dn-on').checked = !!(dn && dn.enabled);
+        if (dn) {
+          $('zb-dn-start').value = dn.start; $('zb-dn-end').value = dn.end;
+          $('zb-dn-daydim').value = dn.dayDim; $('zb-dn-nightdim').value = dn.nightDim;
+          $('zb-dn-dayblur').value = dn.dayBlur; $('zb-dn-nightblur').value = dn.nightBlur;
+        }
+        var cl = c.chatLook || {};
+        setChatSliders(cl.chatDim ?? 0, cl.maskTop ?? 0, cl.maskBottom ?? 0, cl.frost ?? 0);
         $('zb-fit') && applyFitLabel($('zb-fit'), c.fit || 'cover');
+        var sc = document.getElementById('zb-startup-clean');
+        if (sc) sc.checked = c.startupClean !== false;
+        var uw = document.getElementById('zb-updater-wp');
+        if (uw) uw.checked = c.showOnUpdater === true;
         var resetBtn = $('zb-reset');
         if (c.wallpaperSet) {
-          resetBtn.textContent = '\u8FD8\u539F\u9ED8\u8BA4\u5916\u89C2';
+          resetBtn.textContent = '\u8FD8\u539F\u5916\u89C2';
           resetBtn.setAttribute('data-mode', 'reset');
           resetBtn.title = '\u79FB\u9664\u58C1\u7EB8\u4E0E\u914D\u8272,\u8FD8\u539F ZCode \u9ED8\u8BA4\u5916\u89C2(\u58C1\u7EB8\u4F1A\u88AB\u8BB0\u4F4F,\u53EF\u518D\u6B21\u6062\u590D)';
         } else if (c.hasBackup) {
-          resetBtn.textContent = '\u6062\u590D\u6211\u7684\u58C1\u7EB8';
+          resetBtn.textContent = '\u6062\u590D\u58C1\u7EB8';
           resetBtn.setAttribute('data-mode', 'restore');
           resetBtn.title = '\u4ECE\u5907\u4EFD\u6062\u590D\u4F60\u4E4B\u524D\u7684\u58C1\u7EB8\u4E0E\u914D\u8272';
         } else {
-          resetBtn.textContent = '\u8FD8\u539F\u9ED8\u8BA4\u5916\u89C2';
+          resetBtn.textContent = '\u8FD8\u539F\u5916\u89C2';
           resetBtn.setAttribute('data-mode', 'reset');
           resetBtn.title = '\u5F53\u524D\u5DF2\u662F\u9ED8\u8BA4\u5916\u89C2';
         }
@@ -111515,18 +112642,249 @@ function buildPanelScript(apiPort) {
   });
   $('zb-monet').addEventListener('change', pushConfig);
   $('zb-vis').addEventListener('change', pushConfig);
+  $('zb-kb').addEventListener('change', pushConfig);
+  $('zb-vol').addEventListener('input', function () {
+    $('zb-vol-val').textContent = this.value;
+    pushConfig();
+  });
+
+  // --- day/night look schedule (\u62A4\u773C) --------------------------------------
+  function pushDayNight() {
+    var dn = {
+      enabled: $('zb-dn-on').checked,
+      start: $('zb-dn-start').value || '06:00',
+      end: $('zb-dn-end').value || '18:00',
+      dayDim: Number($('zb-dn-daydim').value) || 20,
+      nightDim: Number($('zb-dn-nightdim').value) || 55,
+      dayBlur: Number($('zb-dn-dayblur').value) || 0,
+      nightBlur: Number($('zb-dn-nightblur').value) || 6
+    };
+    post('/api/config', { dayNight: dn }, function (d) { if (d && d.error) status(d.error); });
+  }
+  // Import resolution (\u5F55\u5236\u5206\u8FA8\u7387): persisted in localStorage, sent with
+  // every import POST; "auto" lets serve follow the wallpaper project size.
+  var zbResSel = document.getElementById('zb-import-res');
+  var zbResW = document.getElementById('zb-res-w');
+  var zbResH = document.getElementById('zb-res-h');
+  function resCustomVisible() {
+    var on = zbResSel.value === 'custom';
+    zbResW.hidden = !on; zbResH.hidden = !on;
+  }
+  function resPayload() {
+    var mode = zbResSel.value;
+    var p = { mode: mode };
+    if (mode === 'custom') {
+      p.width = Math.max(256, Math.min(3840, Number(zbResW.value) || 1920));
+      p.height = Math.max(144, Math.min(2160, Number(zbResH.value) || 1080));
+    }
+    return p;
+  }
+  function resPersist() {
+    try { localStorage.setItem('zcode-beautify:import-res', JSON.stringify(resPayload())); } catch (e) {}
+  }
+  if (zbResSel) {
+    try {
+      var savedRes = JSON.parse(localStorage.getItem('zcode-beautify:import-res') || 'null');
+      if (savedRes && savedRes.mode) {
+        zbResSel.value = savedRes.mode === 'custom' || /^d+xd+$/.test(savedRes.mode) ? savedRes.mode : 'auto';
+        if (savedRes.width) zbResW.value = savedRes.width;
+        if (savedRes.height) zbResH.value = savedRes.height;
+      }
+    } catch (e) {}
+    resCustomVisible();
+    zbResSel.addEventListener('change', function () { resCustomVisible(); resPersist(); });
+    zbResW.addEventListener('change', resPersist);
+    zbResH.addEventListener('change', resPersist);
+  }
+  var zbWeLive = document.getElementById('zb-we-live');
+  if (zbWeLive) {
+    try { zbWeLive.checked = localStorage.getItem('zcode-beautify:we-live') !== '0'; } catch (e) {}
+    zbWeLive.addEventListener('change', function () {
+      try { localStorage.setItem('zcode-beautify:we-live', this.checked ? '1' : '0'); } catch (e) {}
+    });
+  }
+  var zbScEl = document.getElementById('zb-startup-clean');
+  if (zbScEl) zbScEl.addEventListener('change', pushConfig);
+  var zbUwEl = document.getElementById('zb-updater-wp');
+  if (zbUwEl) zbUwEl.addEventListener('change', pushConfig);
+  // Per-library visible row counts (\u8BBE\u7F6E \u2192 \u914D\u7F6E): stored in localStorage \u2014
+  // pure panel preference, no serve round-trip needed.
+  // Hover delegation is DOCUMENT-level and cannot be swept like intervals \u2014
+  // handlers from previous panel generations keep firing after a serve
+  // restart re-evaluates this script. Each generation mints a token; stale
+  // handlers see a foreign token, unbind themselves and step aside.
+  var zbHvGen = (window.__zbHvGen = (window.__zbHvGen || 0) + 1);
+  var zbRowH = 32;
+  var libRows = { scenes: 3, images: 3 };
+  try {
+    var savedRows = JSON.parse(localStorage.getItem('zcode-beautify:lib-rows') || 'null');
+    if (savedRows && typeof savedRows === 'object') {
+      if (savedRows.scenes >= 3 && savedRows.scenes <= 20) libRows.scenes = savedRows.scenes;
+      if (savedRows.images >= 3 && savedRows.images <= 20) libRows.images = savedRows.images;
+    }
+  } catch (e) {}
+  function applyLibRows() {
+    var targets = [['zb-lib-scenes', libRows.scenes], ['zb-lib-images', libRows.images]];
+    for (var i = 0; i < targets.length; i++) {
+      var el = document.getElementById(targets[i][0]);
+      if (!el) continue;
+      var first = el.querySelector('.zb-item');
+      var h = first ? first.offsetHeight : 0;
+      // A hidden pane measures 0 \u2014 keep the last REAL measurement so
+      // changing rows from the settings tab stays pixel-accurate.
+      if (h > 5) zbRowH = h;
+      var rowH = zbRowH;
+      el.style.maxHeight = rowH * targets[i][1] + 'px';
+    }
+    var a = document.getElementById('zb-rows-scenes');
+    var b = document.getElementById('zb-rows-images');
+    if (a) a.value = libRows.scenes;
+    if (b) b.value = libRows.images;
+  }
+  ['zb-rows-scenes', 'zb-rows-images'].forEach(function (id) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('change', function () {
+      var v = Math.max(3, Math.min(20, Math.round(Number(this.value) || 3)));
+      this.value = v;
+      if (this.id === 'zb-rows-scenes') libRows.scenes = v; else libRows.images = v;
+      try { localStorage.setItem('zcode-beautify:lib-rows', JSON.stringify(libRows)); } catch (e) {}
+      applyLibRows();
+    });
+  });
+  ['zb-dn-on', 'zb-dn-start', 'zb-dn-end', 'zb-dn-daydim', 'zb-dn-nightdim', 'zb-dn-dayblur', 'zb-dn-nightblur'].forEach(function (id) {
+    $(id).addEventListener('change', pushDayNight);
+  });
+
+  // --- chat-area zone look (\u804A\u5929\u754C\u9762) ----------------------------------------
+  function setChatSliders(d, mu, mb, f) {
+    $('zb-chat-dim').value = d; $('zb-chat-dim-val').textContent = (d / 100).toFixed(2);
+    $('zb-chat-top').value = mu; $('zb-chat-top-val').textContent = (mu / 100).toFixed(2);
+    $('zb-chat-bot').value = mb; $('zb-chat-bot-val').textContent = (mb / 100).toFixed(2);
+    $('zb-chat-frost').value = f; $('zb-chat-frost-val').textContent = (f / 100).toFixed(2);
+    // Reflecting SERVER state: drop the drag-preview inline vars so the
+    // injected :root block (the authoritative values) rules again \u2014 inline
+    // vars outrank the stylesheet and would otherwise pin stale previews.
+    var rs = document.documentElement.style;
+    rs.removeProperty('--zb-chat-dim');
+    rs.removeProperty('--zb-mask-top');
+    rs.removeProperty('--zb-mask-bot');
+    rs.removeProperty('--zb-frost');
+  }
+  // Live preview via the same CSS vars the injected style consumes \u2014 inline
+  // vars outrank the :root block, so drags feel instant; the server push
+  // re-applies the authoritative values right after.
+  function chatPreview(d, mu, mb, f) {
+    var rs = document.documentElement.style;
+    rs.setProperty('--zb-chat-dim', String(d / 100));
+    rs.setProperty('--zb-mask-top', String(mu / 100));
+    rs.setProperty('--zb-mask-bot', String(mb / 100));
+    rs.setProperty('--zb-frost', String(f / 100));
+  }
+  var chatPushTimer = null;
+  function pushChatLook() {
+    clearTimeout(chatPushTimer);
+    chatPushTimer = setTimeout(function () {
+      post('/api/config', {
+        chatLook: {
+          chatDim: Number($('zb-chat-dim').value),
+          maskTop: Number($('zb-chat-top').value),
+          maskBottom: Number($('zb-chat-bot').value),
+          frost: Number($('zb-chat-frost').value)
+        }
+      }, function (d) { if (d && d.error) status(d.error); });
+    }, 300);
+  }
+  [['zb-chat-dim', 'zb-chat-dim-val'], ['zb-chat-top', 'zb-chat-top-val'], ['zb-chat-bot', 'zb-chat-bot-val'], ['zb-chat-frost', 'zb-chat-frost-val']].forEach(function (pair) {
+    $(pair[0]).addEventListener('input', function () {
+      var v = Number(this.value);
+      $(pair[1]).textContent = (v / 100).toFixed(2);
+      chatPreview(Number($('zb-chat-dim').value), Number($('zb-chat-top').value), Number($('zb-chat-bot').value), Number($('zb-chat-frost').value));
+      pushChatLook();
+    });
+  });
+
+  // --- pinned theme color (\u{1F3A8}) ---------------------------------------------
+  $('zb-pin').addEventListener('click', function () {
+    apiFetch('/api/palette')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var existing = document.querySelector('body > .zb-wp-pop');
+        if (existing) { existing.remove(); return; }
+        var pop = document.createElement('div');
+        pop.className = 'zb-wp-pop';
+        var colors = (d && d.colors) || [];
+        if (d && d.pinned) {
+          var auto = document.createElement('div');
+          auto.className = 'zb-wp-item';
+          auto.textContent = '\u2715 \u89E3\u9664\u9501\u5B9A(\u6062\u590D\u81EA\u52A8\u53D6\u8272)';
+          auto.addEventListener('click', function () {
+            post('/api/config', { themeColor: null }, function () { refresh(); pop.remove(); status('\u5DF2\u6062\u590D\u81EA\u52A8\u53D6\u8272'); });
+          });
+          pop.appendChild(auto);
+        }
+        colors.forEach(function (hex) {
+          var it = document.createElement('div');
+          it.className = 'zb-wp-item';
+          var sw = document.createElement('span');
+          sw.style.cssText = 'width:46px;height:26px;border-radius:3px;flex:none;background:' + hex + ';border:1px solid rgba(255,255,255,.2)';
+          var name = document.createElement('span');
+          name.textContent = hex;
+          it.appendChild(sw); it.appendChild(name);
+          it.addEventListener('click', function () {
+            post('/api/config', { themeColor: hex }, function () { refresh(); pop.remove(); status('\u5DF2\u9501\u5B9A\u4E3B\u9898\u8272 ' + hex); });
+          });
+          pop.appendChild(it);
+        });
+        if (!pop.children.length) pop.textContent = '\u5F53\u524D\u58C1\u7EB8\u6CA1\u6709\u53EF\u7528\u8272\u677F';
+        document.body.appendChild(pop);
+      (function () { var wep = document.querySelector('body > .zb-we-pop'); if (wep) document.body.appendChild(wep); })(); // keep the WE window on top (equal z)
+        var btn = $('zb-pin').getBoundingClientRect();
+        pop.style.left = Math.max(8, Math.min(btn.left, window.innerWidth - 216)) + 'px';
+        pop.style.width = '208px';
+        pop.style.bottom = 'auto';
+        pop.style.top = (btn.bottom + 4) + 'px';
+        setTimeout(function () {
+          var close = function (e) {
+            if (!pop.contains(e.target) && e.target !== $('zb-pin')) { pop.remove(); document.removeEventListener('mousedown', close, true); }
+          };
+          document.addEventListener('mousedown', close, true);
+        }, 0);
+      })
+      .catch(function () { status('\u670D\u52A1\u672A\u8FDE\u63A5'); });
+  });
+
+  // --- Alt+B panel shortcut -------------------------------------------------
+  document.addEventListener('keydown', function (e) {
+    if (e.altKey && !e.ctrlKey && !e.shiftKey && (e.key === 'b' || e.key === 'B')) {
+      e.preventDefault();
+      $('zb-fab').click();
+    }
+  });
 
   var FITS = ['cover', 'contain', 'smart'];
   var FIT_LABELS = { cover: '\u586B\u6EE1\u88C1\u526A', contain: '\u5B8C\u6574\u663E\u793A', smart: '\u667A\u80FD\u9002\u914D' };
-  function applyFitLabel(btn, fit) {
-    btn.textContent = '\u80CC\u666F\u586B\u5145: ' + (FIT_LABELS[fit] || fit);
-    btn.setAttribute('data-fit', fit);
+  function applyFitLabel(sel, fit) {
+    sel.value = FIT_LABELS[fit] ? fit : 'cover';
   }
-  $('zb-fit').addEventListener('click', function () {
-    var current = this.getAttribute('data-fit') || 'cover';
-    var next = FITS[(FITS.indexOf(current) + 1) % FITS.length];
-    applyFitLabel(this, next);
+  $('zb-fit').addEventListener('change', function () {
+    var next = this.value;
     post('/api/config', { fit: next }, function (d) { status(d && d.windows > 0 ? '\u5DF2\u5E94\u7528:' + FIT_LABELS[next] : '\u5DF2\u4FDD\u5B58(ZCode \u672A\u8FDE\u63A5)'); });
+  });
+
+  var FXS = ['fade', 'slide', 'zoom', 'blur', 'none'];
+  var FX_LABELS = { fade: '\u4EA4\u53C9\u6DE1\u5165', slide: '\u53F3\u4FA7\u6ED1\u5165', zoom: '\u7F29\u653E\u6D6E\u73B0', blur: '\u6A21\u7CCA\u6E10\u6E05', none: '\u76F4\u63A5\u5207\u6362' };
+  function applyFxLabel(sel, fx) {
+    sel.value = FX_LABELS[fx] ? fx : 'fade';
+  }
+  // The effect is a per-plan setting; the dropdown edits the plan in the
+  // editor and persists immediately (playback is not disturbed \u2014 the effect
+  // is read from the active plan on every switch).
+  $('zb-fx').addEventListener('change', function () {
+    var plan = schedPlans[schedIdx];
+    if (!plan) return;
+    plan.transition = this.value;
+    persistPlans();
   });
 
   $('zb-file').addEventListener('change', function () {
@@ -111536,7 +112894,17 @@ function buildPanelScript(apiPort) {
     if (f.size > 20 * 1024 * 1024) { status('\u56FE\u7247\u8FC7\u5927,\u4E0A\u9650 20 MB'); return; }
     var fr = new FileReader();
     fr.onload = function () {
-      post('/api/wallpaper', { dataUri: fr.result, name: f.name }, function () { status('\u58C1\u7EB8\u5DF2\u66F4\u65B0 updated'); });
+      post('/api/wallpaper', { dataUri: fr.result, name: f.name }, function (d) {
+        if (d && d.error) { status(d.error); return; }
+        status('\u5DF2\u6DFB\u52A0\u5E76\u5E94\u7528:' + f.name);
+        // Server adopted the upload as current \u2014 reflect it in the highlight
+        // immediately (the rows are not rebuilt anymore).
+        if (d && d.wallpaperPath) {
+          try { localStorage.setItem('zcode-beautify:current-key', d.wallpaperPath); } catch (e) {}
+          markCurrent(d.wallpaperPath);
+        }
+        markLibDirty();
+      });
     };
     fr.readAsDataURL(f);
   });
@@ -111548,11 +112916,15 @@ function buildPanelScript(apiPort) {
     'cache-hit': '\u7F13\u5B58\u547D\u4E2D', done: '\u5B8C\u6210', error: '\u5931\u8D25'
   };
   var importTimer = null;
+  // Batch progress ("\u7B2C i/N \u4E2A") shown alongside the per-import stage while a
+  // multi-file queue runs; null for single imports.
+  var batchInfo = null;
   function setProgress(on, stage, fromCache) {
     var box = $('zb-progress');
     box.hidden = !on;
     if (on) {
       var label = STAGE_LABELS[stage] || stage || '\u2026';
+      if (batchInfo) label += ' (\u7B2C ' + batchInfo.i + '/' + batchInfo.n + ' \u4E2A)';
       // The pipeline stages advance in order; map them onto a smooth bar.
       var order = ['starting', 'detect', 'deps', 'opening', 'render-ready', 'recording', 'closing', 'processing', 'poster', 'saving', 'done'];
       var pct = stage === 'done' ? 100 : (stage === 'cache-hit' ? 100 : 8 + 88 * Math.max(0, order.indexOf(stage)) / (order.length - 1));
@@ -111568,31 +112940,466 @@ function buildPanelScript(apiPort) {
   }
   $('zb-pick').addEventListener('click', function () {
     var btn = this;
-    btn.textContent = '\u6253\u5F00\u9009\u62E9\u5668\u2026';
-    fetch(API + '/api/pick-scene', { method: 'POST' })
+    btn.textContent = '\u2026';
+    apiFetch('/api/pick-scene', { method: 'POST' })
       .then(function (r) { return r.json(); })
       .then(function (d) {
-        btn.textContent = '\u9009\u62E9\u5E76\u5BFC\u5165\u2026';
+        btn.textContent = '\u{1F4C1}';
         if (!d || !d.ok || !d.path) return; // user cancelled the dialog
+        var paths = (d.paths && d.paths.length) ? d.paths : [d.path];
+        if (paths.length > 1) { startImportQueue(paths); return; }
         $('zb-scene-path').value = d.path;
         $('zb-import').click();
       })
-      .catch(function () { btn.textContent = '\u9009\u62E9\u5E76\u5BFC\u5165\u2026'; status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable'); });
+      .catch(function () { btn.textContent = '\u{1F4C1}'; status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable'); });
+  });
+
+  // --- Wallpaper Engine library browser (\u{1F9E9}) -----------------------------------
+  // Lists the machine's local WE wallpapers (workshop + myprojects) with
+  // previews; picking one feeds its directory into the normal import queue.
+  var wePop = null;
+  /** Set while the WE popup is open: hides its hover preview. */
+  var weHoverHide = null;
+  function closeWePop() {
+    // Sweep EVERY .zb-we-pop on <body>: after a serve restart the panel
+    // script is re-evaluated and this closure's wePop is null again, while
+    // the previous panel's popup element still sits in the DOM \u2014 clearing
+    // only our own reference would leave that stale popup shadowing
+    // querySelector('body > .zb-we-pop') and breaking the next open.
+    if (weHoverHide) weHoverHide();
+    var pops = document.querySelectorAll('body > .zb-we-pop, body > .zb-we-hover');
+    for (var i = 0; i < pops.length; i++) pops[i].remove();
+    wePop = null;
+    document.removeEventListener('wheel', weScrollClose, true);
+    document.removeEventListener('keydown', weEscClose, true);
+  }
+  // Dismiss on USER scrolling outside the popup (wheel only \u2014 a scroll EVENT
+  // also fires from programmatic scrolls, and ZCode's chat column
+  // auto-follows streaming output, which closed the popup the instant any
+  // in-popup click coincided with a chat autoscroll). Scrolling the popup's
+  // own list must not close it.
+  var weScrollClose = function (e) {
+    if (wePop && wePop.contains(e.target)) return;
+    closeWePop();
+  };
+  var weEscClose = function (e) {
+    if (e.key === 'Escape') closeWePop();
+  };
+  function openWePop(items) {
+    closeWePop();
+    var selected = {};
+    var hasFolders = items.some(function (it) { return it.folder; });
+    var weMode = localStorage.getItem('zcode-beautify:we-mode') === 'folder' && hasFolders ? 'folder' : 'type';
+    wePop = document.createElement('div');
+    wePop.className = 'zb-we-pop';
+
+    var head = document.createElement('div');
+    head.className = 'zb-we-head';
+    var titleEl = document.createElement('span');
+    titleEl.textContent = 'WE \u58C1\u7EB8\u5E93';
+    var modeWrap = document.createElement('div');
+    modeWrap.className = 'zb-we-mode';
+    var modeType = document.createElement('button');
+    modeType.textContent = '\u7C7B\u578B';
+    var modeFolder = document.createElement('button');
+    modeFolder.textContent = '\u6587\u4EF6\u5939';
+    modeFolder.hidden = !hasFolders;
+    modeWrap.appendChild(modeType);
+    modeWrap.appendChild(modeFolder);
+    var countEl = document.createElement('span');
+    countEl.className = 'zb-we-total';
+    countEl.textContent = items.length + ' \u4E2A \xB7 \u70B9\u51FB\u5361\u7247\u591A\u9009';
+    var search = document.createElement('input');
+    search.className = 'zb-we-search';
+    search.type = 'text';
+    search.placeholder = '\u641C\u7D22\u6807\u9898\u2026';
+    search.spellcheck = false;
+    var closeBtn = document.createElement('button');
+    closeBtn.className = 'zb-we-act';
+    closeBtn.textContent = '\u2715';
+    closeBtn.title = '\u5173\u95ED (Esc)';
+    closeBtn.addEventListener('click', closeWePop);
+    head.appendChild(titleEl); head.appendChild(modeWrap); head.appendChild(countEl);
+    head.appendChild(search); head.appendChild(closeBtn);
+    wePop.appendChild(head);
+
+    var list = document.createElement('div');
+    list.className = 'zb-we-list';
+    var groupEls = [];
+    // Folder mode navigates like a real file browser: the root shows one
+    // card per WE folder (\u{1F4C1} + name + count); clicking one descends into it
+    // with a back row on top. \u672A\u5206\u7C7B is just another folder card.
+    var folderNav = 'root';
+    var curFolder = '';
+    var selInfo = document.createElement('span');
+    var impBtn = document.createElement('button');
+    function refreshSel() {
+      var n = Object.keys(selected).length;
+      selInfo.textContent = n > 0 ? ('\u5DF2\u9009 ' + n + ' \u9879') : '\u672A\u9009\u62E9';
+      impBtn.disabled = n === 0;
+    }
+    function refreshModeBtns() {
+      modeType.setAttribute('data-on', weMode === 'type' ? '1' : '0');
+      modeFolder.setAttribute('data-on', weMode === 'folder' ? '1' : '0');
+    }
+    function setWeMode(m) {
+      if (!hasFolders || weMode === m) return;
+      weMode = m;
+      folderNav = 'root';
+      curFolder = '';
+      try { localStorage.setItem('zcode-beautify:we-mode', m); } catch (e) {}
+      refreshModeBtns();
+      renderGroups();
+    }
+    modeType.addEventListener('click', function () { setWeMode('type'); });
+    modeFolder.addEventListener('click', function () { setWeMode('folder'); });
+    refreshModeBtns();
+
+    function buildCard(it) {
+      var card = document.createElement('div');
+      card.className = 'zb-we-card';
+      card.setAttribute('data-title', it.title.toLowerCase());
+      card.setAttribute('data-dir', it.dir);
+      if (!it.importable) card.setAttribute('data-off', '1');
+      if (selected[it.dir]) card.setAttribute('data-sel', '1');
+      // Real-preview chain, best first: the wallpaper's OWN material \u2014
+      // source video for video wallpapers, its own WE preview GIF for
+      // scenes \u2014 and only then the recorded loop, which is
+      // content-addressed: reposts of the SAME wallpaper share one cache
+      // entry, and leading with it made a folder of reposts all preview
+      // as 'the same video'.
+      if (it.videoUrl) card.setAttribute('data-video', it.videoUrl);
+      card.title = it.title + '\\n' + it.dir + (it.folder ? '\\n\u{1F4C1} ' + it.folder : '') + (it.imported ? '\\n(\u5DF2\u5BFC\u5165\u8FC7,\u518D\u6B21\u5BFC\u5165\u79D2\u5B8C\u6210)' : '');
+      if (it.imported) {
+        var done = document.createElement('span');
+        done.className = 'zb-we-done';
+        done.textContent = '\u5DF2\u5BFC\u5165';
+        card.appendChild(done);
+      }
+      var tick = document.createElement('span');
+      tick.className = 'zb-we-tick';
+      tick.textContent = '\u2713';
+      card.appendChild(tick);
+      if (it.previewUrl) {
+        var img = document.createElement('img');
+        img.loading = 'lazy';
+        // previewUrl is serve-relative (/media/...) \u2014 resolve against API or
+        // the img loads against the ZCode app origin and 404s.
+        img.src = mt(API + it.previewUrl);
+        img.alt = '';
+        card.appendChild(img);
+      } else {
+        var ph = document.createElement('div');
+        ph.className = 'zb-we-ph';
+        ph.textContent = '\u65E0\u9884\u89C8';
+        card.appendChild(ph);
+      }
+      if (!it.importable) {
+        var tag = document.createElement('span');
+        tag.className = 'zb-we-tag';
+        tag.textContent = '\u7F51\u9875';
+        card.appendChild(tag);
+      }
+      var t = document.createElement('div');
+      t.className = 'zb-we-name';
+      t.textContent = it.title;
+      card.appendChild(t);
+      card.addEventListener('click', function () {
+        if (!it.importable) return;
+        if (selected[it.dir]) { delete selected[it.dir]; card.removeAttribute('data-sel'); }
+        else { selected[it.dir] = 1; card.setAttribute('data-sel', '1'); }
+        refreshSel();
+      });
+      return card;
+    }
+    function renderGroups() {
+      groupEls = [];
+      list.textContent = '';
+      var groups;
+      if (weMode === 'folder' && folderNav === 'root') {
+        // Root of the folder view: folder cards only (real-file-browser
+        // look), \u672A\u5206\u7C7B last. Folder titles come from WE's own browser
+        // folder tree (config.json \u2192 browser.folders).
+        var titles = [];
+        items.forEach(function (it) {
+          var f = it.folder || '\u672A\u5206\u7C7B';
+          if (titles.indexOf(f) < 0) titles.push(f);
+        });
+        titles.sort(function (a, b) {
+          return (a === '\u672A\u5206\u7C7B' ? 1 : 0) - (b === '\u672A\u5206\u7C7B' ? 1 : 0) || a.localeCompare(b, 'zh');
+        });
+        var fgrid = document.createElement('div');
+        fgrid.className = 'zb-we-grid';
+        titles.forEach(function (t) {
+          var cnt = items.filter(function (it) { return (it.folder || '\u672A\u5206\u7C7B') === t; }).length;
+          var fc = document.createElement('div');
+          fc.className = 'zb-we-fcard';
+          fc.setAttribute('data-title', t.toLowerCase());
+          fc.title = t + ' \u2014 ' + cnt + ' \u4E2A\u58C1\u7EB8,\u70B9\u51FB\u8FDB\u5165';
+          var ico = document.createElement('div');
+          ico.className = 'zb-we-fico';
+          ico.textContent = t === '\u672A\u5206\u7C7B' ? '\u{1F5C3}' : '\u{1F4C1}';
+          fc.appendChild(ico);
+          var fn = document.createElement('div');
+          fn.className = 'zb-we-fname';
+          fn.textContent = t;
+          fc.appendChild(fn);
+          var fcnt = document.createElement('div');
+          fcnt.className = 'zb-we-fcount';
+          fcnt.textContent = cnt + ' \u4E2A';
+          fc.appendChild(fcnt);
+          fc.addEventListener('click', function () {
+            curFolder = t;
+            folderNav = 'inside';
+            search.value = '';
+            renderGroups();
+          });
+          fgrid.appendChild(fc);
+        });
+        list.appendChild(fgrid);
+        groupEls.push(fgrid);
+        applyFilter();
+        return;
+      }
+      if (weMode === 'folder' && folderNav === 'inside') {
+        // Inside one folder: back row + its wallpapers as a flat grid.
+        var back = document.createElement('button');
+        back.className = 'zb-we-back';
+        back.innerHTML = '\u2190 \u8FD4\u56DE\u6587\u4EF6\u5939\u5217\u8868';
+        back.title = '\u8FD4\u56DE\u4E0A\u4E00\u5C42';
+        back.addEventListener('click', function () {
+          folderNav = 'root';
+          curFolder = '';
+          search.value = '';
+          renderGroups();
+        });
+        list.appendChild(back);
+        var lab = document.createElement('div');
+        lab.className = 'zb-we-group';
+        lab.textContent = (curFolder === '\u672A\u5206\u7C7B' ? '\u{1F5C3} ' : '\u{1F4C1} ') + curFolder;
+        list.appendChild(lab);
+        var grid = document.createElement('div');
+        grid.className = 'zb-we-grid';
+        items.filter(function (it) { return (it.folder || '\u672A\u5206\u7C7B') === curFolder; })
+          .forEach(function (it) { grid.appendChild(buildCard(it)); });
+        list.appendChild(grid);
+        groupEls.push(grid);
+        applyFilter();
+        return;
+      }
+      groups = [
+        { label: '\u573A\u666F', list: items.filter(function (it) { return it.type === 'scene'; }) },
+        { label: '\u89C6\u9891', list: items.filter(function (it) { return it.type === 'video'; }) },
+        { label: '\u7F51\u9875 \xB7 \u6682\u4E0D\u652F\u6301\u5BFC\u5165', list: items.filter(function (it) { return it.type === 'web'; }) },
+      ];
+      groups.forEach(function (g) {
+        if (!g.list.length) return;
+        var wrap = document.createElement('div');
+        var lab = document.createElement('div');
+        lab.className = 'zb-we-group';
+        lab.textContent = g.label + ' \xB7 ' + g.list.length;
+        wrap.appendChild(lab);
+        var grid = document.createElement('div');
+        grid.className = 'zb-we-grid';
+        g.list.forEach(function (it) { grid.appendChild(buildCard(it)); });
+        wrap.appendChild(grid);
+        groupEls.push(wrap);
+        list.appendChild(wrap);
+      });
+      if (!items.length) {
+        var empty = document.createElement('div');
+        empty.className = 'zb-we-empty';
+        empty.textContent = '\u672A\u627E\u5230 Wallpaper Engine \u58C1\u7EB8\u3002\u9700\u8981 Steam \u521B\u610F\u5DE5\u574A\u5185\u5BB9(\u573A\u666F/\u89C6\u9891\u58C1\u7EB8),\u6216 wallpaper_engine\\\\projects\\\\myprojects \u4E0B\u7684\u81EA\u5EFA\u9879\u76EE\u3002';
+        list.appendChild(empty);
+      }
+      applyFilter();
+    }
+    function applyFilter() {
+      var q = search.value.trim().toLowerCase();
+      var cards = list.querySelectorAll('.zb-we-card, .zb-we-fcard');
+      for (var i = 0; i < cards.length; i++) {
+        cards[i].hidden = Boolean(q) && cards[i].getAttribute('data-title').indexOf(q) < 0;
+      }
+      groupEls.forEach(function (g) {
+        var visible = 0;
+        // Count BOTH wallpaper and folder cards: the folder-view root grid
+        // holds only .zb-we-fcard, and matching .zb-we-card alone read as
+        // "empty group" \u2014 hiding the whole folder grid, which is exactly the
+        // "popup opens blank" bug.
+        var gr = g.querySelectorAll('.zb-we-card, .zb-we-fcard');
+        for (var j = 0; j < gr.length; j++) if (!gr[j].hidden) visible++;
+        g.hidden = visible === 0;
+      });
+    }
+    renderGroups();
+    wePop.appendChild(list);
+
+    // Bottom action bar: multi-select summary + one-shot queued import.
+    var foot = document.createElement('div');
+    foot.className = 'zb-we-foot';
+    selInfo.className = 'zb-we-selinfo';
+    impBtn.className = 'zb-btn';
+    impBtn.textContent = '\u5BFC\u5165\u6240\u9009';
+    impBtn.title = '\u5C06\u9009\u4E2D\u7684\u58C1\u7EB8\u9010\u4E2A\u6392\u961F\u5BFC\u5165(\u89C4\u683C/\u4FDD\u7559\u58F0\u97F3\u8DDF\u968F\u4E0A\u65B9\u5BFC\u5165\u8BBE\u7F6E)';
+    impBtn.disabled = true;
+    impBtn.addEventListener('click', function () {
+      var dirs = Object.keys(selected);
+      if (!dirs.length) return;
+      closeWePop();
+      startImportQueue(dirs);
+    });
+    var clearBtn = document.createElement('button');
+    clearBtn.className = 'zb-btn';
+    clearBtn.textContent = '\u6E05\u7A7A\u9009\u62E9';
+    clearBtn.title = '\u53D6\u6D88\u5168\u90E8\u9009\u62E9';
+    clearBtn.addEventListener('click', function () {
+      selected = {};
+      var cards = list.querySelectorAll('.zb-we-card[data-sel]');
+      for (var i = 0; i < cards.length; i++) cards[i].removeAttribute('data-sel');
+      refreshSel();
+    });
+    refreshSel();
+    foot.appendChild(selInfo); foot.appendChild(clearBtn); foot.appendChild(impBtn);
+    wePop.appendChild(foot);
+    document.body.appendChild(wePop);
+
+    // Opens to the LEFT of the panel (the panel hugs the right edge).
+    var anchor = $('zb-we-lib').getBoundingClientRect();
+    wePop.style.left = Math.max(8, Math.min(window.innerWidth - 568, anchor.left - 570)) + 'px';
+    wePop.style.top = Math.max(8, Math.min(window.innerHeight - wePop.offsetHeight - 8, anchor.top)) + 'px';
+    document.addEventListener('wheel', weScrollClose, { capture: true, passive: true });
+    document.addEventListener('keydown', weEscClose, true);
+
+    search.addEventListener('input', applyFilter);
+    setTimeout(function () { search.focus(); }, 30);
+
+    // Hover preview: rest on a card 300ms and a large version of its
+    // preview appears beside the popup (WE preview GIFs animate there).
+    weHoverHide = function () {
+      if (weHoverTimer) { clearTimeout(weHoverTimer); weHoverTimer = null; }
+      var p = document.querySelector('body > .zb-we-hover');
+      if (p) p.remove();
+    };
+    var weHoverTimer = null;
+    list.addEventListener('mouseover', function (e) {
+      var card = e.target && e.target.closest ? e.target.closest('.zb-we-card') : null;
+      if (!card) return;
+      weHoverHide();
+      weHoverTimer = setTimeout(function () {
+        weHoverTimer = null;
+        var img = card.querySelector('img');
+        if (!img) return;
+        weHoverHide();
+        // Real preview: video wallpapers play their actual footage when the
+        // setting allows it; everything else (and scenes, whose only real
+        // preview would be a render) shows the cover image.
+        var vUrl = card.getAttribute('data-video');
+        var live = false;
+        try { live = localStorage.getItem('zcode-beautify:we-live') !== '0'; } catch (e) {}
+        var prev = document.createElement('div');
+        prev.className = 'zb-we-hover';
+        var media;
+        if (vUrl && live) {
+          media = document.createElement('video');
+          media.muted = true;
+          media.loop = true;
+          media.playsInline = true;
+          media.autoplay = true;
+          media.src = mt(API + vUrl);
+        } else {
+          media = document.createElement('img');
+          media.src = img.src;
+        }
+        media.alt = '';
+        prev.appendChild(media);
+        // Vertical placement is derived from the CURRENT box height: centered
+        // on the card, clamped to the viewport, pinned to the top when a
+        // very tall preview cannot fit at all. Runs once with the estimate
+        // and again when the medium is ready with its real aspect.
+        var place = function () {
+          var r = card.getBoundingClientRect();
+          var h = prev.offsetHeight || 180;
+          var top = r.top + r.height / 2 - h / 2;
+          if (top + h > window.innerHeight - 8) top = window.innerHeight - h - 8;
+          if (top < 8) top = 8;
+          prev.style.top = Math.round(top) + 'px';
+          prev.style.right = Math.max(8, window.innerWidth - r.left + 10) + 'px';
+        };
+        media.onload = place;
+        media.addEventListener('loadedmetadata', place);
+        document.body.appendChild(prev);
+        place();
+        if (media.tagName === 'VIDEO') media.play().catch(function () {});
+      }, 300);
+    });
+    list.addEventListener('mouseout', function (e) {
+      var card = e.target && e.target.closest ? e.target.closest('.zb-we-card') : null;
+      if (!card) return;
+      if (e.relatedTarget && card.contains(e.relatedTarget)) return;
+      weHoverHide();
+    });
+  }
+  $('zb-we-lib').addEventListener('click', function () {
+    var btn = this;
+    btn.textContent = '\u2026';
+    apiFetch('/api/we-library')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        btn.textContent = '\u{1F9E9}';
+        if (!d || d.error) { status((d && d.error) || '\u8BFB\u53D6 WE \u58C1\u7EB8\u5E93\u5931\u8D25'); return; }
+        openWePop(d.items || []);
+      })
+      .catch(function () { btn.textContent = '\u{1F9E9}'; status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable'); });
+  });
+  /** Resolves once no import job is running (multi-file queue pacing). */
+  function importIdle() {
+    return new Promise(function (resolve) {
+      var t = zbEvery(function () {
+        apiFetch('/api/import-status')
+          .then(function (r) { return r.json(); })
+          .then(function (j) {
+            if (!j || !j.running) { clearInterval(t); setTimeout(resolve, 400); }
+          })
+          .catch(function () { clearInterval(t); resolve(); });
+      }, 800);
+    });
+  }
+  /** Serial import queue for multi-selected files (one job at a time). */
+  function startImportQueue(paths) {
+    status('\u5DF2\u9009 ' + paths.length + ' \u4E2A,\u5F00\u59CB\u6392\u961F\u5BFC\u5165\u2026');
+    batchInfo = { i: 0, n: paths.length };
+    var i = 0;
+    var next = function () {
+      if (i >= paths.length) {
+        batchInfo = null;
+        status('\u961F\u5217\u5B8C\u6210:' + paths.length + ' \u4E2A'); markLibDirty(); return;
+      }
+      $('zb-scene-path').value = paths[i];
+      i++;
+      batchInfo.i = i;
+      status('\u5BFC\u5165 ' + i + '/' + paths.length + '\u2026');
+      $('zb-import').click();
+      void importIdle().then(next);
+    };
+    next();
+  }
+  $('zb-scene-path').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') $('zb-import').click();
   });
 
   $('zb-import').addEventListener('click', function () {
     var p = $('zb-scene-path').value.trim();
     if (!p) { status('\u8BF7\u5148\u7C98\u8D34\u573A\u666F\u58C1\u7EB8\u8DEF\u5F84'); return; }
     showGuide('', false);
-    post('/api/import-scene', { path: p }, function (d) {
+    post('/api/import-scene', { path: p, importRes: zbResSel ? resPayload() : undefined }, function (d) {
       if (d && d.error) { status(d.error); return; }
       setProgress(true, 'starting');
       if (importTimer) clearInterval(importTimer);
-      importTimer = setInterval(pollImport, 600);
+      importTimer = zbEvery(pollImport, 600);
     });
   });
   function pollImport() {
-    fetch(API + '/api/import-status')
+    apiFetch('/api/import-status')
       .then(function (r) { return r.json(); })
       .then(function (j) {
         setProgress(j.running || j.stage === 'done', j.stage);
@@ -111606,6 +113413,7 @@ function buildPanelScript(apiPort) {
           clearInterval(importTimer); importTimer = null;
           status(j.result && j.result.fromCache ? '\u5DF2\u4ECE\u7F13\u5B58\u8F7D\u5165' : '\u52A8\u6001\u58C1\u7EB8\u5DF2\u5E94\u7528');
           refresh();
+          markLibDirty();
         }
       })
       .catch(function () { /* transient */ });
@@ -111615,37 +113423,344 @@ function buildPanelScript(apiPort) {
     $('zb-import').click();
   });
 
-  // --- library (static images + imported scene loops) ------------------------
+  // --- library (dynamic + images, each with its import entry up front) -----
+  // Collapsible library cards: clicking the title folds the body; the state
+  // survives panel reopens (localStorage) per card.
+  function bindFold(cardId, storeKey) {
+    var card = document.getElementById(cardId);
+    if (!card) return;
+    var title = card.querySelector('.zb-card-title');
+    var apply = function (collapsed) {
+      card.classList.toggle('zb-collapsed', collapsed);
+      title.title = collapsed ? '\u5C55\u5F00' : '\u6298\u53E0';
+    };
+    var saved = null;
+    try { saved = localStorage.getItem(storeKey); } catch (e) {}
+    apply(saved === '1');
+    title.addEventListener('click', function () {
+      var next = !card.classList.contains('zb-collapsed');
+      apply(next);
+      try { localStorage.setItem(storeKey, next ? '1' : '0'); } catch (e) {}
+      hideHoverPreview(); // thumbnails vanish under the fold
+    });
+  }
+  bindFold('zb-card-display', 'zcode-beautify:fold-display');
+  bindFold('zb-card-history', 'zcode-beautify:fold-history');
+  bindFold('zb-card-scenes', 'zcode-beautify:fold-scenes');
+  bindFold('zb-card-images', 'zcode-beautify:fold-images');
+
+  // Image sort mode (F6): default newest first; toggles to name order.
+  var imgSort = 'time';
+  var LIB_QUERY = '';
+  function applyLibQuery() {
+    LIB_QUERY = imgSort === 'name' ? '?sort=name' : '';
+    $('zb-img-sort').textContent = imgSort === 'name' ? '\u21C5 \u540D\u79F0' : '\u21C5 \u65F6\u95F4';
+  }
+  var batchMode = false;
   function loadLibrary() {
-    fetch(API + '/api/library')
+    apiFetch('/api/library' + LIB_QUERY)
       .then(function (r) { return r.json(); })
       .then(function (lib) {
-        var el = $('zb-lib');
-        el.innerHTML = '';
-        var head1 = document.createElement('div');
-        head1.className = 'zb-lib-head'; head1.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u52A8\u6001';
-        el.appendChild(head1);
+        var scenes = $('zb-lib-scenes');
+        var images = $('zb-lib-images');
+        scenes.innerHTML = '';
+        images.innerHTML = '';
         (lib.scenes || []).forEach(function (s) {
-          el.appendChild(libItem(s.name || ('\u573A\u666F ' + s.hash.slice(0, 8)), { hash: s.hash }, s.hash, 'scene', s.hash));
+          var item = libItem(s.name || ('\u573A\u666F ' + s.hash.slice(0, 8)), { hash: s.hash }, s.hash, 'scene', s.hash, mt(API + '/media/poster/' + s.hash + '.jpg'), s.favorite);
+          if (typeof s.sizeBytes === 'number' && s.sizeBytes > 0) item.title = (s.name || s.hash.slice(0, 8)) + ' \u2014 ' + (s.sizeBytes / 1048576).toFixed(1) + ' MB';
+          scenes.appendChild(item);
         });
-        var head2 = document.createElement('div');
-        head2.className = 'zb-lib-head'; head2.textContent = '\u58C1\u7EB8\u5E93 \u2014 \u56FE\u7247';
-        el.appendChild(head2);
-        (lib.images || []).forEach(function (im) {
-          el.appendChild(libItem(im.name, { path: im.path }, im.path, 'image', im.path));
-        });
-        if (!(lib.scenes || []).length && !(lib.images || []).length) {
-          el.innerHTML = '<div class="zb-lib-head">\u58C1\u7EB8\u5E93\u4E3A\u7A7A \u2014 \u5BFC\u5165\u6216\u66F4\u6362\u58C1\u7EB8\u540E\u51FA\u73B0\u5728\u8FD9\u91CC</div>';
+        if (!(lib.scenes || []).length) {
+          scenes.innerHTML = '<div class="zb-lib-head">\u6682\u65E0\u52A8\u6001\u58C1\u7EB8 \u2014 \u7528\u4E0A\u65B9\u5BFC\u5165</div>';
         }
+        (lib.images || []).forEach(function (im) {
+          images.appendChild(libItem(im.name, { path: im.path }, im.path, 'image', im.path, mt(API + '/media/lib/' + encodeURIComponent(im.name)), im.favorite));
+        });
+        if (!(lib.images || []).length) {
+          images.innerHTML = '<div class="zb-lib-head">\u6682\u65E0\u56FE\u7247\u58C1\u7EB8 \u2014 \u7528\u4E0A\u65B9\u66F4\u6362\u56FE\u7247</div>';
+        }
+        if (batchMode) enterBatchMode(false); // re-arm checkboxes on the fresh rows
       })
       .catch(function () { /* offline */ });
   }
+  applyLibQuery();
+  $('zb-img-sort').addEventListener('click', function () {
+    imgSort = imgSort === 'time' ? 'name' : 'time';
+    applyLibQuery();
+    markLibDirty();
+  });
+  $('zb-open-images').addEventListener('click', function () {
+    post('/api/open-folder', { target: 'images' }, function () { status('\u5DF2\u5728\u8D44\u6E90\u7BA1\u7406\u5668\u6253\u5F00'); });
+  });
+  $('zb-open-scenes').addEventListener('click', function () {
+    post('/api/open-folder', { target: 'scenes' }, function () { status('\u5DF2\u5728\u8D44\u6E90\u7BA1\u7406\u5668\u6253\u5F00'); });
+  });
+  // Batch delete (F6): checkboxes on image rows, one shot for the selection.
+  function enterBatchMode(on) {
+    batchMode = on;
+    var btn = $('zb-img-batch');
+    var images = $('zb-lib-images');
+    if (on) {
+      btn.textContent = '\u{1F5D1} \u5220\u6240\u9009';
+      var rows = images.querySelectorAll('.zb-item');
+      for (var i = 0; i < rows.length; i++) {
+        if (!rows[i].querySelector('.zb-item-img')) continue;
+        var cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.className = 'zb-batch-cb';
+        cb.setAttribute('data-key', rows[i].getAttribute('data-key'));
+        rows[i].insertBefore(cb, rows[i].firstChild);
+      }
+    } else {
+      btn.textContent = '\u2630 \u6279\u91CF';
+      var cbs = images.querySelectorAll('.zb-batch-cb');
+      for (var j = 0; j < cbs.length; j++) cbs[j].remove();
+    }
+  }
+  $('zb-img-batch').addEventListener('click', function () {
+    if (!batchMode) { enterBatchMode(true); status('\u52FE\u9009\u8981\u5220\u9664\u7684\u56FE\u7247,\u518D\u70B9"\u5220\u6240\u9009"'); return; }
+    var checked = document.querySelectorAll('#zb-lib-images .zb-batch-cb:checked');
+    if (!checked.length) { enterBatchMode(false); status('\u672A\u52FE\u9009\u4EFB\u4F55\u6761\u76EE'); return; }
+    // Image rows carry their raw absolute path in data-key (scene rows hold a
+    // hex hash and never get checkboxes) \u2014 anything non-hex is a path.
+    var paths = [];
+    for (var i = 0; i < checked.length; i++) {
+      var k = checked[i].getAttribute('data-key') || '';
+      if (k && !/^[a-f0-9]{8,64}$/.test(k)) paths.push(k);
+    }
+    if (!paths.length) { enterBatchMode(false); return; }
+    var self = this;
+    var pending = paths.length, failed = 0;
+    paths.forEach(function (p) {
+      post('/api/library-delete', { kind: 'image', path: p }, function (d) {
+        if (!d || !d.ok) failed++;
+        if (--pending === 0) {
+          enterBatchMode(false);
+          markLibDirty();
+          status(failed ? ('\u90E8\u5206\u672A\u5220\u9664:' + failed + ' \u6761(\u4F7F\u7528\u4E2D\u7684\u9700\u5148\u5207\u6362)') : ('\u5DF2\u5220\u9664 ' + (paths.length - failed) + ' \u5F20'));
+        }
+      });
+    });
+  });
+
+  // --- scene cache storage line (F2) ---------------------------------------
+  function loadStorage() {
+    apiFetch('/api/storage')
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        var txt = $('zb-storage-text');
+        var mb = (s.scenesBytes || 0) / 1048576;
+        txt.textContent = mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB \u7F13\u5B58' : mb.toFixed(1) + ' MB \u7F13\u5B58';
+        txt.title = '\u58C1\u7EB8\u7F29\u7565\u56FE ' + ((s.thumbsBytes || 0) / 1048576).toFixed(1) + ' MB';
+      })
+      .catch(function () { $('zb-storage-text').textContent = ''; });
+  }
+  $('zb-compress').addEventListener('click', function () {
+    var btn = this;
+    if (btn.getAttribute('data-armed') !== '1') {
+      btn.setAttribute('data-armed', '1');
+      status('\u518D\u70B9\u4E00\u6B21\u786E\u8BA4:\u5168\u90E8\u52A8\u6001\u58C1\u7EB8\u538B\u7F29\u4E3A 720p/24fps(\u4F7F\u7528\u4E2D\u7684\u8DF3\u8FC7,\u8017\u65F6\u6570\u79D2)');
+      setTimeout(function () { btn.removeAttribute('data-armed'); }, 5000);
+      return;
+    }
+    btn.removeAttribute('data-armed');
+    btn.textContent = '\u26A1 \u538B\u7F29\u4E2D\u2026';
+    post('/api/scenes-recompress', {}, function (d) {
+      btn.textContent = '\u26A1 \u538B\u7F29';
+      if (!d || !d.ok) { status('\u538B\u7F29\u5931\u8D25:' + ((d && d.error) || '\u670D\u52A1\u672A\u8FDE\u63A5')); return; }
+      var mb = (d.savedBytes || 0) / 1048576;
+      status('\u5DF2\u538B\u7F29 ' + d.done + ' \u4E2A' + (d.skipped ? '(\u8DF3\u8FC7 ' + d.skipped + ' \u4E2A\u4F7F\u7528\u4E2D)' : '') + ' \u7701 ' + mb.toFixed(1) + ' MB');
+      markLibDirty();
+    });
+  });
+  $('zb-purge').addEventListener('click', function () {
+    var btn = this;
+    if (btn.getAttribute('data-armed') !== '1') {
+      btn.setAttribute('data-armed', '1');
+      status('\u518D\u70B9\u4E00\u6B21\u786E\u8BA4:\u6E05\u7406\u5168\u90E8\u52A8\u6001\u58C1\u7EB8\u7F13\u5B58(\u4F7F\u7528\u4E2D\u7684\u4FDD\u7559)');
+      setTimeout(function () { btn.removeAttribute('data-armed'); }, 5000);
+      return;
+    }
+    btn.removeAttribute('data-armed');
+    post('/api/scenes-purge', {}, function (d) {
+      status(d && d.ok ? '\u5DF2\u6E05\u7406 ' + (d.removed || 0) + ' \u9879\u7F13\u5B58' : '\u6E05\u7406\u5931\u8D25');
+      markLibDirty();
+    });
+  });
+
+  // --- recently used (F8) ---------------------------------------------------
+  function loadHistory() {
+    apiFetch('/api/history')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var box = $('zb-history');
+        box.innerHTML = '';
+        var items = (d && d.items) || [];
+        if (!items.length) { box.innerHTML = '<div class="zb-lib-head">\u6682\u65E0\u8BB0\u5F55</div>'; return; }
+        items.slice(0, 10).forEach(function (it) {
+          var el = document.createElement('div');
+          el.className = 'zb-item';
+          var img = document.createElement('img');
+          img.className = 'zb-item-img';
+          img.src = mt(it.thumbUrl || '');
+          img.loading = 'lazy';
+          var lb = document.createElement('span');
+          lb.className = 'zb-label';
+          lb.textContent = it.label;
+          lb.title = it.label + (it.at ? ' \u2014 ' + new Date(it.at).toLocaleString() : '');
+          lb.addEventListener('click', function () {
+            post('/api/apply-wallpaper', it.hash ? { hash: it.hash } : { path: it.path }, function (r) {
+              if (r && r.error) { status(r.error); return; }
+              try { localStorage.setItem('zcode-beautify:current-key', it.hash ? it.hash : it.path); } catch (e) {}
+              markCurrent(it.hash ? it.hash : it.path);
+              markLibDirty();
+            });
+          });
+          el.appendChild(img);
+          el.appendChild(lb);
+          box.appendChild(el);
+        });
+      })
+      .catch(function () { /* offline */ });
+  }
+
+  // --- playlist status line (\u7B2C N/M \u5F20 \xB7 \u5269\u4F59 Xs), 1s while the panel is open
+  var rotStateTimer = null;
+  function pollRotState() {
+    apiFetch('/api/rotation-state')
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        var el = $('zb-rot-state');
+        if (!s || !s.on) { el.textContent = '\u672A\u542F\u7528'; return; }
+        if (s.mode === 'schedule') { el.textContent = '\u5B9A\u70B9\u6A21\u5F0F ' + s.planName; return; }
+        var remain = Math.ceil((s.remainMs || 0) / 1000);
+        el.textContent = '\u7B2C ' + (s.index + 1) + '/' + s.total + ' \u5F20 \xB7 ' + (s.frozen ? '\u5DF2\u6682\u505C(\u540E\u53F0)' : remain + 's');
+      })
+      .catch(function () { /* offline */ });
+  }
+  // The rot-state poller starts/stops in the MAIN click handler below \u2014 a
+  // capture-phase variant ran BEFORE the panel toggled, so "open" read as
+  // "closed" and killed the interval the moment the panel opened, freezing
+  // the status line ("\u7B2C N/M \u5F20 \xB7 Xs" never changed).
+  rotStateTimer = panelOpen() ? zbEvery(pollRotState, 1000) : null;
+
+  // --- usage-time ranking (\u{1F4CA}) ----------------------------------------------
+  $('zb-stats').addEventListener('click', function () {
+    apiFetch('/api/stats')
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var existing = document.querySelector('body > .zb-wp-pop');
+        if (existing) { existing.remove(); return; }
+        var pop = document.createElement('div');
+        pop.className = 'zb-wp-pop';
+        var items = (d && d.items) || [];
+        if (!items.length) pop.textContent = '\u6682\u65E0\u4F7F\u7528\u8BB0\u5F55';
+        items.forEach(function (it, i) {
+          var row = document.createElement('div');
+          row.className = 'zb-wp-item';
+          var rank = document.createElement('span');
+          rank.textContent = (i + 1) + '.';
+          rank.style.cssText = 'width:16px;flex:none;opacity:.6';
+          var name = document.createElement('span');
+          name.textContent = it.label;
+          name.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+          var t = document.createElement('span');
+          var min = Math.round(it.seconds / 60);
+          t.textContent = min >= 60 ? (Math.round(min / 60 * 10) / 10) + '\u5C0F\u65F6' : min + '\u5206\u949F';
+          t.style.opacity = '.7';
+          row.appendChild(rank); row.appendChild(name); row.appendChild(t);
+          pop.appendChild(row);
+        });
+        document.body.appendChild(pop);
+      (function () { var wep = document.querySelector('body > .zb-we-pop'); if (wep) document.body.appendChild(wep); })(); // keep the WE window on top (equal z)
+        var btn = $('zb-stats').getBoundingClientRect();
+        pop.style.left = Math.max(8, Math.min(btn.left, window.innerWidth - 216)) + 'px';
+        pop.style.width = '208px';
+        pop.style.bottom = 'auto';
+        pop.style.top = (btn.bottom + 4) + 'px';
+        setTimeout(function () {
+          var close = function (e) {
+            if (!pop.contains(e.target) && e.target !== $('zb-stats')) { pop.remove(); document.removeEventListener('mousedown', close, true); }
+          };
+          document.addEventListener('mousedown', close, true);
+        }, 0);
+      })
+      .catch(function () { status('\u670D\u52A1\u672A\u8FDE\u63A5'); });
+  });
+  // --- config export / import (F3) -----------------------------------------
+  $('zb-cfg-export').addEventListener('click', function () {
+    apiFetch('/api/export')
+      .then(function (r) { return r.json(); })
+      .then(function (cfg) {
+        var blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'zcode-beautify-' + new Date().toISOString().slice(0, 10) + '.json';
+        a.click();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+        status('\u5DF2\u5BFC\u51FA\u914D\u7F6E\u6587\u4EF6');
+      })
+      .catch(function () { status('\u5BFC\u51FA\u5931\u8D25,\u670D\u52A1\u672A\u8FDE\u63A5'); });
+  });
+  $('zb-cfg-import').addEventListener('click', function () { $('zb-cfg-file').click(); });
+  $('zb-cfg-file').addEventListener('change', function () {
+    var f = this.files && this.files[0];
+    this.value = '';
+    if (!f) return;
+    var fr = new FileReader();
+    fr.onload = function () {
+      var body;
+      try { body = JSON.parse(fr.result); } catch (e) { status('\u6587\u4EF6\u4E0D\u662F\u6709\u6548\u7684 JSON'); return; }
+      post('/api/import-config', body, function (d) {
+        if (d && d.error) { status(d.error); return; }
+        status('\u914D\u7F6E\u5DF2\u5BFC\u5165\u5E76\u5E94\u7528');
+        refresh();
+        markLibDirty();
+        loadRotation();
+      });
+    };
+    fr.readAsText(f);
+  });
+
+  /** Flip the data-current highlight in place. Rebuilding the whole list on
+   *  every apply (loadLibrary) destroys and re-decodes every thumbnail <img>,
+   *  which reads as the whole library flickering on each wallpaper switch. */
+  function markCurrent(key) {
+    var rows = document.querySelectorAll('#' + ROOT_ID + ' .zb-item[data-key]');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute('data-key') === key) rows[i].setAttribute('data-current', '1');
+      else rows[i].removeAttribute('data-current');
+    }
+  }
   /** One library row: click-to-apply label + rename (inline) + two-step delete. */
-  function libItem(label, applyBody, key, kind, ref) {
+  function libItem(label, applyBody, key, kind, ref, thumbUrl, favorite) {
     var row = document.createElement('div');
     row.className = 'zb-item';
+    row.setAttribute('data-key', key);
     var cur = localStorage.getItem('zcode-beautify:current-key');
     if (cur === key) row.setAttribute('data-current', '1');
+
+    // Favorite pin: floats to the top of the list (server sorts), survives
+    // restarts in favorites.json.
+    var star = document.createElement('button');
+    star.className = 'zb-act';
+    star.textContent = favorite ? '\u2605' : '\u2606';
+    star.title = favorite ? '\u53D6\u6D88\u6536\u85CF' : '\u6536\u85CF\u7F6E\u9876';
+    star.addEventListener('click', function (e) {
+      e.stopPropagation();
+      post('/api/favorite', { on: !favorite, hash: applyBody.hash, path: applyBody.path }, function (d) {
+        if (d && d.ok) markLibDirty();
+      });
+    });
+    row.appendChild(star);
+
+    if (thumbUrl) {
+      var thumb = document.createElement('img');
+      thumb.className = 'zb-item-img';
+      thumb.src = thumbUrl;
+      thumb.loading = 'lazy';
+      row.appendChild(thumb);
+    }
 
     var labelEl = document.createElement('span');
     labelEl.className = 'zb-label';
@@ -111656,7 +113771,8 @@ function buildPanelScript(apiPort) {
         if (r && r.error) { status(r.error); return; }
         try { localStorage.setItem('zcode-beautify:current-key', key); } catch (e) {}
         status('\u5DF2\u5E94\u7528 applied');
-        loadLibrary();
+        markCurrent(key);
+        markLibDirty();
       });
     });
     row.appendChild(labelEl);
@@ -111672,10 +113788,10 @@ function buildPanelScript(apiPort) {
           post('/api/library-rename', { kind: kind, hash: applyBody.hash, path: applyBody.path, name: input.value.trim() },
             function (r) {
               if (r && r.error) { status(r.error); }
-              loadLibrary();
+              markLibDirty();
             });
         } else {
-          loadLibrary();
+          markLibDirty();
         }
       };
       input.addEventListener('keydown', function (e) {
@@ -111696,7 +113812,8 @@ function buildPanelScript(apiPort) {
     del.addEventListener('click', function () {
       if (del.getAttribute('data-armed') !== '1') {
         del.setAttribute('data-armed', '1'); del.textContent = '\u786E\u8BA4\u5220\u9664?';
-        disarm = setTimeout(function () { del.removeAttribute('data-armed'); del.textContent = '\u{1F5D1}'; }, 3000);
+        status('\u518D\u70B9\u4E00\u6B21\u786E\u8BA4\u5220\u9664 ' + label);
+        disarm = setTimeout(function () { del.removeAttribute('data-armed'); del.textContent = '\u{1F5D1}'; }, 5000);
         return;
       }
       clearTimeout(disarm);
@@ -111706,12 +113823,487 @@ function buildPanelScript(apiPort) {
           try { localStorage.removeItem('zcode-beautify:current-key'); } catch (e) {}
         }
         status('\u5DF2\u5220\u9664 deleted');
-        loadLibrary();
+        markLibDirty();
       });
     });
     row.appendChild(del);
     return row;
   }
+
+  // --- wallpaper rotation (\u5B9A\u65F6\u64AD\u653E: plans, each with its own mode) ---------
+  var schedOptions = [];
+  var schedPlans = [];        // plans being edited (id/name/mode/entries)
+  var schedIdx = 0;           // plan currently shown in the editor
+  var schedActiveId = null;   // which plan plays (server side)
+  var SCHED_DEFAULT_TIMES = ['09:00', '12:00', '18:00', '21:00'];
+  var MODE_HINTS = {
+    sequence: '\u6BCF\u5F20\u64AD\u653E\u8BBE\u5B9A\u7684\u65F6\u957F\u540E\u81EA\u52A8\u5207\u4E0B\u4E00\u5F20,\u987A\u5E8F\u5FAA\u73AF;\u4FDD\u5B58\u5373\u5F00\u59CB',
+    random: '\u968F\u673A\u987A\u5E8F\u64AD\u653E,\u540C\u4E00\u5F20\u4E0D\u4F1A\u8FDE\u7EED\u51FA\u73B0;\u4FDD\u5B58\u5373\u5F00\u59CB',
+    schedule: '\u6BCF\u5929\u5230\u8BBE\u5B9A\u7684\u65F6\u95F4\u70B9\u5207\u6362\u5230\u5BF9\u5E94\u58C1\u7EB8;\u4FDD\u5B58\u540E\u5230\u70B9\u751F\u6548'
+  };
+  function schedMode() { return $('zb-sched-mode').value || 'sequence'; }
+  function applyModeHint() { $('zb-sched-hint').textContent = MODE_HINTS[schedMode()] || ''; }
+  function fetchScheduleOptions() {
+    return apiFetch('/api/library' + LIB_QUERY)
+      .then(function (r) { return r.json(); })
+      .then(function (lib) {
+        schedOptions = [];
+        (lib.scenes || []).forEach(function (s) {
+          schedOptions.push({
+            value: 'h:' + s.hash,
+            label: s.name || ('\u573A\u666F ' + s.hash.slice(0, 8)),
+            thumb: mt(API + '/media/poster/' + s.hash + '.jpg'),
+            group: 'scene'
+          });
+        });
+        (lib.images || []).forEach(function (im) {
+          schedOptions.push({
+            value: 'p:' + im.path,
+            label: im.name,
+            thumb: mt(API + '/media/lib/' + encodeURIComponent(im.name)),
+            group: 'image'
+          });
+        });
+        if (!schedOptions.length) schedOptions = [{ value: '', label: '(\u58C1\u7EB8\u5E93\u4E3A\u7A7A)' }];
+      })
+      .catch(function () { /* offline */ });
+  }
+  /**
+   * Wallpaper picker with thumbnail previews (native <option> elements cannot
+   * show images). The row keeps its current value in a data-wp attribute; the
+   * button shows the selected wallpaper's poster, clicking opens a popup list
+   * where every option carries a preview image.
+   */
+  function wallpaperPicker(row, val) {
+    var wrap = document.createElement('div');
+    wrap.className = 'zb-wp-picker';
+    var cur = null;
+    for (var i = 0; i < schedOptions.length; i++) if (schedOptions[i].value === val) cur = schedOptions[i];
+    var hasLib = schedOptions.length && schedOptions[0].value !== '';
+    if (!cur) {
+      if (!val && hasLib) { cur = schedOptions[0]; val = cur.value; }
+      else cur = { value: val, label: val ? '(\u58C1\u7EB8\u5DF2\u5931\u6548)' : '(\u58C1\u7EB8\u5E93\u4E3A\u7A7A)', thumb: null };
+    }
+    row.setAttribute('data-wp', val);
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'zb-wp-btn';
+    var img = document.createElement('img');
+    if (cur.thumb) img.src = cur.thumb; else img.style.visibility = 'hidden';
+    var span = document.createElement('span');
+    span.textContent = cur.label;
+    btn.appendChild(img); btn.appendChild(span);
+    var pop = null;
+    function closePop() {
+      if (!pop) return;
+      pop.remove(); pop = null;
+      hideHoverPreview();
+      document.removeEventListener('mousedown', onDoc, true);
+      document.removeEventListener('wheel', onScrollClose, true);
+    }
+    function onDoc(e) {
+      if (pop && !pop.contains(e.target) && e.target !== btn && !btn.contains(e.target)) closePop();
+    }
+    // A fixed popup does not follow scrolling \u2014 a USER wheel scroll in the
+    // background closes it. wheel (not scroll): ZCode's chat column scrolls
+    // programmatically while streaming, and a scroll EVENT would close the
+    // popup without any user intent. Scrolling inside the popup itself is
+    // ordinary browsing and must leave it open.
+    function onScrollClose(e) {
+      if (pop && e && e.target && pop.contains(e.target)) return;
+      closePop();
+    }
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (pop) { closePop(); return; }
+      if (!hasLib) return;
+      pop = document.createElement('div');
+      pop.className = 'zb-wp-pop';
+      // Grouped: \u52A8\u6001\u58C1\u7EB8 first, then \u56FE\u7247\u58C1\u7EB8 (skips empty groups); each
+      // group lives in its own scroll window with its own scrollbar.
+      var groups = [{ key: 'scene', label: '\u52A8\u6001\u58C1\u7EB8' }, { key: 'image', label: '\u56FE\u7247\u58C1\u7EB8' }];
+      var groupLists = [];
+      groups.forEach(function (g) {
+        var items = schedOptions.filter(function (o) { return (o.group || '') === g.key; });
+        if (!items.length) return;
+        var head = document.createElement('div');
+        head.className = 'zb-wp-group';
+        head.textContent = g.label;
+        pop.appendChild(head);
+        var glist = document.createElement('div');
+        glist.className = 'zb-wp-group-list';
+        items.forEach(function (o) {
+          var it = document.createElement('div');
+          it.className = 'zb-wp-item';
+          if (o.value === row.getAttribute('data-wp')) it.setAttribute('data-cur', '1');
+          var t = document.createElement('img');
+          if (o.thumb) t.src = o.thumb; else t.style.visibility = 'hidden';
+          var s = document.createElement('span');
+          s.textContent = o.label;
+          it.appendChild(t); it.appendChild(s);
+          it.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            row.setAttribute('data-wp', o.value);
+            if (o.thumb) { img.src = o.thumb; img.style.visibility = 'visible'; }
+            else img.style.visibility = 'hidden';
+            span.textContent = o.label;
+            closePop();
+          });
+          glist.appendChild(it);
+        });
+        pop.appendChild(glist);
+        groupLists.push(glist);
+      });
+      document.body.appendChild(pop);
+      (function () { var wep = document.querySelector('body > .zb-we-pop'); if (wep) document.body.appendChild(wep); })(); // keep the WE window on top (equal z)
+      // Fixed placement anchored to the button: opens above it when the full
+      // two-column list fits; below otherwise, shrinking the group windows
+      // proportionally when the viewport runs out of room.
+      var r = btn.getBoundingClientRect();
+      var w = Math.max(r.width, 200);
+      pop.style.width = w + 'px';
+      pop.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+      var needed = pop.offsetHeight + 4;
+      if (r.top >= needed + 8) {
+        pop.style.top = 'auto';
+        pop.style.bottom = (window.innerHeight - r.top + 4) + 'px';
+      } else {
+        pop.style.bottom = 'auto';
+        pop.style.top = (r.bottom + 4) + 'px';
+        var space = window.innerHeight - r.bottom - 12;
+        if (space < needed && groupLists.length) {
+          var chromeH = needed - groupLists.reduce(function (a, el) { return a + el.offsetHeight; }, 0);
+          var per = Math.max(64, Math.floor((space - chromeH) / groupLists.length));
+          groupLists.forEach(function (el) { el.style.maxHeight = per + 'px'; });
+        }
+      }
+      document.addEventListener('mousedown', onDoc, true);
+      document.addEventListener('wheel', onScrollClose, { capture: true, passive: true });
+    });
+    wrap.appendChild(btn);
+    return wrap;
+  }
+  function schedRow(entry) {
+    var row = document.createElement('div');
+    row.className = 'zb-sched-row';
+    if (schedMode() === 'schedule') {
+      var t = document.createElement('input');
+      t.type = 'time';
+      t.value = entry.time || '09:00';
+      row.appendChild(t);
+    } else {
+      var d = document.createElement('input');
+      d.type = 'number';
+      d.min = '0.5'; d.step = '0.5';
+      d.value = entry.seconds ? String(Math.round((entry.seconds / 60) * 10) / 10) : '5';
+      d.title = '\u64AD\u653E\u65F6\u957F(\u5206\u949F)';
+      row.appendChild(d);
+      var u = document.createElement('span');
+      u.className = 'zb-sched-dur'; u.textContent = '\u5206';
+      row.appendChild(u);
+    }
+    var val = entry.hash ? ('h:' + entry.hash) : (entry.path ? ('p:' + entry.path) : '');
+    row.appendChild(wallpaperPicker(row, val));
+    var del = document.createElement('button');
+    del.className = 'zb-act'; del.textContent = '\u2715'; del.title = '\u5220\u9664\u6B64\u6761';
+    del.addEventListener('click', function () { row.remove(); });
+    row.appendChild(del);
+    return row;
+  }
+  function renderSchedRows(entries) {
+    var list = $('zb-sched-list');
+    list.innerHTML = '';
+    (entries || []).forEach(function (e) { list.appendChild(schedRow(e)); });
+    // A rebuilt list must start at the top \u2014 a stale scrollTop (left by scroll
+    // anchoring or a clipped popup) cut off row 1's upper half.
+    list.scrollTop = 0;
+  }
+  function renderPlanSelect() {
+    var sel = $('zb-plan');
+    sel.innerHTML = '';
+    schedPlans.forEach(function (p, i) {
+      var op = document.createElement('option');
+      op.value = String(i);
+      op.textContent = p.name + (p.id === schedActiveId ? ' (\u751F\u6548\u4E2D)' : '');
+      if (i === schedIdx) op.selected = true;
+      sel.appendChild(op);
+    });
+  }
+  function renderPlanEditor() {
+    var plan = schedPlans[schedIdx];
+    if (!plan) return;
+    $('zb-sched-mode').value = plan.mode || 'sequence';
+    $('zb-fx') && applyFxLabel($('zb-fx'), plan.transition || 'fade');
+    $('zb-win-start').value = plan.window ? plan.window.start : '';
+    $('zb-win-end').value = plan.window ? plan.window.end : '';
+    applyModeHint();
+    renderSchedRows(plan.entries || []);
+  }
+  /** Persist the per-plan activation window (F5) as the inputs change. */
+  function pushPlanWindow() {
+    var plan = schedPlans[schedIdx];
+    if (!plan) return;
+    var s = $('zb-win-start').value, e = $('zb-win-end').value;
+    if (s && e && s !== e) plan.window = { start: s, end: e };
+    else plan.window = undefined;
+    persistPlans();
+  }
+  $('zb-win-start').addEventListener('change', pushPlanWindow);
+  $('zb-win-end').addEventListener('change', pushPlanWindow);
+  $('zb-win-clear').addEventListener('click', function () {
+    $('zb-win-start').value = '';
+    $('zb-win-end').value = '';
+    pushPlanWindow();
+    status('\u5DF2\u6E05\u9664\u65F6\u6BB5,\u5168\u5929\u751F\u6548');
+  });
+  /** Reads the row editor into entry objects for the currently shown mode. */
+  function collectPlanEntries() {
+    var entries = [];
+    var rows = document.querySelectorAll('#zb-sched-list .zb-sched-row');
+    var isSchedule = schedMode() === 'schedule';
+    for (var i = 0; i < rows.length; i++) {
+      var v = rows[i].getAttribute('data-wp') || '';
+      if (!v || v.length < 3) continue;
+      var hash = v.slice(0, 2) === 'h:' ? v.slice(2) : undefined;
+      var imgPath = v.slice(0, 2) !== 'h:' ? v.slice(2) : undefined;
+      if (isSchedule) {
+        var time = rows[i].querySelector('input[type=time]').value;
+        if (!time) continue;
+        entries.push({ time: time, hash: hash, path: imgPath });
+      } else {
+        var minutes = Number(rows[i].querySelector('input[type=number]').value);
+        if (!isFinite(minutes) || minutes <= 0) continue;
+        var seconds = Math.round(minutes * 60);
+        if (seconds < 10) seconds = 10;
+        entries.push({ seconds: seconds, hash: hash, path: imgPath });
+      }
+    }
+    return entries;
+  }
+  /** Writes the editor (mode + rows) back into the plan being edited. */
+  function syncEditorIntoPlan() {
+    var plan = schedPlans[schedIdx];
+    if (!plan) return;
+    plan.mode = schedMode();
+    plan.entries = collectPlanEntries();
+  }
+  function plansPayload() {
+    return schedPlans.map(function (p) {
+      var out = { id: p.id, name: p.name, mode: p.mode, transition: p.transition || 'fade', entries: p.entries };
+      if (p.window) out.window = p.window;
+      return out;
+    });
+  }
+  /**
+   * Auto-persists plan structure edits (rename / create / delete): what the
+   * dropdown already shows must survive a reopen without requiring \u4FDD\u5B58.
+   * Keeps the current enabled state and active plan so playback is not
+   * disturbed; the editor is NOT reloaded afterwards.
+   */
+  function persistPlans() {
+    syncEditorIntoPlan();
+    var activeId = null;
+    for (var i = 0; i < schedPlans.length; i++) if (schedPlans[i].id === schedActiveId) activeId = schedActiveId;
+    post('/api/rotation', {
+      rotation: {
+        enabled: $('zb-sched-on').checked,
+        activePlanId: activeId,
+        plans: plansPayload()
+      }
+    }, function (d) {
+      if (d && d.error) { status(d.error); return; }
+      if (d && d.rotation) schedActiveId = d.rotation.activePlanId || schedActiveId;
+      renderPlanSelect();
+    });
+  }
+  /** Cross-mode conversion: keeps the wallpaper refs, carries over seconds
+   *  when present, spreads default times when switching to schedule. */
+  function convertEntries(rawEntries, toMode) {
+    return (rawEntries || []).map(function (e, i) {
+      var out = e.hash ? { hash: e.hash } : { path: e.path };
+      if (toMode === 'schedule') out.time = e.time || SCHED_DEFAULT_TIMES[i % SCHED_DEFAULT_TIMES.length];
+      else out.seconds = e.seconds || 300;
+      return out;
+    });
+  }
+  function loadRotation() {
+    fetchScheduleOptions().then(function () {
+      return apiFetch('/api/rotation').then(function (r) { return r.json(); });
+    }).then(function (d) {
+      var rot = (d && d.rotation) || {};
+      schedPlans = rot.plans && rot.plans.length
+        ? rot.plans
+        : [{ id: 'default', name: '\u65B9\u6848 1', mode: 'sequence', entries: [] }];
+      schedActiveId = rot.activePlanId || (schedPlans[0] && schedPlans[0].id) || null;
+      var activeIdx = -1;
+      for (var i = 0; i < schedPlans.length; i++) if (schedPlans[i].id === schedActiveId) activeIdx = i;
+      schedIdx = activeIdx >= 0 ? activeIdx : 0;
+      $('zb-sched-on').checked = !!rot.enabled;
+      renderPlanSelect();
+      renderPlanEditor();
+    }).catch(function () { /* offline */ });
+  }
+  // Plan switching keeps the edited plan's state; the editor loads the newly
+  // selected plan from schedPlans.
+  $('zb-plan').addEventListener('change', function () {
+    syncEditorIntoPlan();
+    schedIdx = Number(this.value) || 0;
+    renderPlanSelect();
+    renderPlanEditor();
+  });
+  $('zb-plan-add').addEventListener('click', function () {
+    syncEditorIntoPlan();
+    schedPlans.push({ id: 'p' + Date.now().toString(36), name: '\u65B9\u6848 ' + (schedPlans.length + 1), mode: 'sequence', entries: [] });
+    schedIdx = schedPlans.length - 1;
+    renderPlanSelect();
+    renderPlanEditor();
+    persistPlans();
+  });
+  $('zb-plan-ren').addEventListener('click', function () {
+    var row = document.querySelector('.zb-sched-plan');
+    var sel = $('zb-plan');
+    var plan = schedPlans[schedIdx];
+    if (!plan || !row) return;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.value = plan.name;
+    input.className = 'zb-label-input';
+    input.style.flex = '1';
+    row.replaceChild(input, sel);
+    input.focus(); input.select();
+    // One-shot guard: restoring the select unfocuses the input and fires
+    // blur, which would otherwise run done() a second time (and an Escape
+    // cancel would still commit the typed name).
+    var finished = false;
+    var done = function (save) {
+      if (finished) return;
+      finished = true;
+      if (save && input.value.trim()) plan.name = input.value.trim().slice(0, 20);
+      row.replaceChild(sel, input);
+      renderPlanSelect();
+      if (save) persistPlans();
+    };
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') done(true);
+      if (e.key === 'Escape') done(false);
+    });
+    input.addEventListener('blur', function () { done(true); });
+  });
+  $('zb-plan-del').addEventListener('click', function () {
+    var btn = this;
+    if (schedPlans.length <= 1) { status('\u81F3\u5C11\u4FDD\u7559\u4E00\u4E2A\u65B9\u6848'); return; }
+    if (btn.getAttribute('data-armed') !== '1') {
+      btn.setAttribute('data-armed', '1'); btn.textContent = '\u786E\u8BA4?';
+      setTimeout(function () { btn.removeAttribute('data-armed'); btn.textContent = '\u{1F5D1}'; }, 3000);
+      return;
+    }
+    btn.removeAttribute('data-armed'); btn.textContent = '\u{1F5D1}';
+    var removed = schedPlans.splice(schedIdx, 1)[0];
+    if (schedActiveId === removed.id) schedActiveId = null;
+    schedIdx = Math.min(schedIdx, schedPlans.length - 1);
+    renderPlanSelect();
+    renderPlanEditor();
+    persistPlans();
+  });
+  // Switching modes re-renders the rows in the new editor shape, keeping the
+  // wallpapers and converting timing fields with sensible defaults.
+  $('zb-sched-mode').addEventListener('change', function () {
+    applyModeHint();
+    var plan = schedPlans[schedIdx];
+    if (!plan) return;
+    plan.mode = schedMode();
+    plan.entries = convertEntries(collectPlanEntries(), plan.mode);
+    renderSchedRows(plan.entries);
+  });
+  $('zb-sched-add').addEventListener('click', function () {
+    var doAdd = function () {
+      // The server caps plans at 20 entries and silently drops the rest \u2014
+      // stop at the source instead of letting rows vanish after a reload.
+      if (document.querySelectorAll('#zb-sched-list .zb-sched-row').length >= 20) {
+        status('\u64AD\u653E\u5217\u8868\u6700\u591A 20 \u6761');
+        return;
+      }
+      var entry = schedMode() === 'schedule' ? { time: '09:00' } : { seconds: 300 };
+      var key = currentWallpaperKey();
+      if (key.slice(0, 2) === 'h:') entry.hash = key.slice(2);
+      else if (key.length > 2) entry.path = key.slice(2);
+      var row = schedRow(entry);
+      $('zb-sched-list').appendChild(row);
+      // A full scroll window can hide the new row entirely.
+      row.scrollIntoView({ block: 'nearest' });
+    };
+    if (!schedOptions.length || schedOptions[0].value === '') {
+      fetchScheduleOptions().then(function () {
+        if (!schedOptions.length || schedOptions[0].value === '') { status('\u58C1\u7EB8\u5E93\u4E3A\u7A7A,\u5148\u5BFC\u5165\u6216\u66F4\u6362\u58C1\u7EB8'); return; }
+        doAdd();
+      });
+      return;
+    }
+    doAdd();
+  });
+  // \u542F\u7528\u5F00\u5173\u7ACB\u5373\u63D0\u4EA4:\u670D\u52A1\u7AEF startRotation() \u6536\u5230\u540E\u9A6C\u4E0A\u5F00\u64AD/\u505C\u64AD\u3002\u4E4B\u524D\u5B83
+  // \u53EA\u662F\u4E2A\u8868\u5355\u503C,\u8981\u518D\u70B9\u300C\u4FDD\u5B58/\u64AD\u653E\u300D\u624D\u968F payload \u751F\u6548,\u8BFB\u8D77\u6765\u50CF"\u6CA1\u53CD\u5E94"\u3002
+  // \u8BED\u4E49\u4E0E persistPlans \u4E00\u81F4:\u4E0D\u6362\u6D3B\u52A8\u65B9\u6848,\u53EA\u7FFB enabled;\u4EFB\u4F55\u5931\u8D25\u56DE\u6EDA\u52FE\u9009\u3002
+  $('zb-sched-on').addEventListener('change', function () {
+    var want = this.checked;
+    var self = this;
+    syncEditorIntoPlan();
+    var activeId = null;
+    for (var i = 0; i < schedPlans.length; i++) if (schedPlans[i].id === schedActiveId) activeId = schedActiveId;
+    if (!activeId && schedPlans[schedIdx]) activeId = schedPlans[schedIdx].id;
+    fetch(API + '/api/rotation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Beautify-Token': TOKEN },
+      body: JSON.stringify({ rotation: { enabled: want, activePlanId: activeId, plans: plansPayload() }, resume: true })
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (d && d.error) { self.checked = !want; status(d.error); return; }
+        status(want ? '\u5DF2\u542F\u7528,\u5F00\u59CB\u6309\u65B9\u6848\u64AD\u653E' : '\u5DF2\u505C\u6B62\u64AD\u653E');
+        loadRotation();
+      })
+      .catch(function () {
+        self.checked = !want;
+        status('\u65E0\u6CD5\u8FDE\u63A5\u7F8E\u5316\u670D\u52A1 service unreachable');
+      });
+  });
+  $('zb-sched-save').addEventListener('click', function () {
+    syncEditorIntoPlan();
+    var payload = {
+      enabled: $('zb-sched-on').checked,
+      activePlanId: schedPlans[schedIdx] ? schedPlans[schedIdx].id : undefined,
+      plans: plansPayload()
+    };
+    post('/api/rotation', { rotation: payload }, function (d) {
+      if (d && d.error) { status(d.error); return; }
+      status(payload.enabled ? '\u5DF2\u4FDD\u5B58,\u5F53\u524D\u65B9\u6848\u751F\u6548' : '\u5DF2\u4FDD\u5B58(\u672A\u542F\u7528)');
+      loadRotation();
+    });
+  });
+  // \u64AD\u653E = save everything AND force-enable the edited plan right now \u2014
+  // one click from any state to visible playback.
+  $('zb-sched-play').addEventListener('click', function () {
+    syncEditorIntoPlan();
+    var plan = schedPlans[schedIdx];
+    var payload = {
+      enabled: true,
+      activePlanId: plan ? plan.id : undefined,
+      plans: plansPayload()
+    };
+    post('/api/rotation', { rotation: payload }, function (d) {
+      if (d && d.error) { status(d.error); return; }
+      $('zb-sched-on').checked = true;
+      status(plan ? '\u5F00\u59CB\u64AD\u653E:' + plan.name : '\u5F00\u59CB\u64AD\u653E');
+      loadRotation();
+    });
+  });
+  // \u7ACB\u5373\u5207\u6362: skip the current entry's remaining duration, next wallpaper now.
+  $('zb-sched-next').addEventListener('click', function () {
+    post('/api/rotation-next', {}, function (d) {
+      if (d && d.error) { status(d.error); return; }
+      status('\u5DF2\u5207\u6362\u5230\u4E0B\u4E00\u5F20');
+    });
+  });
 
   $('zb-reset').addEventListener('click', function () {
     var mode = this.getAttribute('data-mode') || 'reset';
@@ -111731,20 +114323,79 @@ function buildPanelScript(apiPort) {
     refresh();
   });
 
+  // --- tabs (\u58C1\u7EB8 / \u5B9A\u65F6\u64AD\u653E) ------------------------------------------------
+  // Library/history rebuilds are DIRTY-driven: re-rendering the lists on
+  // every tab switch recreated every <img> and the panel flashed black
+  // while they decoded. switchTab now only refreshes control VALUES; the
+  // DOM rebuilds happen when something actually changed the data.
+  var zbLibDirty = true;
+  function markLibDirty() {
+    zbLibDirty = true;
+    if (!$('zb-tab-main').hidden) { reloadMainLists(); }
+  }
+  function reloadMainLists() {
+    zbLibDirty = false;
+    loadLibrary();
+    loadStorage();
+    loadHistory();
+    // Row height is only measurable once list items exist \u2014 re-apply the
+    // per-library row limits after the rebuild settles.
+    setTimeout(function () { if (typeof applyLibRows === 'function') applyLibRows(); }, 350);
+  }
+  function switchTab(name) {
+    var tabs = document.querySelectorAll('.zb-tab');
+    for (var i = 0; i < tabs.length; i++) {
+      tabs[i].setAttribute('data-active', tabs[i].getAttribute('data-tab') === name ? '1' : '0');
+    }
+    var pane = $(name === 'main' ? 'zb-tab-main' : name === 'sched' ? 'zb-tab-sched' : 'zb-tab-settings');
+    $('zb-tab-main').hidden = name !== 'main';
+    $('zb-tab-sched').hidden = name !== 'sched';
+    $('zb-tab-settings').hidden = name !== 'settings';
+    // Silk: a short fade-and-rise so the pane change reads as one motion.
+    pane.classList.remove('zb-pane-in');
+    void pane.offsetWidth;
+    pane.classList.add('zb-pane-in');
+    try { localStorage.setItem('zcode-beautify:tab', name); } catch (e) {}
+    if (name === 'sched') loadRotation();
+    else {
+      refresh();
+      if (zbLibDirty) reloadMainLists();
+    }
+  }
+  $('zb-tabs').addEventListener('click', function (e) {
+    var b = e.target && e.target.closest ? e.target.closest('.zb-tab') : null;
+    if (b) switchTab(b.getAttribute('data-tab'));
+  });
+  function activateSavedTab() {
+    var saved = 'main';
+    try { saved = localStorage.getItem('zcode-beautify:tab') || 'main'; } catch (e) {}
+    switchTab(saved === 'sched' || saved === 'settings' ? saved : 'main');
+  }
+
   $('zb-fab').addEventListener('click', function () {
     var p = $('zb-panel');
     p.hidden = !p.hidden;
     if (!p.hidden) {
-      refresh();
-      loadLibrary();
+      // A previously dragged panel can sit (partially) outside the viewport,
+      // which reads as "the panel did not open". Pull it back in.
+      var r = p.getBoundingClientRect();
+      if (r.width && (r.right < 40 || r.bottom < 40 || r.left > window.innerWidth - 40 || r.top > window.innerHeight - 40)) {
+        p.style.left = ''; p.style.top = ''; p.style.right = ''; p.style.bottom = '';
+      }
+      activateSavedTab();
       beat(true);
-    } else if (root.getAttribute('data-offline') !== '1') {
-      beat(false);
+      if (!rotStateTimer) { pollRotState(); rotStateTimer = zbEvery(pollRotState, 1000); }
+    } else {
+      hideHoverPreview(); // thumbnails vanish under the closed panel
+      if (root.getAttribute('data-offline') !== '1') beat(false);
+      if (rotStateTimer) { clearInterval(rotStateTimer); rotStateTimer = null; }
     }
   });
 
   // Fill in the fit label (and control values) right away, not just on open.
   refresh();
+  setTimeout(applyLibRows, 400);
+  setTimeout(applyLibRows, 1500);
 
   (function () {
     var head = $('zb-head'), panel = $('zb-panel');
@@ -111785,6 +114436,30 @@ function buildPanelScript(apiPort) {
       }
     }
   }
+  };
+  // The registration replays at document creation where <body> does not exist
+  // yet \u2014 document.body.appendChild would throw and the panel would never
+  // come back after a reload. Wait for the parser (a few ms at most).
+  var zbStartupOn = function() {
+    if (!document.body) return false;
+    var cls = document.body.className || '';
+    return /zcode-startup/.test(cls) && !/ready/.test(cls);
+  };
+  var zbMount = function() { runPanel(); };
+  var zbPanelWait = function() {
+    if (!document.body) { setTimeout(zbPanelWait, 20); return; }
+    // The startup screen shows loading art \u2014 mounting the FAB/panel on top
+    // of it looks broken; hold off until the app marks itself ready.
+    if (STARTUP_CLEAN && zbStartupOn()) {
+      var mo = new MutationObserver(function() {
+        if (!zbStartupOn()) { mo.disconnect(); zbMount(); }
+      });
+      mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+      return;
+    }
+    zbMount();
+  };
+  zbPanelWait();
 })();`;
 }
 var PANEL_ROOT_ID;
@@ -111804,7 +114479,10 @@ function sendMediaFile(req, res, filePath) {
   } catch {
     return false;
   }
-  const type = MIME[filePath.toLowerCase().split(".").pop() ?? ""] ?? "application/octet-stream";
+  if (!stat.isFile())
+    return false;
+  const ext = filePath.toLowerCase().split(".").pop() ?? "";
+  const type = MIME[`.${ext}`] ?? "application/octet-stream";
   const headers = {
     "Content-Type": type,
     "Accept-Ranges": "bytes",
@@ -111835,10 +114513,10 @@ function sendMediaFile(req, res, filePath) {
       "Content-Range": `bytes ${start}-${end}/${stat.size}`,
       "Content-Length": end - start + 1
     });
-    fs10.createReadStream(filePath, { start, end }).pipe(res);
+    fs10.createReadStream(filePath, { start, end }).on("error", () => res.destroy()).pipe(res);
   } else {
     res.writeHead(200, { ...headers, "Content-Length": stat.size });
-    fs10.createReadStream(filePath).pipe(res);
+    fs10.createReadStream(filePath).on("error", () => res.destroy()).pipe(res);
   }
   return true;
 }
@@ -111851,8 +114529,217 @@ var init_media = __esm({
       ".webm": "video/webm",
       ".jpg": "image/jpeg",
       ".jpeg": "image/jpeg",
-      ".png": "image/png"
+      ".png": "image/png",
+      ".gif": "image/gif",
+      ".webp": "image/webp"
     };
+  }
+});
+
+// dist/core/weLibrary.js
+import fs11 from "node:fs";
+import path11 from "node:path";
+function isDirWithEntries(p2) {
+  try {
+    return fs11.statSync(p2).isDirectory() && fs11.readdirSync(p2).length > 0;
+  } catch {
+    return false;
+  }
+}
+function readJsonSafe(file) {
+  try {
+    return JSON.parse(fs11.readFileSync(file, "utf8"));
+  } catch {
+    return void 0;
+  }
+}
+function findWeRoots() {
+  const roots = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const lib of steamLibraryCandidates()) {
+    const candidates = [
+      ["workshop", path11.join(lib, "steamapps", "workshop", "content", "431960")],
+      ["myprojects", path11.join(lib, "steamapps", "common", "wallpaper_engine", "projects", "myprojects")]
+    ];
+    for (const [kind, dir] of candidates) {
+      const key = dir.toLowerCase();
+      if (seen.has(key) || !isDirWithEntries(dir))
+        continue;
+      seen.add(key);
+      roots.push({ kind, dir });
+    }
+  }
+  return roots;
+}
+function weInstallDirs() {
+  const dirs = /* @__PURE__ */ new Set();
+  for (const root of findWeRoots()) {
+    if (root.kind !== "workshop")
+      continue;
+    dirs.add(path11.resolve(root.dir, "..", "..", "..", "common", "wallpaper_engine"));
+  }
+  for (const lib of steamLibraryCandidates()) {
+    dirs.add(path11.join(lib, "steamapps", "common", "wallpaper_engine"));
+  }
+  return [...dirs].filter((d) => fs11.existsSync(path11.join(d, "config.json")));
+}
+function listWeFolders() {
+  const out = [];
+  for (const install of weInstallDirs()) {
+    const config = readJsonSafe(path11.join(install, "config.json"));
+    const userNodes = Object.values(config ?? {}).filter((v) => Boolean(v) && typeof v === "object" && !Array.isArray(v) && "general" in v);
+    for (const node of userNodes) {
+      const general = node.general;
+      const folders = general?.browser?.folders;
+      if (!Array.isArray(folders))
+        continue;
+      const walk = (list, prefix) => {
+        for (const f2 of list) {
+          if (!f2 || typeof f2 !== "object")
+            continue;
+          const fo = f2;
+          const title = typeof fo.title === "string" && fo.title.trim() ? fo.title.trim() : "";
+          if (!title)
+            continue;
+          const full = prefix ? `${prefix} / ${title}` : title;
+          const items = fo.items && typeof fo.items === "object" ? Object.keys(fo.items) : [];
+          out.push({ title: full, items });
+          if (Array.isArray(fo.subfolders))
+            walk(fo.subfolders, full);
+        }
+      };
+      walk(folders, "");
+    }
+  }
+  return out;
+}
+function listWeWallpapers() {
+  const folders = listWeFolders();
+  const folderByKey = /* @__PURE__ */ new Map();
+  for (const f2 of folders) {
+    for (const key of f2.items) {
+      if (!folderByKey.has(key))
+        folderByKey.set(key, f2.title);
+    }
+  }
+  const items = [];
+  for (const root of findWeRoots()) {
+    let entries;
+    try {
+      entries = fs11.readdirSync(root.dir);
+    } catch {
+      continue;
+    }
+    for (const name of entries) {
+      const dir = path11.join(root.dir, name);
+      let stat;
+      try {
+        stat = fs11.statSync(dir);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory())
+        continue;
+      const type = detectWallpaperType(dir);
+      if (type !== "scene" && type !== "video" && type !== "web")
+        continue;
+      const project = readJsonSafe(path11.join(dir, "project.json"));
+      const title = typeof project?.title === "string" && project.title.trim() ? project.title.trim() : name;
+      const declared = typeof project?.preview === "string" ? project.preview : void 0;
+      const previewName = declared && PREVIEW_NAME_RE.test(declared) ? declared : PREVIEW_FALLBACKS.find((f2) => fs11.existsSync(path11.join(dir, f2)));
+      const usable = previewName ? fs11.existsSync(path11.join(dir, previewName)) : false;
+      let folder = folderByKey.get(name);
+      if (!folder) {
+        const dirLower = dir.toLowerCase();
+        for (const [key, title2] of folderByKey) {
+          if (key.includes("\\") && key.toLowerCase().startsWith(dirLower)) {
+            folder = title2;
+            break;
+          }
+        }
+      }
+      let videoFile;
+      if (type === "video") {
+        for (const sub of ["", "files"]) {
+          try {
+            const hit = fs11.readdirSync(path11.join(dir, sub)).find((e2) => /.(mp4|webm)$/i.test(e2));
+            if (hit) {
+              videoFile = path11.join(dir, sub, hit);
+              break;
+            }
+          } catch {
+          }
+        }
+      }
+      items.push({
+        id: name,
+        title,
+        type,
+        dir,
+        videoFile,
+        previewName: usable ? previewName : void 0,
+        importable: type !== "web",
+        source: root.kind,
+        folder
+      });
+    }
+  }
+  const order = { scene: 0, video: 1, web: 2 };
+  items.sort((a2, b) => order[a2.type] - order[b.type] || a2.title.localeCompare(b.title, "zh"));
+  return items;
+}
+function weDirForPath(p2) {
+  let abs;
+  try {
+    abs = path11.resolve(p2).toLowerCase();
+  } catch {
+    return void 0;
+  }
+  for (const root of findWeRoots()) {
+    const rootLower = root.dir.toLowerCase() + path11.sep;
+    if (!abs.startsWith(rootLower))
+      continue;
+    const id = abs.slice(rootLower.length).split(path11.sep)[0];
+    if (id)
+      return path11.join(root.dir, id);
+  }
+  return void 0;
+}
+function weTitleForPath(p2) {
+  const dir = weDirForPath(p2);
+  if (!dir)
+    return void 0;
+  const project = readJsonSafe(path11.join(dir, "project.json"));
+  return typeof project?.title === "string" && project.title.trim() ? project.title.trim() : void 0;
+}
+function resolveWePreview(source, id, file, nameRe = PREVIEW_NAME_RE) {
+  if (!nameRe.test(file))
+    return void 0;
+  if (!/^[^\\/:*?"<>|]+$/.test(id))
+    return void 0;
+  const kind = source === "workshop" || source === "myprojects" ? source : void 0;
+  if (!kind)
+    return void 0;
+  const root = findWeRoots().find((r2) => r2.kind === kind);
+  if (!root)
+    return void 0;
+  const dir = path11.resolve(root.dir, id);
+  const rootResolved = path11.resolve(root.dir);
+  if (!dir.toLowerCase().startsWith(rootResolved.toLowerCase() + path11.sep))
+    return void 0;
+  const fileAbs = path11.resolve(dir, file);
+  if (path11.dirname(fileAbs).toLowerCase() !== dir.toLowerCase())
+    return void 0;
+  return fs11.existsSync(fileAbs) ? fileAbs : void 0;
+}
+var PREVIEW_FALLBACKS, PREVIEW_NAME_RE;
+var init_weLibrary = __esm({
+  "dist/core/weLibrary.js"() {
+    "use strict";
+    init_wallpaperType();
+    init_dependencyCheck();
+    PREVIEW_FALLBACKS = ["preview.jpg", "preview.gif", "preview.png"];
+    PREVIEW_NAME_RE = /^[^\\/:*?"<>|]+\.(jpe?g|gif|png|webp)$/i;
   }
 });
 
@@ -111863,25 +114750,71 @@ __export(server_exports, {
   startServe: () => startServe
 });
 import http from "node:http";
-import fs11 from "node:fs";
-import path10 from "node:path";
-import { execFile as execFile3 } from "node:child_process";
+import fs12 from "node:fs";
+import path12 from "node:path";
+import crypto2 from "node:crypto";
+import { execFile as execFile3, spawn as spawn3 } from "node:child_process";
 import { promisify as promisify3 } from "node:util";
+function rememberAssets(file, mtimeMs, assets) {
+  assetsCache.set(file, { mtimeMs, assets });
+  if (assetsCache.size > 6) {
+    assetsCache.delete(assetsCache.keys().next().value);
+  }
+}
+async function ffmpegPath() {
+  if (ffmpegPathCache !== void 0)
+    return ffmpegPathCache || void 0;
+  const st = await checkFfmpeg();
+  ffmpegPathCache = st.ok && st.path ? st.path : "";
+  return ffmpegPathCache || void 0;
+}
+function thumbDir() {
+  return path12.join(dataDir(), "thumbs");
+}
+async function themeThumbFor(source) {
+  if (!isInsideDataDir(source))
+    return source;
+  const thumb = path12.join(thumbDir(), path12.basename(source) + ".jpg");
+  try {
+    if (!fs12.existsSync(thumb)) {
+      const exe = await ffmpegPath();
+      if (!exe)
+        return source;
+      fs12.mkdirSync(thumbDir(), { recursive: true });
+      await execFileP(exe, ["-y", "-hide_banner", "-loglevel", "error", "-i", source, "-vf", "scale=160:-2", "-frames:v", "1", "-q:v", "4", thumb], { timeout: 2e4 });
+    }
+    return fs12.existsSync(thumb) ? thumb : source;
+  } catch {
+    return source;
+  }
+}
+function withPinnedTheme(assets, config) {
+  const hex = config.themeColor;
+  if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex))
+    return assets;
+  const r2 = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return { ...assets, theme: themeFromSourceColor(argbFromRgb(r2, g, b)) };
+}
 async function getAssets(config) {
   const wallpaperPath = config.wallpaperPath;
-  if (!wallpaperPath || !fs11.existsSync(wallpaperPath))
+  if (!wallpaperPath || !fs12.existsSync(wallpaperPath))
     return void 0;
-  const sourcePath = config.mediaType === "video" ? path10.join(path10.dirname(wallpaperPath), "poster.jpg") : wallpaperPath;
-  if (!fs11.existsSync(sourcePath))
+  const sourcePath = config.mediaType === "video" ? path12.join(path12.dirname(wallpaperPath), "poster.jpg") : await themeThumbFor(wallpaperPath);
+  if (!fs12.existsSync(sourcePath))
     return void 0;
-  const mtimeMs = fs11.statSync(sourcePath).mtimeMs;
-  if (cachedAssets?.file === sourcePath && cachedAssets.mtimeMs === mtimeMs) {
-    return cachedAssets.assets;
+  const mtimeMs = fs12.statSync(sourcePath).mtimeMs;
+  const cached = assetsCache.get(sourcePath);
+  if (cached?.mtimeMs === mtimeMs) {
+    assetsCache.delete(sourcePath);
+    assetsCache.set(sourcePath, cached);
+    return withPinnedTheme(cached.assets, config);
   }
   try {
     const assets = await loadWallpaper(sourcePath);
-    cachedAssets = { file: sourcePath, mtimeMs, assets };
-    return assets;
+    rememberAssets(sourcePath, mtimeMs, assets);
+    return withPinnedTheme(assets, config);
   } catch {
     return void 0;
   }
@@ -111890,23 +114823,81 @@ function currentConfig() {
   return { ...DEFAULT_CONFIG, ...loadConfig() };
 }
 function backupFile() {
-  return path10.join(dataDir(), "config.backup.json");
+  return path12.join(dataDir(), "config.backup.json");
 }
 function hasBackup() {
-  return fs11.existsSync(backupFile());
+  return fs12.existsSync(backupFile());
+}
+function weImportsFile() {
+  return path12.join(dataDir(), "we-imports.json");
+}
+function loadWeImports() {
+  try {
+    return JSON.parse(fs12.readFileSync(weImportsFile(), "utf8"));
+  } catch {
+    return {};
+  }
+}
+function saveWeImports(map) {
+  try {
+    fs12.writeFileSync(weImportsFile(), JSON.stringify(map, null, 1));
+  } catch {
+  }
+}
+function cachedSceneNames() {
+  const names3 = /* @__PURE__ */ new Map();
+  try {
+    for (const d of fs12.readdirSync(scenesCacheRoot())) {
+      try {
+        const name = JSON.parse(fs12.readFileSync(path12.join(scenesCacheRoot(), d, "name.json"), "utf8")).name;
+        if (name && !/^[0-9a-f]{8}$/.test(name)) {
+          names3.set(name, [...names3.get(name) ?? [], d]);
+        }
+      } catch {
+      }
+    }
+  } catch {
+  }
+  return names3;
+}
+function isDayPeriod(dn) {
+  const hhmm = `${String((/* @__PURE__ */ new Date()).getHours()).padStart(2, "0")}:${String((/* @__PURE__ */ new Date()).getMinutes()).padStart(2, "0")}`;
+  return dn.start <= dn.end ? hhmm >= dn.start && hhmm < dn.end : hhmm >= dn.start || hhmm < dn.end;
+}
+function effectiveLook(config) {
+  const dn = config.dayNight;
+  if (!dn?.enabled)
+    return { dim: config.dim, blur: config.blur };
+  return isDayPeriod(dn) ? { dim: dn.dayDim, blur: dn.dayBlur } : { dim: dn.nightDim, blur: dn.nightBlur };
+}
+function lookConfigFor(config) {
+  return { ...config, ...effectiveLook(config) };
 }
 function publicConfig(config) {
+  const look = effectiveLook(config);
   return {
-    blur: config.blur,
-    dim: config.dim,
+    blur: look.blur,
+    dim: look.dim,
+    flatBlur: config.blur,
+    flatDim: config.dim,
     monet: config.monet,
     wallpaperVisible: config.wallpaperVisible,
+    kenBurns: config.kenBurns ?? false,
+    videoVolume: config.videoVolume ?? 0,
+    themeColor: config.themeColor ?? null,
+    dayNight: config.dayNight ?? null,
+    chatLook: normalizeChatLook(config.chatLook),
+    startupClean: config.startupClean !== false,
+    showOnUpdater: config.showOnUpdater === true,
+    importRes: config.importRes ?? { mode: "auto" },
     fit: config.fit,
-    wallpaperSet: Boolean(config.wallpaperPath && fs11.existsSync(config.wallpaperPath)),
+    wallpaperSet: Boolean(config.wallpaperPath && fs12.existsSync(config.wallpaperPath)),
     hasBackup: hasBackup(),
     cdpPort: config.port,
     mediaType: config.mediaType ?? "image",
-    sceneHash: config.sceneHash
+    sceneHash: config.sceneHash,
+    /** Current wallpaper file (image mode) — lets the panel preselect it. */
+    wallpaperPath: config.mediaType === "video" ? void 0 : config.wallpaperPath
   };
 }
 function sanitize(body) {
@@ -111919,46 +114910,146 @@ function sanitize(body) {
     out.monet = body.monet;
   if (typeof body?.wallpaperVisible === "boolean")
     out.wallpaperVisible = body.wallpaperVisible;
+  if (typeof body?.kenBurns === "boolean")
+    out.kenBurns = body.kenBurns;
+  if (typeof body?.startupClean === "boolean")
+    out.startupClean = body.startupClean;
+  if (typeof body?.showOnUpdater === "boolean")
+    out.showOnUpdater = body.showOnUpdater;
+  const ir = body?.importRes;
+  if (ir && typeof ir === "object") {
+    out.importRes = {
+      mode: ir.mode === "custom" || /\d+x\d+/.test(String(ir.mode ?? "")) ? ir.mode : "auto",
+      width: typeof ir.width === "number" && ir.width >= 256 && ir.width <= 3840 ? Math.round(ir.width) : void 0,
+      height: typeof ir.height === "number" && ir.height >= 144 && ir.height <= 2160 ? Math.round(ir.height) : void 0
+    };
+  }
+  if (typeof body?.videoVolume === "number" && body.videoVolume >= 0 && body.videoVolume <= 100)
+    out.videoVolume = Math.round(body.videoVolume);
+  if (body?.themeColor === null)
+    out.themeColor = void 0;
+  else if (typeof body?.themeColor === "string" && /^#[0-9a-fA-F]{6}$/.test(body.themeColor))
+    out.themeColor = body.themeColor;
   if (body?.fit === "cover" || body?.fit === "contain" || body?.fit === "smart")
     out.fit = body.fit;
+  const cl = body?.chatLook;
+  if (cl && typeof cl === "object") {
+    const pct = (v) => typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : void 0;
+    out.chatLook = {
+      chatDim: pct(cl.chatDim) ?? 0,
+      maskTop: pct(cl.maskTop) ?? 0,
+      maskBottom: pct(cl.maskBottom) ?? 0,
+      frost: pct(cl.frost) ?? 0
+    };
+  }
+  const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  const dn = body?.dayNight;
+  if (dn && typeof dn === "object") {
+    const num = (v, max) => typeof v === "number" && v >= 0 && v <= max ? Math.round(v) : void 0;
+    const start = typeof dn.start === "string" && HHMM_RE.test(dn.start) ? dn.start : void 0;
+    const end = typeof dn.end === "string" && HHMM_RE.test(dn.end) ? dn.end : void 0;
+    out.dayNight = {
+      enabled: dn.enabled === true,
+      start: start ?? "06:00",
+      end: end ?? "18:00",
+      dayDim: num(dn.dayDim, 80) ?? 20,
+      nightDim: num(dn.nightDim, 80) ?? 55,
+      dayBlur: num(dn.dayBlur, 30) ?? 0,
+      nightBlur: num(dn.nightBlur, 30) ?? 6
+    };
+  }
   return out;
+}
+async function scrubPanelArtifacts(target) {
+  if (!target.webSocketDebuggerUrl)
+    return;
+  const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
+  try {
+    await conn.send("Runtime.evaluate", {
+      expression: `(function(){
+        var p = document.getElementById('zcode-beautify-panel-root'); if (p) p.remove();
+        document.querySelectorAll('body > .zb-we-pop').forEach(function(e){e.remove();});
+        try{(window.__zbTimers||[]).forEach(function(t){clearInterval(t)});window.__zbTimers=[];}catch(_){}
+      })()`,
+      returnByValue: true
+    });
+  } finally {
+    conn.close();
+  }
+}
+async function scrubTarget(target) {
+  if (!target.webSocketDebuggerUrl)
+    return;
+  const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
+  try {
+    await conn.send("Runtime.evaluate", {
+      expression: `(function(){
+        ['zcode-beautify-style','zcode-beautify-wallpaper','zcode-beautify-fade','zcode-beautify-fade-style','zcode-beautify-chatlook-style','zcode-beautify-frost','zcode-beautify-zonemask','zcode-beautify-backdrop','zcode-beautify-panel-root'].forEach(function(i){var e=document.getElementById(i);if(e)e.remove();});
+        document.querySelectorAll('body > .zb-we-pop, style[id^="zcode-beautify"]').forEach(function(e){e.remove();});
+        try{(window.__zbTimers||[]).forEach(function(t){clearInterval(t)});window.__zbTimers=[];}catch(_){}
+      })()`,
+      returnByValue: true
+    });
+  } finally {
+    conn.close();
+  }
 }
 async function registerScript(session, source) {
   const { identifier } = await session.conn.send("Page.addScriptToEvaluateOnNewDocument", { source });
   return identifier;
 }
-async function holdSession(target, config, apiPort) {
+async function holdSession(target, config, apiPort, opts = {}) {
   if (!target.webSocketDebuggerUrl)
     return;
   const conn = await CdpConnection.connect(target.webSocketDebuggerUrl);
   await conn.send("Page.enable");
   const session = { conn };
   const assets = await getAssets(config);
-  const payload = buildPayload(config, assets);
+  const payload = buildPayload(lookConfigFor(config), assets, mediaToken);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
     videoSrc: payload.videoSrc,
-    fit: payload.fit
+    fit: payload.fit,
+    transition: payload.transition,
+    kenBurns: payload.kenBurns,
+    videoVolume: payload.videoVolume,
+    chatLook: payload.chatLook,
+    startupClean: payload.startupClean
   });
   const { identifier } = await conn.send("Page.addScriptToEvaluateOnNewDocument", {
     source: bootstrap
   });
   session.themeScriptId = identifier;
-  await conn.send("Runtime.evaluate", { expression: bootstrap, returnByValue: true });
-  const panelScript = buildPanelScript(apiPort);
+  const bootEval = await conn.send("Runtime.evaluate", { expression: bootstrap, returnByValue: true });
+  if (bootEval?.exceptionDetails) {
+    console.error(`serve: theme bootstrap threw \u2014 ${JSON.stringify(bootEval.exceptionDetails).slice(0, 400)}`);
+  }
+  if (opts.panel === false) {
+    held.set(target.id, session);
+    return;
+  }
+  const panelScript = buildPanelScript(apiPort, mediaToken, config.startupClean !== false);
   await conn.send("Page.addScriptToEvaluateOnNewDocument", { source: panelScript });
-  await conn.send("Runtime.evaluate", { expression: panelScript, returnByValue: true });
+  const panelEval = await conn.send("Runtime.evaluate", { expression: panelScript, returnByValue: true });
+  if (panelEval?.exceptionDetails) {
+    console.error(`serve: panel script threw \u2014 ${JSON.stringify(panelEval.exceptionDetails).slice(0, 400)}`);
+  }
   held.set(target.id, session);
 }
 async function pushConfigToSessions(config) {
   const assets = await getAssets(config);
-  const payload = buildPayload(config, assets);
+  const payload = buildPayload(lookConfigFor(config), assets, mediaToken);
   const bootstrap = buildBootstrapScript({
     css: payload.css,
     wallpaperDataUri: payload.wallpaperDataUri,
     videoSrc: payload.videoSrc,
-    fit: payload.fit
+    fit: payload.fit,
+    transition: payload.transition,
+    kenBurns: payload.kenBurns,
+    videoVolume: payload.videoVolume,
+    chatLook: payload.chatLook,
+    startupClean: payload.startupClean
   });
   let ok = 0;
   for (const [id, session] of held) {
@@ -111969,6 +115060,12 @@ async function pushConfigToSessions(config) {
       }
       session.themeScriptId = await registerScript(session, bootstrap);
       await session.conn.send("Runtime.evaluate", { expression: bootstrap, returnByValue: true });
+      const vv = Math.max(0, Math.min(100, Math.round(payload.videoVolume ?? 0)));
+      await session.conn.send("Runtime.evaluate", {
+        expression: `(function(){var v=document.getElementById('zcode-beautify-video');if(v){v.muted=${JSON.stringify(vv === 0)};v.volume=${(vv / 100).toFixed(3)};}})()`,
+        returnByValue: true
+      }).catch(() => {
+      });
       ok++;
     } catch {
       session.conn.close();
@@ -111981,7 +115078,47 @@ async function poll(config, apiPort) {
   try {
     const targets = pickRendererTargets(await listTargets(config.port));
     const current = new Set(targets.map((t2) => t2.id));
+    for (const [id, session] of [...held]) {
+      const alive = await Promise.race([
+        session.conn.send("Runtime.evaluate", { expression: "1" }).then(() => true, () => false),
+        new Promise((r2) => setTimeout(() => r2(false), 1500))
+      ]);
+      if (!alive) {
+        session.conn.close();
+        held.delete(id);
+      }
+    }
     for (const t2 of targets) {
+      if (isUpdaterTarget(t2)) {
+        if (config.showOnUpdater === true) {
+          if (!held.has(t2.id)) {
+            try {
+              await holdSession(t2, config, apiPort, { panel: false });
+              console.log(`serve: update-status window (${t2.id.slice(0, 8)}) beautified \u2014 wallpaper only, no panel`);
+            } catch {
+            }
+          }
+          try {
+            await scrubPanelArtifacts(t2);
+          } catch {
+          }
+        } else {
+          if (held.has(t2.id)) {
+            held.get(t2.id).conn.close();
+            held.delete(t2.id);
+          }
+          try {
+            await scrubTarget(t2);
+            if (!scrubbedUpdaters.has(t2.id)) {
+              scrubbedUpdaters.add(t2.id);
+              console.log(`serve: update-status window (${t2.id.slice(0, 8)}) left stock \u2014 wallpaper/panel scrubbed (opt back in via settings)`);
+            }
+          } catch {
+            scrubbedUpdaters.delete(t2.id);
+          }
+        }
+        continue;
+      }
       if (!held.has(t2.id)) {
         try {
           await holdSession(t2, config, apiPort);
@@ -112041,11 +115178,70 @@ function readBody(req) {
 }
 async function startServe(opts) {
   const { cdpPort, apiPort } = opts;
+  mediaToken = crypto2.randomBytes(24).toString("hex");
+  try {
+    fs12.mkdirSync(dataDir(), { recursive: true });
+    fs12.writeFileSync(path12.join(dataDir(), "serve.token"), mediaToken, { encoding: "utf8" });
+  } catch {
+  }
+  const historyFile = () => path12.join(dataDir(), "history.json");
+  function readHistory() {
+    try {
+      return JSON.parse(fs12.readFileSync(historyFile(), "utf8"));
+    } catch {
+      return [];
+    }
+  }
+  function recordHistory(entry) {
+    try {
+      const list = readHistory().filter((e2) => e2.hash !== entry.hash || e2.path !== entry.path);
+      list.unshift({ at: Date.now(), ...entry });
+      fs12.writeFileSync(historyFile(), JSON.stringify(list.slice(0, 20), null, 2));
+    } catch {
+    }
+  }
   const runtimeConfig = () => ({ ...currentConfig(), port: cdpPort });
   const persisted = (config) => ({
     ...config,
     port: currentConfig().port
   });
+  const applyRef = async (ref) => {
+    const config = runtimeConfig();
+    if (typeof ref.hash === "string") {
+      const loopPath = path12.join(scenesCacheRoot(), ref.hash, "loop.mp4");
+      if (!fs12.existsSync(loopPath))
+        throw new Error("unknown scene hash");
+      let label = ref.hash.slice(0, 8);
+      try {
+        label = JSON.parse(fs12.readFileSync(path12.join(scenesCacheRoot(), ref.hash, "name.json"), "utf8")).name || label;
+      } catch {
+      }
+      const next = {
+        ...config,
+        mediaType: "video",
+        sceneHash: ref.hash,
+        wallpaperPath: loopPath,
+        apiPort,
+        sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${ref.hash}.mp4`
+      };
+      saveConfig(persisted(next));
+      recordHistory({ label, kind: "video", hash: ref.hash, thumbUrl: `http://127.0.0.1:${apiPort}/media/poster/${ref.hash}.jpg` });
+      return { windows: await pushConfigToSessions(next).catch(() => 0) };
+    }
+    if (typeof ref.path === "string" && fs12.existsSync(ref.path)) {
+      const next = {
+        ...config,
+        wallpaperPath: ref.path,
+        mediaType: "image",
+        sceneHash: void 0,
+        sceneVideoUrl: void 0
+      };
+      saveConfig(persisted(next));
+      recordHistory({ label: path12.basename(ref.path), kind: "image", path: ref.path, thumbUrl: `http://127.0.0.1:${apiPort}/media/lib/${encodeURIComponent(path12.basename(ref.path))}` });
+      return { windows: await pushConfigToSessions(next).catch(() => 0) };
+    }
+    throw new Error("provide hash or existing path");
+  };
   const already = await existingServePid(apiPort);
   if (already !== void 0) {
     throw new Error(`a beautify service is already running on http://127.0.0.1:${apiPort} (pid ${already}) \u2014 open its panel, or stop that process first`);
@@ -112062,8 +115258,23 @@ async function startServe(opts) {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     try {
       if (req.method === "OPTIONS") {
-        sendJson(res, 204, {});
+        try {
+          res.writeHead(204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-Beautify-Token"
+          });
+          res.end();
+        } catch {
+        }
         return;
+      }
+      if (url.pathname !== "/api/health") {
+        const presented = String(req.headers["x-beautify-token"] ?? url.searchParams.get("t") ?? "");
+        if (presented !== mediaToken) {
+          sendJson(res, 401, { error: "unauthorized" });
+          return;
+        }
       }
       if (req.method === "GET" && url.pathname === "/api/config") {
         sendJson(res, 200, publicConfig(runtimeConfig()));
@@ -112072,6 +115283,24 @@ async function startServe(opts) {
       if (req.method === "POST" && url.pathname === "/api/config") {
         const patch = sanitize(JSON.parse(await readBody(req)));
         const config = { ...runtimeConfig(), ...patch };
+        if (config.dayNight?.enabled && (patch.dim !== void 0 || patch.blur !== void 0)) {
+          const dn = config.dayNight;
+          const day = isDayPeriod(dn);
+          if (patch.dim !== void 0) {
+            if (day)
+              dn.dayDim = patch.dim;
+            else
+              dn.nightDim = patch.dim;
+            config.dim = patch.dim;
+          }
+          if (patch.blur !== void 0) {
+            if (day)
+              dn.dayBlur = patch.blur;
+            else
+              dn.nightBlur = patch.blur;
+            config.blur = patch.blur;
+          }
+        }
         saveConfig(persisted(config));
         const windows = await pushConfigToSessions(config).catch(() => 0);
         sendJson(res, 200, { ok: true, windows, ...publicConfig(config) });
@@ -112088,20 +115317,34 @@ async function startServe(opts) {
           throw new Error(`image too large (max ${MAX_WALLPAPER_BYTES / 1024 / 1024} MB)`);
         }
         const config = runtimeConfig();
-        fs11.mkdirSync(dataDir(), { recursive: true });
-        const dest = path10.join(dataDir(), "wallpaper" + IMAGE_EXT[m[1]]);
-        fs11.writeFileSync(dest, bytes);
-        cachedAssets = { file: dest, mtimeMs: fs11.statSync(dest).mtimeMs, assets: await loadWallpaper(dest) };
-        saveConfig(persisted({ ...config, wallpaperPath: dest }));
-        const windows = await pushConfigToSessions({ ...config, wallpaperPath: dest }).catch(() => 0);
-        sendJson(res, 200, { ok: true, windows, ...publicConfig({ ...config, wallpaperPath: dest }) });
+        fs12.mkdirSync(dataDir(), { recursive: true });
+        const ext = IMAGE_EXT[m[1]];
+        const safeBase = (typeof body?.name === "string" ? path12.basename(body.name) : "wallpaper").replace(/[\\/:*?"<>|]/g, "_").replace(new RegExp("\\" + ext + "$", "i"), "").trim() || "wallpaper";
+        let dest = path12.join(dataDir(), safeBase + ext);
+        for (let i2 = 2; fs12.existsSync(dest); i2++) {
+          dest = path12.join(dataDir(), `${safeBase}(${i2})${ext}`);
+        }
+        fs12.writeFileSync(dest, bytes);
+        const themeSrc = await themeThumbFor(dest);
+        rememberAssets(themeSrc, fs12.statSync(themeSrc).mtimeMs, await loadWallpaper(themeSrc));
+        const nextCfg = {
+          ...config,
+          wallpaperPath: dest,
+          mediaType: "image",
+          sceneHash: void 0,
+          sceneVideoUrl: void 0
+        };
+        saveConfig(persisted(nextCfg));
+        recordHistory({ label: safeBase + ext, kind: "image", path: dest, thumbUrl: `http://127.0.0.1:${apiPort}/media/lib/${encodeURIComponent(path12.basename(dest))}` });
+        const windows = await pushConfigToSessions(nextCfg).catch(() => 0);
+        sendJson(res, 200, { ok: true, windows, ...publicConfig(nextCfg) });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/reset") {
         const stored = loadConfig();
-        if (stored.wallpaperPath && fs11.existsSync(stored.wallpaperPath)) {
-          fs11.mkdirSync(dataDir(), { recursive: true });
-          fs11.writeFileSync(backupFile(), JSON.stringify(stored));
+        if (stored.wallpaperPath && fs12.existsSync(stored.wallpaperPath)) {
+          fs12.mkdirSync(dataDir(), { recursive: true });
+          fs12.writeFileSync(backupFile(), JSON.stringify(stored));
         }
         for (const [id, session] of held) {
           try {
@@ -112116,15 +115359,26 @@ async function startServe(opts) {
             held.delete(id);
           }
         }
-        saveConfig({ ...stored, wallpaperPath: void 0, mediaType: void 0, sceneHash: void 0, sceneVideoUrl: void 0 });
-        cachedAssets = void 0;
+        stopRotationTimers();
+        const storedRot = stored.rotation ? normalizeRotation(stored.rotation) : void 0;
+        const cleared = storedRot ? { ...storedRot, enabled: false } : void 0;
+        const resetCfg = {
+          ...stored,
+          wallpaperPath: void 0,
+          mediaType: void 0,
+          sceneHash: void 0,
+          sceneVideoUrl: void 0,
+          ...cleared ? { rotation: cleared } : {}
+        };
+        saveConfig(resetCfg);
+        assetsCache.clear();
         sendJson(res, 200, { ok: true, hasBackup: true });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/restore") {
         let saved;
         try {
-          saved = JSON.parse(fs11.readFileSync(backupFile(), "utf8"));
+          saved = JSON.parse(fs12.readFileSync(backupFile(), "utf8"));
         } catch {
           throw new Error("no wallpaper backup available");
         }
@@ -112140,7 +115394,7 @@ async function startServe(opts) {
       }
       if (req.method === "POST" && url.pathname === "/api/pick-scene") {
         const picked = await pickFileViaDialog();
-        sendJson(res, 200, { ok: Boolean(picked), path: picked });
+        sendJson(res, 200, { ok: picked.length > 0, path: picked[0], paths: picked });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/import-scene") {
@@ -112153,10 +115407,43 @@ async function startServe(opts) {
           return;
         }
         importJob = { running: true, stage: "starting" };
+        const resSetting = { ...runtimeConfig().importRes ?? { mode: "auto" }, ...typeof body?.importRes === "object" ? body.importRes : {} };
+        let resW, resH;
+        try {
+          const m = /^(\d+)x(\d+)$/.exec(String(resSetting.mode ?? "auto"));
+          if (resSetting.mode === "custom" && resSetting.width && resSetting.height) {
+            resW = resSetting.width;
+            resH = resSetting.height;
+          } else if (m) {
+            resW = Number(m[1]);
+            resH = Number(m[2]);
+          } else {
+            const dir = (() => {
+              try {
+                return fs12.statSync(scenePath).isDirectory() ? scenePath : path12.dirname(scenePath);
+              } catch {
+                return scenePath;
+              }
+            })();
+            const probe = JSON.parse(fs12.readFileSync(path12.join(dir, "project.json"), "utf8"));
+            const w = Number(probe?.general?.properties?.width);
+            const h = Number(probe?.general?.properties?.height);
+            if (w >= 256 && w <= 3840)
+              resW = Math.round(w);
+            if (h >= 144 && h <= 2160)
+              resH = Math.round(h);
+          }
+        } catch {
+        }
+        const sceneOpts = {};
+        if (resW && resH) {
+          sceneOpts.width = resW;
+          sceneOpts.height = resH;
+        }
         void importScene(scenePath, (stage, detail) => {
           importJob.stage = stage;
           importJob.detail = detail;
-        }).then(async (result) => {
+        }, sceneOpts).then(async (result) => {
           importJob = {
             running: false,
             stage: "done",
@@ -112172,6 +115459,33 @@ async function startServe(opts) {
             sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${result.hash}.mp4`
           };
           saveConfig(persisted(next));
+          let label = result.hash.slice(0, 8);
+          let named = false;
+          try {
+            label = JSON.parse(fs12.readFileSync(path12.join(scenesCacheRoot(), result.hash, "name.json"), "utf8")).name || label;
+            named = true;
+          } catch {
+          }
+          if (!named) {
+            const fallback = weTitleForPath(scenePath) ?? (path12.extname(scenePath) ? path12.basename(scenePath).replace(/\.[^.]+$/, "") : void 0);
+            if (fallback) {
+              label = fallback;
+              try {
+                fs12.writeFileSync(path12.join(scenesCacheRoot(), result.hash, "name.json"), JSON.stringify({ name: fallback }));
+              } catch {
+              }
+            }
+          }
+          recordHistory({ label, kind: "video", hash: result.hash, thumbUrl: `http://127.0.0.1:${apiPort}/media/poster/${result.hash}.jpg` });
+          try {
+            const weDir = weDirForPath(scenePath);
+            if (weDir) {
+              const weMap = loadWeImports();
+              weMap[weDir.toLowerCase()] = { hash: result.hash };
+              saveWeImports(weMap);
+            }
+          } catch {
+          }
           await pushConfigToSessions(next).catch(() => 0);
         }).catch((err) => {
           importJob = {
@@ -112190,64 +115504,62 @@ async function startServe(opts) {
       }
       if (req.method === "POST" && url.pathname === "/api/apply-wallpaper") {
         const body = JSON.parse(await readBody(req));
-        const config = runtimeConfig();
-        if (typeof body?.hash === "string") {
-          const loopPath = path10.join(scenesCacheRoot(), body.hash, "loop.mp4");
-          if (!fs11.existsSync(loopPath))
-            throw new Error("unknown scene hash");
-          const next = {
-            ...config,
-            mediaType: "video",
-            sceneHash: body.hash,
-            wallpaperPath: loopPath,
-            apiPort,
-            sceneVideoUrl: `http://127.0.0.1:${apiPort}/media/scene/${body.hash}.mp4`
-          };
-          saveConfig(persisted(next));
-          const windows = await pushConfigToSessions(next).catch(() => 0);
-          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
-          return;
+        const r2 = await applyRef({
+          hash: typeof body?.hash === "string" ? body.hash : void 0,
+          path: typeof body?.path === "string" ? body.path : void 0
+        });
+        if (runtimeConfig().rotation?.enabled) {
+          stopRotationTimers();
+          const next = runtimeConfig();
+          if (next.rotation) {
+            next.rotation.enabled = false;
+            saveConfig(persisted(next));
+          }
+          console.log("serve: rotation paused (manual wallpaper switch)");
         }
-        if (typeof body?.path === "string" && fs11.existsSync(body.path)) {
-          const next = {
-            ...config,
-            wallpaperPath: body.path,
-            mediaType: "image",
-            sceneHash: void 0,
-            sceneVideoUrl: void 0
-          };
-          saveConfig(persisted(next));
-          const windows = await pushConfigToSessions(next).catch(() => 0);
-          sendJson(res, 200, { ok: true, windows, ...publicConfig(next) });
-          return;
-        }
-        throw new Error("provide hash or existing path");
+        sendJson(res, 200, { ok: true, windows: r2.windows, ...publicConfig(runtimeConfig()) });
+        return;
       }
       if (req.method === "GET" && url.pathname === "/api/library") {
+        let fav = { hashes: [], paths: [] };
+        try {
+          fav = JSON.parse(fs12.readFileSync(path12.join(dataDir(), "favorites.json"), "utf8"));
+        } catch {
+        }
         const images = [];
-        for (const f2 of fs11.readdirSync(dataDir())) {
+        for (const f2 of fs12.readdirSync(dataDir())) {
           if (/\.(jpe?g|png|webp|bmp)$/i.test(f2)) {
-            images.push({ name: f2, path: path10.join(dataDir(), f2) });
+            try {
+              const p2 = path12.join(dataDir(), f2);
+              images.push({ name: f2, path: p2, mtimeMs: fs12.statSync(p2).mtimeMs, favorite: fav.paths.includes(path12.resolve(p2)) });
+            } catch {
+            }
           }
+        }
+        const byFav = (a2, b) => Number(b.favorite) - Number(a2.favorite);
+        if (url.searchParams.get("sort") === "name") {
+          images.sort((a2, b) => byFav(a2, b) || a2.name.localeCompare(b.name, "zh-Hans-CN"));
+        } else {
+          images.sort((a2, b) => byFav(a2, b) || b.mtimeMs - a2.mtimeMs);
         }
         const scenes = [];
         try {
-          for (const d of fs11.readdirSync(scenesCacheRoot())) {
-            const loop = path10.join(scenesCacheRoot(), d, "loop.mp4");
+          for (const d of fs12.readdirSync(scenesCacheRoot())) {
+            const loop = path12.join(scenesCacheRoot(), d, "loop.mp4");
             try {
-              const st = fs11.statSync(loop);
+              const st = fs12.statSync(loop);
               let name;
               try {
-                name = JSON.parse(fs11.readFileSync(path10.join(scenesCacheRoot(), d, "name.json"), "utf8")).name;
+                name = JSON.parse(fs12.readFileSync(path12.join(scenesCacheRoot(), d, "name.json"), "utf8")).name;
               } catch {
               }
-              scenes.push({ hash: d, name, sizeBytes: st.size, mtimeMs: st.mtimeMs });
+              scenes.push({ hash: d, name, sizeBytes: st.size, mtimeMs: st.mtimeMs, favorite: fav.hashes.includes(d) });
             } catch {
             }
           }
         } catch {
         }
-        scenes.sort((a2, b) => b.mtimeMs - a2.mtimeMs);
+        scenes.sort((a2, b) => Number(b.favorite) - Number(a2.favorite) || b.mtimeMs - a2.mtimeMs);
         sendJson(res, 200, { images, scenes });
         return;
       }
@@ -112259,18 +115571,19 @@ async function startServe(opts) {
         if (name.includes("/") || name.includes("\\") || name.includes(".."))
           throw new Error("invalid name");
         if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
-          const dir = path10.join(scenesCacheRoot(), body.hash);
-          if (!fs11.existsSync(dir))
+          const dir = path12.join(scenesCacheRoot(), body.hash);
+          if (!fs12.existsSync(dir))
             throw new Error("unknown scene hash");
-          fs11.writeFileSync(path10.join(dir, "name.json"), JSON.stringify({ name }));
+          fs12.writeFileSync(path12.join(dir, "name.json"), JSON.stringify({ name }));
           sendJson(res, 200, { ok: true });
           return;
         }
         if (body?.kind === "image" && typeof body?.path === "string") {
-          const oldPath = path10.resolve(body.path);
+          const oldPath = path12.resolve(body.path);
           const renamed = renameLibraryImage(oldPath, name);
-          if (runtimeConfig().wallpaperPath === oldPath) {
-            saveConfig(persisted({ ...runtimeConfig(), wallpaperPath: renamed }));
+          const cfg = runtimeConfig();
+          if (cfg.wallpaperPath && path12.resolve(cfg.wallpaperPath) === oldPath) {
+            saveConfig(persisted({ ...cfg, wallpaperPath: renamed }));
           }
           sendJson(res, 200, { ok: true, path: renamed });
           return;
@@ -112280,30 +115593,413 @@ async function startServe(opts) {
       if (req.method === "POST" && url.pathname === "/api/library-delete") {
         const body = JSON.parse(await readBody(req));
         const config = runtimeConfig();
+        const dropFromPlans = (match) => {
+          const rot = normalizeRotation(runtimeConfig().rotation);
+          let touched = false;
+          for (const plan of rot.plans) {
+            const kept = plan.entries.filter((e2) => !match(e2));
+            if (kept.length !== plan.entries.length) {
+              plan.entries = kept;
+              touched = true;
+            }
+          }
+          if (touched) {
+            saveConfig(persisted({ ...runtimeConfig(), rotation: rot }));
+            if (rot.enabled)
+              startRotation(true);
+          }
+        };
         if (body?.kind === "scene" && typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
           if (config.sceneHash === body.hash) {
             throw new Error("\u8BE5\u58C1\u7EB8\u6B63\u5728\u4F7F\u7528\u4E2D \u2014 \u5148\u5207\u6362\u5230\u5176\u4ED6\u58C1\u7EB8\u518D\u5220\u9664");
           }
-          const dir = path10.join(scenesCacheRoot(), body.hash);
-          if (!fs11.existsSync(dir))
+          const dir = path12.join(scenesCacheRoot(), body.hash);
+          if (!fs12.existsSync(dir))
             throw new Error("unknown scene hash");
-          fs11.rmSync(dir, { recursive: true, force: true });
+          fs12.rmSync(dir, { recursive: true, force: true });
+          dropFromPlans((e2) => e2.hash === body.hash);
           sendJson(res, 200, { ok: true });
           return;
         }
         if (body?.kind === "image" && typeof body?.path === "string") {
-          const target = path10.resolve(body.path);
-          if (config.wallpaperPath === target) {
+          const target = path12.resolve(body.path);
+          if (config.wallpaperPath && path12.resolve(config.wallpaperPath) === target) {
             throw new Error("\u8BE5\u58C1\u7EB8\u6B63\u5728\u4F7F\u7528\u4E2D \u2014 \u5148\u5207\u6362\u5230\u5176\u4ED6\u58C1\u7EB8\u518D\u5220\u9664");
           }
           if (!isInsideDataDir(target) || !/\.(jpe?g|png|webp|bmp)$/i.test(target)) {
             throw new Error("only plugin-managed wallpapers can be deleted here");
           }
-          fs11.rmSync(target, { force: true });
+          fs12.rmSync(target, { force: true });
+          const thumb = path12.join(thumbDir(), path12.basename(target) + ".jpg");
+          if (isInsideDataDir(thumb))
+            fs12.rmSync(thumb, { force: true });
+          dropFromPlans((e2) => Boolean(e2.path && path12.resolve(e2.path) === target));
           sendJson(res, 200, { ok: true });
           return;
         }
         throw new Error("kind must be scene (with hash) or image (with path)");
+      }
+      if (req.method === "GET" && url.pathname === "/api/rotation") {
+        sendJson(res, 200, { rotation: normalizeRotation(runtimeConfig().rotation) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/rotation") {
+        const body = JSON.parse(await readBody(req));
+        const next = sanitizeRotation(body?.rotation);
+        const stored = persisted({ ...runtimeConfig(), rotation: next });
+        delete stored.schedule;
+        delete stored.transition;
+        saveConfig(stored);
+        startRotation(body?.resume === true);
+        sendJson(res, 200, { ok: true, rotation: next });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/rotation-next") {
+        sendJson(res, 200, skipRotation());
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/rotation-visibility") {
+        const body = JSON.parse(await readBody(req));
+        const visible = body?.visible === true;
+        if (visible === !rotationHidden) {
+          sendJson(res, 200, { ok: true, unchanged: true });
+          return;
+        }
+        rotationHidden = !visible;
+        if (rotationHidden) {
+          if (rotationTimer) {
+            rotationRemainMs = Math.max(0, rotationDeadline - Date.now());
+            clearTimeout(rotationTimer);
+            rotationTimer = void 0;
+          }
+          console.log("serve: rotation frozen (page hidden)");
+        } else if (rotationRemainMs > 0 && !rotationTimer) {
+          scheduleRotationNext(rotationRemainMs);
+          console.log("serve: rotation resumed (page visible)");
+        }
+        sendJson(res, 200, { ok: true, hidden: rotationHidden });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/rotation-state") {
+        const s2 = rotationNow();
+        if (!s2.on || !s2.plan) {
+          sendJson(res, 200, { on: false });
+          return;
+        }
+        sendJson(res, 200, {
+          on: true,
+          planName: s2.plan.name,
+          mode: s2.plan.mode,
+          index: rotationIndex,
+          total: s2.plan.entries.length,
+          remainMs: rotationHidden ? rotationRemainMs : Math.max(0, rotationDeadline - Date.now()),
+          frozen: rotationHidden
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/storage") {
+        let scenesBytes = 0;
+        const entries = [];
+        try {
+          for (const d of fs12.readdirSync(scenesCacheRoot())) {
+            try {
+              let size = 0;
+              const walk = (dir) => {
+                for (const f2 of fs12.readdirSync(dir, { withFileTypes: true })) {
+                  const p2 = path12.join(dir, f2.name);
+                  if (f2.isDirectory())
+                    walk(p2);
+                  else {
+                    try {
+                      size += fs12.statSync(p2).size;
+                    } catch {
+                    }
+                  }
+                }
+              };
+              walk(path12.join(scenesCacheRoot(), d));
+              let name;
+              try {
+                name = JSON.parse(fs12.readFileSync(path12.join(scenesCacheRoot(), d, "name.json"), "utf8")).name;
+              } catch {
+              }
+              entries.push({ hash: d, name, sizeBytes: size });
+              scenesBytes += size;
+            } catch {
+            }
+          }
+        } catch {
+        }
+        let thumbsBytes = 0;
+        try {
+          for (const f2 of fs12.readdirSync(thumbDir())) {
+            try {
+              thumbsBytes += fs12.statSync(path12.join(thumbDir(), f2)).size;
+            } catch {
+            }
+          }
+        } catch {
+        }
+        sendJson(res, 200, { scenesBytes, thumbsBytes, entries: entries.sort((a2, b) => b.sizeBytes - a2.sizeBytes) });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/scenes-recompress") {
+        const ff = await ffmpegPath();
+        if (!ff)
+          throw new Error("ffmpeg not found");
+        const config = runtimeConfig();
+        let done = 0;
+        let skipped = 0;
+        let savedBytes = 0;
+        try {
+          for (const d of fs12.readdirSync(scenesCacheRoot())) {
+            const loop = path12.join(scenesCacheRoot(), d, "loop.mp4");
+            try {
+              if (!fs12.statSync(loop).isFile())
+                continue;
+              if (config.sceneHash === d) {
+                skipped++;
+                continue;
+              }
+              const before = fs12.statSync(loop).size;
+              const tmp = `${loop}.cmp-${process.pid}.mp4`;
+              await execFileP(ff, [
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                loop,
+                "-vf",
+                "scale=-2:720",
+                "-r",
+                "24",
+                "-c:v",
+                "libx264",
+                "-crf",
+                "26",
+                "-preset",
+                "veryfast",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-an",
+                tmp
+              ], { timeout: 3e5 });
+              const after = fs12.statSync(tmp).size;
+              if (after > 0 && after < before) {
+                fs12.renameSync(tmp, loop);
+                done++;
+                savedBytes += before - after;
+              } else {
+                fs12.rmSync(tmp, { force: true });
+              }
+            } catch {
+            }
+          }
+        } catch {
+        }
+        sendJson(res, 200, { ok: true, done, skipped, savedBytes });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/scenes-purge") {
+        const config = runtimeConfig();
+        let removed = 0;
+        try {
+          for (const d of fs12.readdirSync(scenesCacheRoot())) {
+            if (config.sceneHash === d)
+              continue;
+            try {
+              fs12.rmSync(path12.join(scenesCacheRoot(), d), { recursive: true, force: true });
+              removed++;
+            } catch {
+            }
+          }
+        } catch {
+        }
+        if (removed) {
+          const rot = normalizeRotation(runtimeConfig().rotation);
+          for (const plan of rot.plans)
+            plan.entries = plan.entries.filter((e2) => !e2.hash || fs12.existsSync(path12.join(scenesCacheRoot(), e2.hash, "loop.mp4")));
+          saveConfig(persisted({ ...runtimeConfig(), rotation: rot }));
+          if (rot.enabled)
+            startRotation(true);
+        }
+        sendJson(res, 200, { ok: true, removed });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/export") {
+        const stored = runtimeConfig();
+        sendJson(res, 200, {
+          kind: "zcode-beautify-config",
+          version: 1,
+          exportedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          config: {
+            blur: stored.blur,
+            dim: stored.dim,
+            monet: stored.monet,
+            wallpaperVisible: stored.wallpaperVisible,
+            kenBurns: stored.kenBurns ?? false,
+            fit: stored.fit,
+            wallpaperPath: stored.wallpaperPath,
+            mediaType: stored.mediaType,
+            sceneHash: stored.sceneHash,
+            rotation: normalizeRotation(stored.rotation)
+          }
+        });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/import-config") {
+        const body = JSON.parse(await readBody(req));
+        if (body?.kind !== "zcode-beautify-config" || !body?.config) {
+          throw new Error("not a zcode-beautify config export");
+        }
+        const incoming = body.config;
+        const patch = sanitize(incoming);
+        const withWp = { ...runtimeConfig(), ...patch };
+        if (typeof incoming.wallpaperPath === "string" && fs12.existsSync(incoming.wallpaperPath)) {
+          withWp.wallpaperPath = incoming.wallpaperPath;
+          withWp.mediaType = incoming.mediaType === "video" ? "video" : "image";
+          withWp.sceneHash = typeof incoming.sceneHash === "string" ? incoming.sceneHash : void 0;
+          if (withWp.sceneHash && (!/^[a-f0-9]{8,64}$/.test(withWp.sceneHash) || !fs12.existsSync(path12.join(scenesCacheRoot(), withWp.sceneHash, "loop.mp4")))) {
+            withWp.sceneHash = void 0;
+            withWp.mediaType = "image";
+          }
+          withWp.sceneVideoUrl = withWp.mediaType === "video" && withWp.sceneHash ? `http://127.0.0.1:${apiPort}/media/scene/${withWp.sceneHash}.mp4` : void 0;
+        }
+        if (incoming.rotation)
+          withWp.rotation = sanitizeRotation(incoming.rotation);
+        saveConfig(persisted(withWp));
+        const windows = await pushConfigToSessions(withWp).catch(() => 0);
+        startRotation(true);
+        sendJson(res, 200, { ok: true, windows });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/open-folder") {
+        const body = JSON.parse(await readBody(req));
+        const target = body?.target === "scenes" ? scenesCacheRoot() : body?.target === "thumbs" ? thumbDir() : dataDir();
+        fs12.mkdirSync(target, { recursive: true });
+        spawn3("explorer", [target], { detached: true, stdio: "ignore" }).unref();
+        sendJson(res, 200, { ok: true, path: target });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/history") {
+        sendJson(res, 200, { items: readHistory() });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/stats") {
+        const items = readHistory();
+        const acc = /* @__PURE__ */ new Map();
+        for (let i2 = 0; i2 < items.length; i2++) {
+          const it = items[i2];
+          const key = it.hash ?? it.path ?? String(i2);
+          const end = i2 > 0 ? items[i2 - 1].at : Date.now();
+          const dur = Math.max(0, Math.min(end - it.at, 24 * 3600 * 1e3));
+          const row = acc.get(key) ?? { label: it.label, thumbUrl: it.thumbUrl, seconds: 0 };
+          row.seconds += Math.round(dur / 1e3);
+          acc.set(key, row);
+        }
+        const top = [...acc.entries()].map(([key, v]) => ({ key, ...v })).sort((a2, b) => b.seconds - a2.seconds).slice(0, 8);
+        sendJson(res, 200, { items: top });
+        return;
+      }
+      const favoritesFile = () => path12.join(dataDir(), "favorites.json");
+      const readFavorites = () => {
+        try {
+          return JSON.parse(fs12.readFileSync(favoritesFile(), "utf8"));
+        } catch {
+          return { hashes: [], paths: [] };
+        }
+      };
+      if (req.method === "POST" && url.pathname === "/api/favorite") {
+        const body = JSON.parse(await readBody(req));
+        const fav = readFavorites();
+        const toggle = (arr, v, on) => {
+          const i2 = arr.indexOf(v);
+          if (on && i2 < 0)
+            arr.push(v);
+          if (!on && i2 >= 0)
+            arr.splice(i2, 1);
+        };
+        if (typeof body?.hash === "string" && /^[a-f0-9]{8,64}$/.test(body.hash)) {
+          toggle(fav.hashes, body.hash, body.on === true);
+        } else if (typeof body?.path === "string") {
+          toggle(fav.paths, path12.resolve(body.path), body.on === true);
+        } else {
+          throw new Error("hash or path required");
+        }
+        fs12.writeFileSync(favoritesFile(), JSON.stringify(fav, null, 2));
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/palette") {
+        const config = runtimeConfig();
+        const sourcePath = config.mediaType === "video" && config.sceneHash ? path12.join(scenesCacheRoot(), config.sceneHash, "poster.jpg") : config.wallpaperPath ? await themeThumbFor(config.wallpaperPath) : void 0;
+        let colors = [];
+        if (sourcePath && fs12.existsSync(sourcePath)) {
+          try {
+            colors = await extractPalette(sourcePath);
+          } catch {
+          }
+        }
+        sendJson(res, 200, { colors, pinned: config.themeColor ?? null });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/we-library") {
+        const items = listWeWallpapers();
+        const map = loadWeImports();
+        const sceneNames = cachedSceneNames();
+        const cleanTitle = (t2) => t2.replace(/\[.*?\]/g, " ").replace(/（.*?）/g, " ").replace(/\(.*?\)/g, " ").replace(/\s+/g, " ").trim();
+        let dirty = false;
+        for (const it of items) {
+          const key = it.dir.toLowerCase();
+          if (map[key])
+            continue;
+          const exact = [...sceneNames.entries()].filter(([n2]) => n2 === cleanTitle(it.title));
+          if (exact.length === 1 && exact[0][1].length === 1 && items.filter((x2) => cleanTitle(x2.title) === exact[0][0]).length === 1) {
+            map[key] = { hash: exact[0][1][0], seed: true };
+            dirty = true;
+            continue;
+          }
+          const contains = [...sceneNames.entries()].filter(([n2]) => it.title.includes(n2));
+          if (contains.length === 1 && contains[0][1].length === 1 && items.filter((x2) => x2.title.includes(contains[0][0])).length === 1) {
+            map[key] = { hash: contains[0][1][0], seed: true };
+            dirty = true;
+          }
+        }
+        if (dirty)
+          saveWeImports(map);
+        sendJson(res, 200, {
+          count: items.length,
+          items: items.map((it) => ({
+            id: it.id,
+            title: it.title,
+            type: it.type,
+            dir: it.dir,
+            importable: it.importable,
+            imported: Boolean(it.imported || map[it.dir.toLowerCase()] && fs12.existsSync(path12.join(scenesCacheRoot(), map[it.dir.toLowerCase()].hash, "loop.mp4"))),
+            source: it.source,
+            folder: it.folder ?? null,
+            videoUrl: it.videoFile ? `/media/we-video?s=${it.source}&id=${encodeURIComponent(it.id)}&f=${encodeURIComponent(path12.basename(it.videoFile))}` : null,
+            previewUrl: it.previewName ? `/media/we-preview?s=${it.source}&id=${encodeURIComponent(it.id)}&f=${encodeURIComponent(it.previewName)}` : null
+          }))
+        });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/media/we-video") {
+        const vf = resolveWePreview(String(url.searchParams.get("s") ?? ""), String(url.searchParams.get("id") ?? ""), String(url.searchParams.get("f") ?? ""), /^[^/:*?"<>|]+.(mp4|webm)$/i);
+        if (!vf || !sendMediaFile(req, res, vf)) {
+          sendJson(res, 404, { error: "we video not found" });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/media/we-preview") {
+        const file = resolveWePreview(String(url.searchParams.get("s") ?? ""), String(url.searchParams.get("id") ?? ""), String(url.searchParams.get("f") ?? ""));
+        if (!file || !sendMediaFile(req, res, file)) {
+          sendJson(res, 404, { error: "we preview not found" });
+        }
+        return;
       }
       if (req.method === "GET" && url.pathname.startsWith("/media/scene/")) {
         const hash = /^\/media\/scene\/([a-f0-9]{8,64})\.mp4$/.exec(url.pathname)?.[1];
@@ -112311,9 +116007,33 @@ async function startServe(opts) {
           sendJson(res, 400, { error: "bad scene media path" });
           return;
         }
-        const file = path10.join(scenesCacheRoot(), hash, "loop.mp4");
+        const file = path12.join(scenesCacheRoot(), hash, "loop.mp4");
         if (!sendMediaFile(req, res, file)) {
           sendJson(res, 404, { error: "scene media not found" });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/media/poster/")) {
+        const hash = /^\/media\/poster\/([a-f0-9]{8,64})\.jpg$/.exec(url.pathname)?.[1];
+        if (!hash) {
+          sendJson(res, 400, { error: "bad poster path" });
+          return;
+        }
+        const file = path12.join(scenesCacheRoot(), hash, "poster.jpg");
+        if (!sendMediaFile(req, res, file)) {
+          sendJson(res, 404, { error: "poster not found" });
+        }
+        return;
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/media/lib/")) {
+        const name = decodeURIComponent(url.pathname.slice("/media/lib/".length));
+        if (name.includes("..") || name.includes("/") || name.includes("\\") || !/^[^:"<>|*?]+\.(jpe?g|png|webp|bmp)$/i.test(name)) {
+          sendJson(res, 400, { error: "bad library media path" });
+          return;
+        }
+        const file = path12.join(dataDir(), name);
+        if (!isInsideDataDir(file) || !sendMediaFile(req, res, file)) {
+          sendJson(res, 404, { error: "library media not found" });
         }
         return;
       }
@@ -112331,61 +116051,341 @@ async function startServe(opts) {
   });
   console.log(`serve: control API on http://127.0.0.1:${apiPort} \u2014 Ctrl+C to stop`);
   console.log(`serve: injecting into ZCode renderers on CDP port ${cdpPort}`);
+  let rotationTimer;
+  let rotationTick;
+  let lastScheduleFire = "";
+  let randomAvoid = -1;
+  let rotationIndex = 0;
+  let rotationGen = 0;
+  const resumeIndex = /* @__PURE__ */ new Map();
+  let windowPlanId;
+  let rotationHidden = false;
+  let rotationRemainMs = 0;
+  let rotationDeadline = 0;
+  function scheduleRotationNext(delayMs) {
+    if (rotationTimer) {
+      clearTimeout(rotationTimer);
+      rotationTimer = void 0;
+    }
+    rotationDeadline = Date.now() + delayMs;
+    rotationRemainMs = delayMs;
+    if (rotationHidden)
+      return;
+    rotationTimer = setTimeout(rotationFire, delayMs);
+    rotationTimer.unref?.();
+  }
+  function rotationFire() {
+    rotationTimer = void 0;
+    const s2 = rotationNow();
+    if (!s2.on || !s2.plan || s2.plan.mode === "schedule" || !s2.plan.entries.length)
+      return;
+    const total = s2.plan.entries.length;
+    let next;
+    if (s2.plan.id !== planIdAtSchedule) {
+      next = (resumeIndex.get(s2.plan.id) ?? -1) + 1;
+    } else if (s2.plan.mode === "random" && total > 1) {
+      do {
+        next = Math.floor(Math.random() * total);
+      } while (next === randomAvoid);
+    } else {
+      next = (rotationIndex + 1) % total;
+    }
+    void playRotationEntry(next);
+  }
+  let planIdAtSchedule;
+  const hhmmNow = () => `${String((/* @__PURE__ */ new Date()).getHours()).padStart(2, "0")}:${String((/* @__PURE__ */ new Date()).getMinutes()).padStart(2, "0")}`;
+  function inWindow(win, hhmm) {
+    if (!win)
+      return false;
+    return win.start <= win.end ? hhmm >= win.start && hhmm <= win.end : hhmm >= win.start || hhmm <= win.end;
+  }
+  function rotationNow() {
+    const norm = normalizeRotation(runtimeConfig().rotation);
+    if (!norm.enabled || !norm.plans.length)
+      return { on: false };
+    const hhmm = hhmmNow();
+    const windowed = norm.plans.find((p2) => inWindow(p2.window, hhmm) && p2.entries.length);
+    const plan = windowed ?? norm.plans.find((p2) => p2.id === norm.activePlanId) ?? norm.plans[0];
+    if (!plan || !plan.entries.length)
+      return { on: false };
+    return { on: true, plan };
+  }
+  function stopRotationTimers() {
+    rotationGen++;
+    if (rotationTimer) {
+      clearTimeout(rotationTimer);
+      rotationTimer = void 0;
+    }
+    if (rotationTick) {
+      clearInterval(rotationTick);
+      rotationTick = void 0;
+    }
+  }
+  async function playRotationEntry(index) {
+    const gen = rotationGen;
+    const s2 = rotationNow();
+    if (!s2.on || !s2.plan || s2.plan.mode === "schedule")
+      return;
+    const rot = s2.plan;
+    const n2 = rot.entries.length;
+    const i2 = (index % n2 + n2) % n2;
+    const entry = rot.entries[i2];
+    randomAvoid = i2;
+    rotationIndex = i2;
+    resumeIndex.set(rot.id, i2);
+    try {
+      const r2 = await applyRef(entry);
+      console.log(`serve: rotation [${rot.name}/${rot.mode}] ${i2 + 1}/${n2} -> ${entry.hash ?? entry.path} for ${entry.seconds}s (${r2.windows} window(s))`);
+    } catch (err) {
+      console.error(`serve: rotation apply failed \u2014 ${err.message}`);
+    }
+    if (gen !== rotationGen)
+      return;
+    planIdAtSchedule = rot.id;
+    scheduleRotationNext(Math.max(10, entry.seconds ?? 60) * 1e3);
+  }
+  function checkRotationSchedule() {
+    const s2 = rotationNow();
+    if (!s2.on || !s2.plan || s2.plan.mode !== "schedule")
+      return;
+    const now = /* @__PURE__ */ new Date();
+    const hhmm = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+    const fireKey = `${now.getFullYear()}-${now.getMonth()}-${now.getDate()} ${hhmm}`;
+    if (fireKey === lastScheduleFire)
+      return;
+    const due = s2.plan.entries.filter((e2) => e2.time === hhmm);
+    if (!due.length)
+      return;
+    lastScheduleFire = fireKey;
+    const entry = due[due.length - 1];
+    void applyRef(entry).then((r2) => console.log(`serve: rotation [${s2.plan.name}/schedule] ${hhmm} -> ${entry.hash ?? entry.path} (${r2.windows} window(s))`)).catch((err) => console.error(`serve: rotation schedule fire failed \u2014 ${err.message}`));
+  }
+  let dayNightWas;
+  function dayNightTick() {
+    const config = runtimeConfig();
+    const dn = config.dayNight;
+    if (!dn?.enabled) {
+      dayNightWas = void 0;
+      return;
+    }
+    const isDay = isDayPeriod(dn) ? 1 : 0;
+    if (dayNightWas === void 0) {
+      dayNightWas = isDay;
+      return;
+    }
+    if (isDay !== dayNightWas) {
+      dayNightWas = isDay;
+      console.log(`serve: day/night flip -> ${isDay ? "day" : "night"} look`);
+      void pushConfigToSessions(config).catch(() => 0);
+    }
+  }
+  function rotationWatch() {
+    const norm = normalizeRotation(runtimeConfig().rotation);
+    if (!norm.enabled)
+      return;
+    const hhmm = hhmmNow();
+    const windowed = norm.plans.find((p2) => inWindow(p2.window, hhmm) && p2.entries.length);
+    if (windowed) {
+      if (windowed.id !== windowPlanId) {
+        console.log(`serve: rotation window -> plan "${windowed.name}" (${hhmm})`);
+        startRotation(true);
+      }
+      return;
+    }
+    const fallback = norm.plans.find((p2) => p2.id === norm.activePlanId) ?? norm.plans[0];
+    if (fallback && fallback.id !== windowPlanId) {
+      console.log(`serve: rotation window closed -> plan "${fallback.name}" (${hhmm})`);
+      startRotation(true);
+    }
+  }
+  function skipRotation() {
+    const s2 = rotationNow();
+    if (!s2.on || !s2.plan)
+      return { ok: false, error: "\u5B9A\u65F6\u64AD\u653E\u672A\u542F\u7528\u6216\u65B9\u6848\u4E3A\u7A7A" };
+    if (s2.plan.mode === "schedule")
+      return { ok: false, error: "\u5B9A\u65F6\u5207\u6362\u6A21\u5F0F\u6309\u65F6\u95F4\u70B9\u64AD\u653E,\u65E0\u4E0B\u4E00\u5F20" };
+    if (rotationTimer)
+      clearTimeout(rotationTimer);
+    const total = s2.plan.entries.length;
+    let next;
+    if (s2.plan.mode === "random" && total > 1) {
+      do {
+        next = Math.floor(Math.random() * total);
+      } while (next === rotationIndex);
+    } else {
+      next = rotationIndex + 1;
+    }
+    void playRotationEntry(next);
+    return { ok: true };
+  }
+  function startRotation(resume = false) {
+    stopRotationTimers();
+    lastScheduleFire = "";
+    randomAvoid = -1;
+    const norm = normalizeRotation(runtimeConfig().rotation);
+    const hhmm = hhmmNow();
+    windowPlanId = (norm.plans.find((p2) => inWindow(p2.window, hhmm) && p2.entries.length) ?? norm.plans.find((p2) => p2.id === norm.activePlanId) ?? norm.plans[0])?.id;
+    const s2 = rotationNow();
+    if (!s2.on || !s2.plan)
+      return;
+    if (s2.plan.mode === "schedule") {
+      rotationTick = setInterval(checkRotationSchedule, 2e4);
+      rotationTick.unref?.();
+      checkRotationSchedule();
+    } else {
+      rotationTick = setInterval(rotationWatch, 2e4);
+      rotationTick.unref?.();
+      void playRotationEntry(resume ? resumeIndex.get(s2.plan.id) ?? 0 : 0);
+    }
+  }
+  const dayNightTimer = setInterval(dayNightTick, 2e4);
+  dayNightTimer.unref?.();
   await poll(runtimeConfig(), apiPort);
+  startRotation();
   for (; ; ) {
     await new Promise((r2) => setTimeout(r2, POLL_MS));
     await poll(runtimeConfig(), apiPort);
   }
 }
+function validPlanEntries(mode, raw) {
+  const out = [];
+  if (!Array.isArray(raw))
+    return out;
+  const seenTimes = /* @__PURE__ */ new Set();
+  for (const e2 of raw.slice(0, 20)) {
+    if (!e2 || typeof e2 !== "object")
+      continue;
+    const { seconds, time, hash, path: imgPath } = e2;
+    const ref = typeof hash === "string" && /^[a-f0-9]{8,64}$/.test(hash) && fs12.existsSync(path12.join(scenesCacheRoot(), hash, "loop.mp4")) ? { hash } : typeof imgPath === "string" && fs12.existsSync(imgPath) ? { path: imgPath } : void 0;
+    if (!ref)
+      continue;
+    if (mode === "schedule") {
+      if (typeof time !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(time))
+        continue;
+      if (seenTimes.has(time))
+        continue;
+      seenTimes.add(time);
+      out.push({ time, ...ref });
+    } else {
+      if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds < 10 || seconds > 86400)
+        continue;
+      out.push({ seconds: Math.round(seconds), ...ref });
+    }
+  }
+  return out;
+}
+function normalizeRotation(stored) {
+  const legacy = stored;
+  const plansShape = stored;
+  if (Array.isArray(plansShape?.plans) && plansShape.plans.length) {
+    return sanitizeRotation(stored);
+  }
+  const mode = legacy?.mode === "random" || legacy?.mode === "schedule" ? legacy.mode : "sequence";
+  return {
+    enabled: typeof legacy?.enabled === "boolean" ? legacy.enabled : false,
+    activePlanId: "default",
+    plans: [{ id: "default", name: "\u9ED8\u8BA4\u65B9\u6848", mode, entries: validPlanEntries(mode, legacy?.entries) }]
+  };
+}
+function sanitizeRotation(raw) {
+  const r2 = raw ?? {};
+  const plansRaw = Array.isArray(r2.plans) && r2.plans.length ? r2.plans.slice(0, 10) : [{ mode: r2.mode, entries: r2.entries }];
+  const plans = [];
+  const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+  plansRaw.forEach((p2, i2) => {
+    if (!p2 || typeof p2 !== "object")
+      return;
+    const q = p2;
+    const mode = q.mode === "random" || q.mode === "schedule" ? q.mode : "sequence";
+    const entries = validPlanEntries(mode, q.entries);
+    const transition = q.transition === "fade" || q.transition === "none" || q.transition === "slide" || q.transition === "zoom" || q.transition === "blur" ? q.transition : void 0;
+    const id = typeof q.id === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(q.id) ? q.id : `p${Date.now().toString(36)}${i2}`;
+    const name = typeof q.name === "string" && q.name.trim() ? q.name.trim().slice(0, 20) : `\u65B9\u6848 ${i2 + 1}`;
+    const plan = { id, name, mode, entries };
+    if (transition)
+      plan.transition = transition;
+    const w = q.window;
+    if (w && typeof w.start === "string" && typeof w.end === "string" && HHMM_RE.test(w.start) && HHMM_RE.test(w.end) && w.start !== w.end) {
+      plan.window = { start: w.start, end: w.end };
+    }
+    plans.push(plan);
+  });
+  if (!plans.length) {
+    plans.push({ id: "default", name: "\u65B9\u6848 1", mode: "sequence", entries: [] });
+  }
+  const activePlanId = typeof r2.activePlanId === "string" && plans.some((p2) => p2.id === r2.activePlanId) ? r2.activePlanId : plans[0].id;
+  return { enabled: r2.enabled === true, activePlanId, plans };
+}
 async function pickFileViaDialog() {
   const script = `
 Add-Type -AssemblyName System.Windows.Forms
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $d = New-Object System.Windows.Forms.OpenFileDialog
-$d.Title = '\u9009\u62E9\u52A8\u6001\u58C1\u7EB8 (\u573A\u666F .pkg / \u89C6\u9891 .mp4, \u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6)'
+$d.Title = '\u9009\u62E9\u52A8\u6001\u58C1\u7EB8 (\u53EF\u591A\u9009:\u573A\u666F .pkg / \u89C6\u9891 .mp4,\u6216\u58C1\u7EB8\u76EE\u5F55\u5185\u4EFB\u610F\u6587\u4EF6)'
 $d.Filter = '\u52A8\u6001\u58C1\u7EB8 (*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm)|*.pkg;*.json;*.gif;*.jpg;*.png;*.mp4;*.webm|\u6240\u6709\u6587\u4EF6 (*.*)|*.*'
-if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }`;
+$d.Multiselect = $true
+if ($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $d.FileNames | ForEach-Object { Write-Output $_ } }`;
   try {
     const { stdout } = await promisify3(execFile3)("powershell", ["-STA", "-NoProfile", "-Command", script], { timeout: 3e5, windowsHide: true });
-    return stdout.trim();
+    return stdout.split(/\r?\n/).map((l2) => l2.trim()).filter(Boolean);
   } catch {
-    return "";
+    return [];
   }
 }
 function renameLibraryImage(oldPath, name) {
   if (!isInsideDataDir(oldPath) || !/\.(jpe?g|png|webp|bmp)$/i.test(oldPath)) {
     throw new Error("only plugin-managed wallpapers can be renamed here");
   }
-  const ext = path10.extname(oldPath);
+  const ext = path12.extname(oldPath);
   const safe = name.replace(/[\/:*?"<>|]/g, "").trim() || "wallpaper";
-  const newPath = path10.join(path10.dirname(oldPath), safe + ext);
-  if (newPath !== oldPath)
-    fs11.renameSync(oldPath, newPath);
+  let newPath = path12.join(path12.dirname(oldPath), safe + ext);
+  if (path12.resolve(newPath) !== path12.resolve(oldPath)) {
+    if (newPath.toLowerCase() !== path12.resolve(oldPath).toLowerCase()) {
+      for (let i2 = 2; fs12.existsSync(newPath); i2++) {
+        newPath = path12.join(path12.dirname(oldPath), `${safe}(${i2})${ext}`);
+      }
+    }
+    fs12.renameSync(oldPath, newPath);
+  }
+  const oldThumb = path12.join(thumbDir(), path12.basename(oldPath) + ".jpg");
+  if (fs12.existsSync(oldThumb)) {
+    try {
+      fs12.renameSync(oldThumb, path12.join(thumbDir(), path12.basename(newPath) + ".jpg"));
+    } catch {
+    }
+  }
   return newPath;
 }
 function isInsideDataDir(target) {
-  const rel = path10.relative(path10.resolve(dataDir()), path10.resolve(target));
+  const rel = path12.relative(path12.resolve(dataDir()), path12.resolve(target));
   return rel !== "" && !rel.startsWith("..");
 }
-var MAX_WALLPAPER_BYTES, MAX_BODY_BYTES, POLL_MS, cachedAssets, importJob, held, IMAGE_EXT;
+var MAX_WALLPAPER_BYTES, MAX_BODY_BYTES, POLL_MS, assetsCache, ffmpegPathCache, importJob, held, scrubbedUpdaters, mediaToken, IMAGE_EXT;
 var init_server = __esm({
   "dist/core/server.js"() {
     "use strict";
     init_cdp();
     init_inject();
     init_monet();
+    init_material_color_utilities();
     init_panelScript();
     init_launch();
     init_media();
     init_scenePipeline();
+    init_weLibrary();
     init_dependencyCheck();
+    init_exec();
     init_cacheManager();
     MAX_WALLPAPER_BYTES = 20 * 1024 * 1024;
     MAX_BODY_BYTES = MAX_WALLPAPER_BYTES + 1024 * 1024;
     POLL_MS = 1500;
+    assetsCache = /* @__PURE__ */ new Map();
     importJob = { running: false, stage: "idle" };
     held = /* @__PURE__ */ new Map();
+    scrubbedUpdaters = /* @__PURE__ */ new Set();
+    mediaToken = "";
     IMAGE_EXT = {
       "image/jpeg": ".jpg",
       "image/png": ".png",
@@ -112400,8 +116400,8 @@ var init_server = __esm({
 init_inject();
 init_launch();
 init_session();
-import fs12 from "node:fs";
-import path11 from "node:path";
+import fs13 from "node:fs";
+import path13 from "node:path";
 var USAGE = `zcode-beautify <command> [options]
 
 Commands:
@@ -112552,18 +116552,18 @@ Quit ZCode completely (including any tray icon), then run \`zcode-beautify launc
   }
 }
 async function startServeDetached(cdpPort, apiPort) {
-  const { spawn: spawn3 } = await import("node:child_process");
+  const { spawn: spawn4 } = await import("node:child_process");
   const { existingServePid: existingServePid2 } = await Promise.resolve().then(() => (init_server(), server_exports));
   const already = await existingServePid2(apiPort);
   if (already !== void 0) {
     throw new Error(`a beautify service is already running on http://127.0.0.1:${apiPort} (pid ${already}) \u2014 open its panel, or stop that process first`);
   }
-  fs12.mkdirSync(dataDir(), { recursive: true });
-  const logFile = path11.join(dataDir(), "serve.log");
-  const out = fs12.openSync(logFile, "a");
-  const child = spawn3(process.execPath, [process.argv[1], "serve", "--port", String(cdpPort), "--api-port", String(apiPort)], { detached: true, stdio: ["ignore", out, out], windowsHide: true });
+  fs13.mkdirSync(dataDir(), { recursive: true });
+  const logFile = path13.join(dataDir(), "serve.log");
+  const out = fs13.openSync(logFile, "a");
+  const child = spawn4(process.execPath, [process.argv[1], "serve", "--port", String(cdpPort), "--api-port", String(apiPort)], { detached: true, stdio: ["ignore", out, out], windowsHide: true });
   child.unref();
-  fs12.closeSync(out);
+  fs13.closeSync(out);
   for (let i2 = 0; i2 < 20; i2++) {
     await new Promise((r2) => setTimeout(r2, 500));
     try {

@@ -13,6 +13,7 @@
  */
 
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import { execFileP } from "./exec.js";
 import path from "node:path";
 
@@ -26,7 +27,7 @@ export interface DependencyStatus {
   detail?: string;
 }
 
-const WE_EXE_RELATIVE = path.join("wallpaper_engine", "wallpaper64.exe");
+const WE_EXE_RELATIVE = path.join("steamapps", "common", "wallpaper_engine", "wallpaper64.exe");
 /** ffmpeg major version that introduced the ddagrab filter. */
 const MIN_FFMPEG_MAJOR = 5;
 
@@ -156,18 +157,46 @@ async function findWallpaperInRegistry(): Promise<string | undefined> {
 }
 
 /**
+ * Steam install path from the registry (sync; cached). Covers Steam roots
+ * outside the conventional folder names (e.g. F:\soft\steam) that neither the
+ * default candidates nor the drive-root patterns match — its
+ * libraryfolders.vdf then yields every actual library.
+ */
+let registrySteamPathCache: string | undefined;
+let registrySteamPathProbed = false;
+function registrySteamPath(): string | undefined {
+  if (registrySteamPathProbed) return registrySteamPathCache;
+  registrySteamPathProbed = true;
+  for (const key of ["HKCU\\Software\\Valve\\Steam", "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam", "HKLM\\SOFTWARE\\Valve\\Steam"]) {
+    try {
+      const out = execFileSync("reg", ["query", key, "/v", "SteamPath"], { timeout: 4000, encoding: "utf8" });
+      const m = /SteamPath\s+REG_SZ\s+(\S+)/.exec(out);
+      if (m?.[1]) {
+        registrySteamPathCache = m[1];
+        return registrySteamPathCache;
+      }
+    } catch {
+      /* key absent — try next */
+    }
+  }
+  return undefined;
+}
+
+/**
  * Steam library roots: parse libraryfolders.vdf from the default Steam
  * install locations, then fall back to scanning common library folder names
  * on every drive root (covers installs where the vdf is missing too).
+ * Exported for the WE library browser (workshop content discovery).
  */
-function steamLibraryCandidates(): string[] {
+export function steamLibraryCandidates(): string[] {
   const candidates = new Set<string>();
 
   const vdfRoots = [
+    registrySteamPath(),
     "C:\\Program Files (x86)\\Steam",
     "C:\\Program Files\\Steam",
     ...driveRoots().flatMap((d) => [path.join(d, "Steam"), path.join(d, "SteamLibrary")]),
-  ];
+  ].filter((p): p is string => Boolean(p));
   for (const root of vdfRoots) {
     const vdf = path.join(root, "steamapps", "libraryfolders.vdf");
     for (const lib of parseVdfPaths(readFileSafe(vdf))) candidates.add(lib);
@@ -190,7 +219,13 @@ export function parseVdfPaths(vdf: string): string[] {
   return paths;
 }
 
+// Cached after the first probe: synchronously touching every drive letter
+// costs seconds when unreachable mapped network drives are in the mix, and
+// the set of local drives does not change within a process lifetime.
+let driveRootsCache: string[] | undefined;
+
 function driveRoots(): string[] {
+  if (driveRootsCache) return driveRootsCache;
   const roots: string[] = [];
   for (let i = 67; i <= 90; i++) {
     // C..Z
@@ -202,6 +237,7 @@ function driveRoots(): string[] {
       /* drive absent */
     }
   }
+  driveRootsCache = roots;
   return roots;
 }
 
